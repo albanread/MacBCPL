@@ -25,8 +25,8 @@ use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum};
 use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue};
 
 use newbcpl_ir::{
-    BasicBlock as IrBlock, BlockId, Const, Function as IrFunction, Instr, IrBinOp, IrUnOp,
-    Module as IrModule, Param, Terminator, TypedKind, Value, ValueId,
+    AllocTarget, BasicBlock as IrBlock, BlockId, Const, Function as IrFunction, Instr, IrBinOp,
+    IrUnOp, Module as IrModule, Param, Terminator, TypedKind, Value, ValueId,
 };
 use newbcpl_sema::{ClassLayout, TypeHint};
 
@@ -1122,8 +1122,9 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                 kind,
                 args,
                 hint: _,
+                alloc_target,
             } => {
-                let result = self.emit_typed_construct(*kind, args);
+                let result = self.emit_typed_construct(*kind, args, *alloc_target);
                 self.value_map.insert(*dst, result);
             }
             Instr::New {
@@ -1520,14 +1521,15 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         &mut self,
         kind: TypedKind,
         args: &[Value],
+        alloc_target: AllocTarget,
     ) -> BasicValueEnum<'ctx> {
         // SIMD shape dispatch — see docs/pair_and_multilane_types.md.
         // PAIR / FPAIR / QUAD / OCT all pack into one i64 word
         // per the reference's ABI; FQUAD and FOCT are wider and
         // need genuine LLVM vectors.
         match kind {
-            TypedKind::Vec | TypedKind::Table => self.emit_vec_construct(args, false),
-            TypedKind::FVec | TypedKind::FTable => self.emit_vec_construct(args, true),
+            TypedKind::Vec | TypedKind::Table => self.emit_vec_construct(args, false, alloc_target),
+            TypedKind::FVec | TypedKind::FTable => self.emit_vec_construct(args, true, alloc_target),
             TypedKind::Pair => self.build_packed_word(args, 32, /* float = */ false),
             TypedKind::FPair => self.build_packed_word(args, 32, /* float = */ true),
             TypedKind::Quad => self.build_packed_word(args, 16, false),
@@ -1569,7 +1571,12 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
     /// (f64 vs i64). The const-size path is element-type-agnostic
     /// because it allocates raw bytes — the slot-load type is
     /// determined at the use site.
-    fn emit_vec_construct(&mut self, args: &[Value], float: bool) -> BasicValueEnum<'ctx> {
+    fn emit_vec_construct(
+        &mut self,
+        args: &[Value],
+        float: bool,
+        alloc_target: AllocTarget,
+    ) -> BasicValueEnum<'ctx> {
         let i64_t = self.context.i64_type();
         let f64_t = self.context.f64_type();
         // Heuristic: a single Int constant arg means "size k",
@@ -1588,8 +1595,9 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         let count: u64 = single_const_size.unwrap_or_else(|| args.len() as u64);
         let total_bytes = count.saturating_add(1).saturating_mul(8);
 
-        // Heap-allocate via the GC's size-keyed allocator.
-        let buf = self.alloc_rec_bytes(total_bytes);
+        // Allocate via the size-keyed allocator — arena (stack-scope
+        // lifetime) or manual heap, per the escape pre-pass's decision.
+        let buf = self.alloc_rec_bytes(total_bytes, alloc_target);
         // Length header at byte offset 0.
         self.store_word_at_offset(buf, 0, i64_t.const_int(count, true).into());
 
@@ -1629,23 +1637,28 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         self.byte_offset_ptr(buf, 8, "vec.data").into()
     }
 
-    /// Call `__newbcpl_alloc_rec(size)` and return the resulting
-    /// pointer. Declares the function on demand with its precise
-    /// `ptr fn(i64)` signature.
-    fn alloc_rec_bytes(&mut self, size: u64) -> PointerValue<'ctx> {
+    /// Call the size-keyed allocator and return the resulting pointer.
+    /// `Heap` → `__newbcpl_alloc_rec` (manual free-list heap); `Arena` →
+    /// `__newbcpl_alloc_rec_arena` (per-scope arena, stack-scope
+    /// lifetime). Both share the `ptr fn(i64)` signature and the same
+    /// 16-byte-header / length-at-`p[-1]` payload contract, so the rest
+    /// of `emit_vec_construct` is identical either way. Declared on
+    /// demand.
+    fn alloc_rec_bytes(&mut self, size: u64, target: AllocTarget) -> PointerValue<'ctx> {
         let i64_t = self.context.i64_type();
         let ptr_t = self.context.ptr_type(AddressSpace::default());
-        let alloc_fn = match self.by_name.get("__newbcpl_alloc_rec") {
+        let sym = match target {
+            AllocTarget::Arena => "__newbcpl_alloc_rec_arena",
+            AllocTarget::Heap => "__newbcpl_alloc_rec",
+        };
+        let alloc_fn = match self.by_name.get(sym) {
             Some(&f) => f,
             None => {
                 let fn_ty = ptr_t.fn_type(&[i64_t.into()], false);
-                let fv = self.module.add_function(
-                    "__newbcpl_alloc_rec",
-                    fn_ty,
-                    Some(Linkage::External),
-                );
-                self.by_name
-                    .insert("__newbcpl_alloc_rec".to_string(), fv);
+                let fv = self
+                    .module
+                    .add_function(sym, fn_ty, Some(Linkage::External));
+                self.by_name.insert(sym.to_string(), fv);
                 fv
             }
         };
@@ -1653,7 +1666,7 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         let call_site = self
             .builder
             .build_call(alloc_fn, &[size_arg.into()], "alloc_rec")
-            .expect("call __newbcpl_alloc_rec");
+            .expect("call size-keyed allocator");
         use inkwell::values::ValueKind;
         match call_site.try_as_basic_value() {
             ValueKind::Basic(rv) => self.as_pointer(rv),

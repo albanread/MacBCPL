@@ -2158,6 +2158,9 @@ impl<'a> Lowerer<'a> {
             kind: typed_kind(kind),
             args: arg_values,
             hint,
+            // Conservative default: the manual heap. The escape pre-pass
+            // flips proven-scope-local VEC/FVEC/TABLE sites to Arena.
+            alloc_target: AllocTarget::Heap,
         });
         Value::Local(dst)
     }

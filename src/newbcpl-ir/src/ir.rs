@@ -267,6 +267,12 @@ pub enum Instr {
         kind: TypedKind,
         args: Vec<Value>,
         hint: TypeHint,
+        /// Which memory tier this construction allocates from. `Heap`
+        /// (the conservative default) is the manual free-list heap;
+        /// `Arena` is the per-scope arena (stack-scope lifetime) and is
+        /// set ONLY when the escape pre-pass proves the bound value
+        /// never outlives its function. See `AllocTarget`.
+        alloc_target: AllocTarget,
     },
     /// `pair.|n|` — extract a single lane from a SIMD value. The
     /// lane index is a runtime value (codegen still picks the
@@ -296,6 +302,16 @@ pub enum Instr {
         value: Value,
         kind: TypedKind,
     },
+}
+
+/// Which memory tier an allocation draws from in the no-GC model.
+/// `Heap` is the manual free-list heap (Tier 2, conservative default);
+/// `Arena` is the per-scope arena (Tier 1, stack-scope lifetime).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AllocTarget {
+    #[default]
+    Heap,
+    Arena,
 }
 
 /// IR-level constructor kinds, mirroring the parser's

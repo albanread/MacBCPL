@@ -219,18 +219,24 @@ fn render_instr(i: &Instr) -> String {
             kind,
             args,
             hint,
+            alloc_target,
         } => {
             let args_str = args
                 .iter()
                 .map(render_value)
                 .collect::<Vec<_>>()
                 .join(", ");
+            let tier = match alloc_target {
+                AllocTarget::Arena => " @arena",
+                AllocTarget::Heap => "",
+            };
             format!(
-                "%{} = construct {} ({}) : {}",
+                "%{} = construct {} ({}) : {}{}",
                 dst.0,
                 kind.as_str(),
                 args_str,
-                hint.as_str()
+                hint.as_str(),
+                tier
             )
         }
         Instr::LaneExtract {
