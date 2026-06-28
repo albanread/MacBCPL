@@ -2472,15 +2472,20 @@ impl Parser {
         };
         let mut selector = String::new();
         let mut args: Vec<Expr> = Vec::new();
+        let mut arg_annotations: Vec<Option<String>> = Vec::new();
         if next_is_colon(self) {
-            // Keyword form: ( IDENT ":" arg )+  -> "kw1:kw2:..."
+            // Keyword form: ( IDENT ":" arg [AS Type] )+  -> "kw1:kw2:..."
             loop {
                 let kw = self.eat(); // IDENT
                 self.expect_sym(":")?;
                 let arg = self.parse_expr()?;
+                // Optional per-arg `AS Type` to fix this arg's register
+                // class (e.g. an int passed to a `double` param).
+                let ann = self.parse_optional_as_annotation();
                 selector.push_str(&kw.lexeme);
                 selector.push(':');
                 args.push(arg);
+                arg_annotations.push(ann);
                 if !next_is_colon(self) {
                     break;
                 }
@@ -2502,6 +2507,7 @@ impl Parser {
             receiver: Box::new(receiver),
             selector,
             args,
+            arg_annotations,
             ret_annotation,
             span: SourceSpan {
                 start,

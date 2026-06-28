@@ -2377,6 +2377,9 @@ impl<'a> Lowerer<'a> {
     ) -> Value {
         let recv_val = self.lower_objc_receiver(receiver);
         let arg_values: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
+        // Per-arg register class comes from each arg's hint — which sema has
+        // already overridden from any per-arg `AS Type` annotation, so an
+        // int passed to a `double` param rides a d-register.
         let arg_hints: Vec<TypeHint> = args.iter().map(|a| a.hint()).collect();
         let dst = self.b().alloc_value();
         self.b().emit(Instr::ObjcRawSend {
@@ -2396,7 +2399,10 @@ impl<'a> Lowerer<'a> {
     /// works); anything else -> the lowered expression (an instance id).
     fn lower_objc_receiver(&mut self, receiver: &Expr) -> Value {
         if let Expr::Ident { name, .. } = receiver {
-            if name == "SELF" {
+            // `[SELF ...]` is only meaningful inside a class method (sema
+            // errors otherwise); the `current_class` guard keeps a stray
+            // top-level `[SELF ...]` from panicking load_self().
+            if name == "SELF" && self.current_class.is_some() {
                 return self.load_self();
             }
             // A bare name with no local/global/manifest/SELF-field binding

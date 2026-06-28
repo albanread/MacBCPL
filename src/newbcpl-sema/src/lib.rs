@@ -1966,6 +1966,23 @@ impl Sema {
                         *dot_span,
                     );
                 }
+                // `%` (char index) on an Object — e.g. an un-annotated
+                // bracket-send result — would dereference the `id` as a
+                // byte buffer (SIGSEGV on a tagged pointer). Objects aren't
+                // byte-indexable; if it really is a string, annotate the
+                // send `AS STRING`.
+                if matches!(op, BinaryOp::CharSubscript)
+                    && lhs_hint == TypeHint::Object
+                    && !self.errors.iter().any(|e| {
+                        e.span == *dot_span && e.message.starts_with("cannot use `%`")
+                    })
+                {
+                    self.error(
+                        "cannot use `%` on an Object — it is not byte-indexable; if \
+                         this message returns a string, annotate the send `AS STRING`",
+                        *dot_span,
+                    );
+                }
                 self.binary_result(*op, lhs_hint, rhs_hint, lhs, rhs)
             }
             Expr::Conditional {
@@ -2024,33 +2041,60 @@ impl Sema {
             }
             Expr::ObjcMessage {
                 receiver,
+                selector,
                 args,
+                arg_annotations,
                 ret_annotation,
                 span,
                 ..
             } => {
                 // Type the receiver + args so their hints drive lowering
-                // (the per-arg ABI reads each arg's hint).
+                // (the per-arg ABI reads each arg's hint). A per-arg
+                // `AS Type` annotation OVERRIDES the inferred hint in place,
+                // so e.g. an int literal passed to a `double` selector
+                // param rides a d-register instead of an x-register.
                 let _ = self.type_of(receiver);
-                for a in args {
+                for (i, a) in args.iter().enumerate() {
                     let _ = self.type_of(a);
+                    if let Some(h) = arg_annotations
+                        .get(i)
+                        .and_then(|o| o.as_deref())
+                        .and_then(type_hint_from_annotation)
+                    {
+                        a.set_hint(h);
+                    }
                 }
                 // `[SUPER ...]` raw sends aren't supported in v1 — direct
                 // them to the dot form, which does static parent dispatch.
-                if matches!(receiver.as_ref(), Expr::Ident { name, .. } if name == "SUPER") {
-                    self.error(
-                        "`[SUPER ...]` is not supported yet — use `SUPER.method(args)` \
-                         for superclass sends",
-                        *span,
-                    );
+                // `[SELF ...]` is only valid inside a class method (else
+                // lowering's load_self would panic).
+                if let Expr::Ident { name, .. } = receiver.as_ref() {
+                    if name == "SUPER" {
+                        self.error(
+                            "`[SUPER ...]` is not supported yet — use \
+                             `SUPER.method(args)` for superclass sends",
+                            *span,
+                        );
+                    } else if name == "SELF" && self.current_class.is_none() {
+                        self.error(
+                            "`[SELF ...]` is only valid inside a class method",
+                            *span,
+                        );
+                    }
                 }
-                // Return type: an `id`/Object by default; an explicit
-                // trailing `AS Type` overrides it (and gives the correct
-                // x0-vs-d0 return ABI for INT/FLOAT).
-                ret_annotation
-                    .as_deref()
-                    .and_then(type_hint_from_annotation)
-                    .unwrap_or(TypeHint::Object)
+                // Return type: an explicit trailing `AS Type` wins; else a
+                // known NSString-returning selector yields String (so the
+                // result flows into `%`/LEN/WRITES safely without the user
+                // annotating, and isn't dereferenced as raw bytes); else an
+                // `id`/Object. (A full selector signature DB will broaden
+                // this synthesis to ints/floats/structs later.)
+                if let Some(h) = ret_annotation.as_deref().and_then(type_hint_from_annotation) {
+                    h
+                } else if objc_selector_returns_string(selector) {
+                    TypeHint::String
+                } else {
+                    TypeHint::Object
+                }
             }
         }
     }
@@ -2193,8 +2237,48 @@ fn merge_hints(hints: &[TypeHint]) -> TypeHint {
     }
 }
 
+/// Common Cocoa selectors known to return an `NSString*`. Used to
+/// synthesize a `String` return hint for a bracket send so the result is
+/// safe under `%`/LEN/WRITES without an `AS STRING` annotation. This is a
+/// curated stopgap — a generated selector-signature DB (the M2/WF66
+/// `cocoa-selectors.json`) will eventually drive return-type synthesis for
+/// every selector (ids, ints, floats, structs).
+fn objc_selector_returns_string(selector: &str) -> bool {
+    matches!(
+        selector,
+        "description"
+            | "debugDescription"
+            | "uppercaseString"
+            | "lowercaseString"
+            | "capitalizedString"
+            | "stringValue"
+            | "lastPathComponent"
+            | "stringByDeletingLastPathComponent"
+            | "stringByDeletingPathExtension"
+            | "pathExtension"
+            | "stringByStandardizingPath"
+            | "stringByExpandingTildeInPath"
+            | "stringByAppendingString:"
+            | "stringByAppendingPathComponent:"
+            | "stringByAppendingPathExtension:"
+            | "stringByReplacingOccurrencesOfString:withString:"
+            | "stringByTrimmingCharactersInSet:"
+            | "stringByPaddingToLength:withString:startingAtIndex:"
+            | "substringFromIndex:"
+            | "substringToIndex:"
+            | "substringWithRange:"
+            | "componentsJoinedByString:"
+            | "stringWithString:"
+            | "stringWithUTF8String:"
+            | "stringWithFormat:"
+    )
+}
+
 fn map_annotation_to_hint(annotation: &str) -> Option<TypeHint> {
-    Some(match annotation {
+    // Base-type annotations are case-insensitive (`AS String` == `AS STRING`);
+    // class-name annotations (mixed case) fall through to None and are
+    // resolved by the class-name path instead.
+    Some(match annotation.to_ascii_uppercase().as_str() {
         "INT" | "INTEGER" => TypeHint::Int,
         "FLOAT" | "REAL" => TypeHint::Float,
         "STRING" => TypeHint::String,
@@ -2860,12 +2944,17 @@ mod tests {
     }
 
     #[test]
-    fn objc_message_default_result_is_object() {
-        // A bracket send with no `AS` annotation is an id/Object; with
-        // `AS INT` it is an Int.
-        let out = analyze_str("LET START() BE $( LET a = [\"x\" uppercaseString]\n LET b = [\"x\" length] AS INT $)\n");
+    fn objc_message_result_hints() {
+        // A non-string send defaults to id/Object; `AS INT` -> Int; a known
+        // NSString-returning selector is synthesized to String (so the
+        // result is safe under %/LEN/WRITES without annotation).
+        let out = analyze_str(
+            "LET START() BE $( LET a = [[NSMutableArray alloc] init]\n \
+             LET b = [\"x\" length] AS INT\n LET c = [\"x\" uppercaseString] $)\n",
+        );
         assert_eq!(binding_hint(&out, "a"), TypeHint::Object);
         assert_eq!(binding_hint(&out, "b"), TypeHint::Int);
+        assert_eq!(binding_hint(&out, "c"), TypeHint::String);
     }
 
     #[test]

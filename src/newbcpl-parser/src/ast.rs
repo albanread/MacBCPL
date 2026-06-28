@@ -575,6 +575,11 @@ pub enum Expr {
         receiver: Box<Expr>,
         selector: String,
         args: Vec<Expr>,
+        /// Optional per-arg `AS Type` annotation, one slot per `args`
+        /// entry. Overrides the arg's inferred hint so codegen picks the
+        /// right register class — e.g. an integer literal passed to a
+        /// `double` selector param via `... numberWithDouble: 7 AS FLOAT`.
+        arg_annotations: Vec<Option<String>>,
         ret_annotation: Option<String>,
         span: Span,
         hint: Cell<TypeHint>,

@@ -70,6 +70,41 @@ fn multi_keyword_send() {
     );
 }
 
+// ─── Implementation-review regression probes ────────────────────────
+
+/// REVIEW #1: `%` / LEN on a bracket-send NSString result must not deref
+/// the id as raw bytes. A known string selector is synthesized to a String
+/// hint, so it routes to the safe char-fetch path. (Was a SIGSEGV.)
+#[test]
+fn string_returning_send_indexes_safely() {
+    expect(
+        "objc_str_index",
+        "LET START() BE $(\n  LET u = [\"abcdef\" uppercaseString]\n  WRITEN(u % 0)\n  WRITEN(LEN u)\n$)\n",
+        "656",
+    );
+}
+
+/// REVIEW #1: `AS String` (mixed case) must behave like `AS STRING`.
+#[test]
+fn as_string_annotation_is_case_insensitive() {
+    expect(
+        "objc_as_string_case",
+        "LET START() BE $(\n  LET v = [\"xy\" lowercaseString] AS String\n  WRITEN(LEN v)\n$)\n",
+        "2",
+    );
+}
+
+/// REVIEW #3: an int arg to a `double` selector param via a per-arg
+/// `AS FLOAT` must ride a d-register (else garbage). 7 -> 7.0 round-trips.
+#[test]
+fn per_arg_as_float_routes_to_fp_register() {
+    expect(
+        "objc_arg_as_float",
+        "LET START() BE $(\n  LET num = [NSNumber numberWithDouble: 7 AS FLOAT]\n  FWRITE([num doubleValue] AS FLOAT)\n$)\n",
+        "7",
+    );
+}
+
 /// A send used as a bare statement (result discarded) runs and continues.
 #[test]
 fn statement_form_send() {
