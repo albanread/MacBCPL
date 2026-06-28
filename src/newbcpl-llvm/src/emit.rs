@@ -1547,7 +1547,7 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             // type-dispatched by each arg's LLVM type so that
             // floats land in float atoms and packed PAIR
             // values land in pair atoms.
-            TypedKind::List | TypedKind::ManifestList => self.emit_list_construct(args),
+            TypedKind::List | TypedKind::ManifestList => self.emit_cons_chain(args),
         }
     }
 
@@ -1781,80 +1781,42 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
     /// allocates in read-only memory, but our runtime tracks
     /// every list via `Box::leak` for now (GC integration of
     /// list nodes is a follow-up slice).
-    fn emit_list_construct(&mut self, args: &[Value]) -> BasicValueEnum<'ctx> {
+    /// `LIST(a, b, c)` / `MANIFESTLIST(...)` — build an inline chain of
+    /// cons cells [hd@0, tl@8], tail-first so each `tl` is known when its
+    /// cell is written. No runtime construction calls beyond
+    /// `__newbcpl_cons_alloc` per cell (one per element); the element
+    /// words are stored directly. An empty list is NIL (a null pointer).
+    /// Cells come from the recycling cons pool (never the arena — lists
+    /// alias via TL/REST). Element words follow the uniform 8-byte model:
+    /// floats stored as f64 (HD with a float hint reads them back),
+    /// pointers as-is, ints / packed-SIMD as i64.
+    fn emit_cons_chain(&mut self, args: &[Value]) -> BasicValueEnum<'ctx> {
         let ptr_t = self.context.ptr_type(AddressSpace::default());
-        let i64_t = self.context.i64_type();
-        let f64_t = self.context.f64_type();
-
-        // Make sure the helper functions are declared with the
-        // exact signatures the runtime exposes — we go around
-        // `declare_extern`'s defaults because the list ABI uses
-        // pointer + typed-value pairs.
-        let new_empty = self.declare_list_helper(
-            "__newbcpl_list_new_empty",
-            ptr_t.fn_type(&[], false),
-        );
-        let apnd_int = self.declare_list_helper(
-            "APND",
-            i64_t.fn_type(&[ptr_t.into(), i64_t.into()], false),
-        );
-        let apnd_float = self.declare_list_helper(
-            "APND_FLOAT",
-            i64_t.fn_type(&[ptr_t.into(), f64_t.into()], false),
-        );
-        let apnd_string = self.declare_list_helper(
-            "APND_STRING",
-            i64_t.fn_type(&[ptr_t.into(), ptr_t.into()], false),
-        );
-        let apnd_pair = self.declare_list_helper(
-            "APND_PAIR",
-            i64_t.fn_type(&[ptr_t.into(), i64_t.into()], false),
-        );
-
-        let header = self
-            .builder
-            .build_call(new_empty, &[], "list.hdr")
-            .expect("call __newbcpl_list_new_empty")
-            .try_as_basic_value();
-        use inkwell::values::ValueKind;
-        let header_ptr = match header {
-            ValueKind::Basic(v) => self.as_pointer(v),
-            ValueKind::Instruction(_) => panic!(
-                "__newbcpl_list_new_empty must return a pointer"
-            ),
-        };
-
-        for (i, a) in args.iter().enumerate() {
-            let v = self.lower_value(a);
-            let (callee, arg_val): (FunctionValue<'ctx>, BasicMetadataValueEnum<'ctx>) = match v {
-                BasicValueEnum::FloatValue(_) => (apnd_float, v.into()),
-                BasicValueEnum::PointerValue(_) => (apnd_string, v.into()),
-                // VectorValue (FQUAD / FOCT) doesn't fit a list
-                // atom's i64 slot — collapse via `as_int_word`
-                // for now (loses lanes; same band-aid we use
-                // for other vector-to-word boundaries).
-                BasicValueEnum::IntValue(_) | BasicValueEnum::VectorValue(_) => {
-                    let packed = self.as_int_word(v);
-                    // We don't track the source's SIMD kind here;
-                    // route packed PAIR / QUAD / OCT values
-                    // through `APND_PAIR` so the atom carries an
-                    // `ATOM_PAIR` tag. Bare integers also go
-                    // through this path — the atom holds the
-                    // same i64 either way and the type tag is
-                    // a hint, not a correctness gate.
-                    let needs_pair_tag =
-                        matches!(a, Value::Local(_)) && matches!(v, BasicValueEnum::VectorValue(_));
-                    let callee = if needs_pair_tag { apnd_pair } else { apnd_int };
-                    (callee, packed.into())
-                }
-                _ => (apnd_int, self.as_int_word(v).into()),
-            };
-            let _ = self
-                .builder
-                .build_call(callee, &[header_ptr.into(), arg_val], &format!("list.apnd.{i}"))
-                .expect("call APND_*");
+        if args.is_empty() {
+            // NIL.
+            return ptr_t.const_null().into();
         }
-        header_ptr.into()
+        // Build tail-first: tl starts as NIL, each new cell prepends.
+        let mut tl: BasicValueEnum<'ctx> = ptr_t.const_null().into();
+        for a in args.iter().rev() {
+            let cons_fn = self.runtime_ptr_fn("__newbcpl_cons_alloc", 0);
+            let call = self
+                .builder
+                .build_call(cons_fn, &[], "cons")
+                .expect("call __newbcpl_cons_alloc");
+            let cell = self.call_result_ptr(call, "__newbcpl_cons_alloc");
+            // hd at +0 (uniform 8-byte word), tl at +8.
+            let v = self.lower_value(a);
+            let hd: BasicValueEnum<'ctx> = match v {
+                BasicValueEnum::FloatValue(_) | BasicValueEnum::PointerValue(_) => v,
+                BasicValueEnum::VectorValue(_) => self.pack_vector_to_word(v).into(),
+                _ => self.as_int_word(v).into(),
+            };
+            self.store_word_at_offset(cell, 0, hd);
+            self.store_word_at_offset(cell, 8, tl);
+            tl = cell.into();
+        }
+        tl
     }
 
     /// Declare a list-runtime helper with a precise signature.

@@ -1551,49 +1551,18 @@ impl<'a> Lowerer<'a> {
     ///                i64 length @8, ptr head @16, ptr tail @24 }
     ///                — total 32 bytes
     fn lower_foreach_list(&mut self, names: &[String], iter: &Expr, body: &Stmt) {
-        const ATOM_VALUE_OFFSET: i64 = 8;
-        const ATOM_NEXT_OFFSET: i64 = 16;
-        const HEADER_HEAD_OFFSET: i64 = 16;
+        // Cons-cell list: the value IS a pointer to the first cell
+        // [hd @ +0, tl @ +8], or NIL=0. Element at cell+0, next at cell+8.
+        const ATOM_VALUE_OFFSET: i64 = 0;
+        const ATOM_NEXT_OFFSET: i64 = 8;
 
-        // header pointer in a stable slot.
-        let header_v = self.lower_expr(iter);
-        let header_slot = self.b().alloca("foreach.list.hdr", TypeHint::List);
-        self.b().emit(Instr::Store {
-            slot: header_slot,
-            value: header_v,
-        });
-
-        // cursor = header.head — a load via `Gep(base=header,
-        // index=16, stride=1)`. The IR's Gep takes
-        // `base + index * element_bytes`, so passing
-        // `index=HEADER_HEAD_OFFSET, element_bytes=1` lands on
-        // the head field exactly.
-        let header_load = self.b().alloc_value();
-        self.b().emit(Instr::Load {
-            dst: header_load,
-            slot: header_slot,
-            hint: TypeHint::List,
-        });
-        let head_field = self.b().alloc_value();
-        self.b().emit(Instr::Gep {
-            dst: head_field,
-            base: Value::Local(header_load),
-            index: Value::Const(Const::Int(HEADER_HEAD_OFFSET)),
-            element_bytes: 1,
-        });
-        let initial_head = self.b().alloc_value();
-        self.b().emit(Instr::IndirectLoad {
-            dst: initial_head,
-            addr: Value::Local(head_field),
-            hint: TypeHint::List,
-            byte_width: 8,
-        });
-
-        // cursor slot — holds the current atom pointer.
+        // Seed the cursor with the list pointer directly — no header
+        // indirection; the iter value already points at the first cell.
+        let initial = self.lower_expr(iter);
         let cursor_slot = self.b().alloca("foreach.list.cur", TypeHint::List);
         self.b().emit(Instr::Store {
             slot: cursor_slot,
-            value: Value::Local(initial_head),
+            value: initial,
         });
 
         let header_block = self.b().alloc_block("foreach.list.header");
@@ -2801,22 +2770,35 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_unary(&mut self, op: UnaryOp, operand: &Expr, hint: TypeHint) -> Value {
+        // Cons-cell list access is OPEN-CODED INLINE (no runtime call): a
+        // list is a pointer to a 16-byte cell [hd @ +0, tl @ +8]. HD x is
+        // x!0, TL x / REST x are x!1 — one GEP + one IndirectLoad each.
+        match op {
+            UnaryOp::Hd => {
+                let h = if hint == TypeHint::Float {
+                    TypeHint::Float
+                } else {
+                    TypeHint::Word
+                };
+                return self.inline_cons_load(operand, 0, h);
+            }
+            UnaryOp::Tl | UnaryOp::Rest => {
+                return self.inline_cons_load(operand, 1, TypeHint::List);
+            }
+            _ => {}
+        }
         // BCPL list / vector keyword operators lower to runtime
         // calls. The runtime helper names line up with NewCP's
         // convention so the GC and ABI shapes match.
         if let Some(default_name) = unary_runtime_helper(op) {
-            // `LEN` is the one operator where the runtime helper
-            // differs by operand shape — vectors carry their
-            // length one word *before* the data pointer, while
-            // lists hold it in a `ListHeader` field. Dispatch
-            // here so the call site lands on the right address;
-            // see `__newbcpl_len` and `__newbcpl_list_len` in
-            // newbcpl-runtime/builtins.rs. `HD`/`TL`/`REST` are
-            // already list-shaped and have no vector form.
+            // `LEN` differs by operand shape: a VEC carries its length
+            // one word *before* the data pointer (`__newbcpl_len`); a
+            // cons list has no length word, so it is counted by an O(n)
+            // walk (`__newbcpl_cons_len`).
             let runtime_name = if matches!(op, UnaryOp::Len)
                 && matches!(operand.hint(), TypeHint::List)
             {
-                "__newbcpl_list_len"
+                "__newbcpl_cons_len"
             } else {
                 default_name
             };
@@ -2917,6 +2899,28 @@ impl<'a> Lowerer<'a> {
     /// by the subscript family for both rvalue loads and lvalue
     /// stores. `element_bytes` controls the stride (1 for chars,
     /// 8 for words / floats / pointers).
+    /// Open-coded cons-cell field load: `operand` is a list (pointer to
+    /// a [hd@0, tl@8] cell); load the word at cell + `index`*8. Used for
+    /// HD (index 0) and TL/REST (index 1) — identical to `operand ! index`.
+    fn inline_cons_load(&mut self, operand: &Expr, index: i64, hint: TypeHint) -> Value {
+        let base = self.lower_expr(operand);
+        let gep = self.b().alloc_value();
+        self.b().emit(Instr::Gep {
+            dst: gep,
+            base,
+            index: Value::Const(Const::Int(index)),
+            element_bytes: 8,
+        });
+        let dst = self.b().alloc_value();
+        self.b().emit(Instr::IndirectLoad {
+            dst,
+            addr: Value::Local(gep),
+            hint,
+            byte_width: 8,
+        });
+        Value::Local(dst)
+    }
+
     fn lower_subscript_address(
         &mut self,
         base: &Expr,
@@ -3417,9 +3421,8 @@ fn collect_field_initialisers(c: &ClassDecl) -> Vec<(String, &Expr)> {
 /// `reference/runtime/ListDataTypes.h`.
 fn unary_runtime_helper(op: UnaryOp) -> Option<&'static str> {
     Some(match op {
-        UnaryOp::Hd => "__newbcpl_list_hd",
-        UnaryOp::Tl => "__newbcpl_list_tl",
-        UnaryOp::Rest => "__newbcpl_list_rest",
+        // HD / TL / REST are open-coded inline (see lower_unary +
+        // inline_cons_load) — not runtime calls.
         UnaryOp::Len => "__newbcpl_len",
         UnaryOp::FreeVec => "__newbcpl_freevec",
         UnaryOp::FreeList => "__newbcpl_freelist",

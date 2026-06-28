@@ -257,22 +257,6 @@ pub unsafe extern "C-unwind" fn PAIRWISE_ADD(pair: i64) -> i64 {
 // sema pre-seeds. Programs use these to introspect / unpack atoms
 // in a list.
 
-/// `TYPE(list)` — returns the type tag of the first atom in the
-/// list, or `0` (`ATOM_SENTINEL`) if the list is null / empty.
-/// FOREACH-with-two-names also provides this per-atom, but TYPE()
-/// is handy for "what kind of list is this" probes.
-pub unsafe extern "C-unwind" fn TYPE(list_hdr: *const ListHeader) -> i64 {
-    if list_hdr.is_null() {
-        return ATOM_SENTINEL as i64;
-    }
-    let head = unsafe { (*list_hdr).head };
-    if head.is_null() {
-        ATOM_SENTINEL as i64
-    } else {
-        unsafe { (*head).type_tag as i64 }
-    }
-}
-
 // ─── Vector / list reducers (SUM, JOIN) ───────────────────────────
 //
 // Corpus shape:
@@ -311,40 +295,26 @@ pub unsafe extern "C-unwind" fn SUM(v1: *const i64, v2: *const i64) -> *mut i64 
 /// concatenate with `separator` between adjacent atoms. Returns a
 /// fresh null-terminated UTF-8 buffer on the GC heap. Null inputs
 /// return null; an empty list returns an empty string ("").
-pub unsafe extern "C-unwind" fn JOIN(
-    list_hdr: *const ListHeader,
-    separator: *const u8,
-) -> *const u8 {
-    if list_hdr.is_null() {
+pub unsafe extern "C-unwind" fn JOIN(list: i64, separator: *const u8) -> *const u8 {
+    if list == 0 {
         return std::ptr::null();
     }
     let sep_str = unsafe { cstr_to_str(separator) };
     let mut out = String::new();
-    let mut cur = unsafe { (*list_hdr).head };
+    let mut cur = list as *const ConsCell;
     let mut first = true;
+    // Cons cells are untyped words; JOIN renders each hd as a string
+    // pointer (the classic "join a list of strings" use).
     while !cur.is_null() {
-        let atom = unsafe { &*cur };
         if !first {
             out.push_str(sep_str);
         }
         first = false;
-        match atom.type_tag {
-            t if t == ATOM_STRING => {
-                let s = unsafe { cstr_to_str(atom.value as *const u8) };
-                out.push_str(s);
-            }
-            t if t == ATOM_FLOAT => {
-                let f = f64::from_bits(atom.value as u64);
-                out.push_str(&format!("{}", f));
-            }
-            _ => {
-                // ATOM_INT, ATOM_PAIR (which is i64 anyway), and
-                // anything else with a raw word value — render as
-                // decimal integer.
-                out.push_str(&format!("{}", atom.value));
-            }
+        let hd = unsafe { (*cur).hd };
+        if hd != 0 {
+            out.push_str(unsafe { cstr_to_str(hd as *const u8) });
         }
-        cur = atom.next;
+        cur = unsafe { (*cur).tl } as *const ConsCell;
     }
     // Materialise into a GC-managed byte vector so the result has a
     // process-stable address and gets cleaned up by the collector.
@@ -713,156 +683,196 @@ pub unsafe extern "C-unwind" fn RND(max_val: i64) -> f64 {
     FRND() * (max_val as f64)
 }
 
-// ─── list runtime (real linked-list shape) ──────────────────────
+// ─── Cons-cell lists (recycling free-list) ──────────────────────────
 //
-// Mirrors `reference/runtime/ListDataTypes.h` so the layout the JIT
-// emits and the layout the runtime expects agree byte-for-byte.
-// Allocations currently come from `Box::leak` (same shape as our
-// vector / pair stubs); routing list nodes through the GC heap
-// alongside class instances is a clearly-labelled follow-up.
+// A list value is a 64-bit word: NIL (0) or a pointer to a 16-byte cons
+// cell laid out [hd @ +0, tl @ +8] — classic BCPL/Lisp, no header, no
+// per-element tag, no length word. HD/TL/REST and FOREACH traversal are
+// open-coded INLINE in codegen (`p!0` / `p!1` already lower to a
+// GEP+load), so the runtime only provides the recycling allocator and
+// the O(n) helpers (APND / CONCAT / FREELIST). Cells come from a
+// dedicated, tagless 16-byte free-list — NOT `bcpl_heap_alloc` (which
+// prefixes a 16-byte length header that `__newbcpl_len` reads) and NEVER
+// the per-scope arena (lists alias their tails via TL/REST, so they
+// can't be bulk-freed at scope exit).
 
-/// One node of a BCPL list. The `type` tag describes which member of
-/// the value union is live (`ATOM_INT`, `ATOM_FLOAT`, `ATOM_PAIR`,
-/// `ATOM_OBJECT`, ...). The reference reserves slot 0 for the
-/// header (`ATOM_SENTINEL`) so a stray walk through `next` past the
-/// last data node lands on the header rather than wild memory.
 #[repr(C)]
-pub struct ListAtom {
-    pub type_tag: i32,
-    pub pad: i32,
-    /// Untagged 64-bit value slot. Holds an `i64` for `ATOM_INT`,
-    /// the bit pattern of an `f64` for `ATOM_FLOAT`, or a raw
-    /// pointer for `ATOM_STRING` / `ATOM_OBJECT` / `ATOM_LIST_POINTER`.
-    /// PAIR/QUAD/OCT (all 64-bit packed) round-trip through here too.
-    pub value: i64,
-    pub next: *mut ListAtom,
+pub struct ConsCell {
+    pub hd: i64,
+    /// Next cell pointer stored as a word, or 0 for end-of-list.
+    pub tl: i64,
 }
 
-/// The header that every list points to. `head` / `tail` are atoms,
-/// `length` is maintained on each append for O(1) `LEN`. The `type`
-/// field is always `ATOM_SENTINEL` so code walking through a chain
-/// can detect the header bookend.
-#[repr(C)]
-pub struct ListHeader {
-    pub type_tag: i32,
-    pub contains_literals: i32,
-    pub length: i64,
-    pub head: *mut ListAtom,
-    pub tail: *mut ListAtom,
+const CONS_SLAB_CELLS: usize = 1024;
+
+struct ConsPool {
+    /// Free-list head, cells linked through their `tl` field.
+    free: *mut ConsCell,
 }
 
-/// Atom type tags — must match `reference/runtime/ListDataTypes.h`.
-#[allow(dead_code)]
-pub const ATOM_SENTINEL: i32 = 0;
-pub const ATOM_INT: i32 = 1;
-pub const ATOM_FLOAT: i32 = 2;
-pub const ATOM_STRING: i32 = 3;
-#[allow(dead_code)]
-pub const ATOM_LIST_POINTER: i32 = 4;
-pub const ATOM_OBJECT: i32 = 5;
-pub const ATOM_PAIR: i32 = 6;
-
-fn leak_list_header() -> *mut ListHeader {
-    let hdr = Box::new(ListHeader {
-        type_tag: ATOM_SENTINEL,
-        contains_literals: 0,
-        length: 0,
-        head: std::ptr::null_mut(),
-        tail: std::ptr::null_mut(),
-    });
-    Box::leak(hdr) as *mut ListHeader
+thread_local! {
+    static CONS_POOL: std::cell::RefCell<ConsPool> =
+        const { std::cell::RefCell::new(ConsPool { free: std::ptr::null_mut() }) };
 }
 
-fn leak_atom(type_tag: i32, value: i64) -> *mut ListAtom {
-    let atom = Box::new(ListAtom {
-        type_tag,
-        pad: 0,
-        value,
-        next: std::ptr::null_mut(),
-    });
-    Box::leak(atom) as *mut ListAtom
-}
-
-/// Create a fresh empty list. JIT-emitted `LIST(...)` construction
-/// calls this once, then issues an `APND_*` per initialiser.
+/// Allocate one 16-byte cons cell from the recycling free-list, growing
+/// by a slab when empty. `hd`/`tl` are uninitialised — every caller
+/// (LIST construct, APND, CONCAT) writes both before the cell is used.
 #[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn __newbcpl_list_new_empty() -> *mut ListHeader {
-    leak_list_header()
+pub extern "C-unwind" fn __newbcpl_cons_alloc() -> *mut ConsCell {
+    CONS_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        if pool.free.is_null() {
+            // Grow: one slab of cells, threaded onto the free-list. The
+            // slab leaks for the process lifetime (single-mutator JIT).
+            let layout = std::alloc::Layout::array::<ConsCell>(CONS_SLAB_CELLS).unwrap();
+            let base = unsafe { std::alloc::alloc(layout) } as *mut ConsCell;
+            if base.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            let mut prev = std::ptr::null_mut::<ConsCell>();
+            for i in (0..CONS_SLAB_CELLS).rev() {
+                let cell = unsafe { base.add(i) };
+                unsafe { (*cell).tl = prev as i64 };
+                prev = cell;
+            }
+            pool.free = prev;
+        }
+        let cell = pool.free;
+        pool.free = unsafe { (*cell).tl } as *mut ConsCell;
+        cell
+    })
 }
 
-fn append_atom(hdr: *mut ListHeader, atom: *mut ListAtom) {
-    if hdr.is_null() || atom.is_null() {
+/// Push a single cell back onto the free-list for reuse, poisoning `hd`
+/// so a stray read of a freed cell surfaces (a 0, not stale data).
+fn cons_recycle(cell: *mut ConsCell) {
+    if cell.is_null() {
         return;
     }
+    CONS_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        unsafe {
+            (*cell).hd = 0;
+            (*cell).tl = pool.free as i64;
+        }
+        pool.free = cell;
+    });
+}
+
+/// `APND(list, value)` — append `value` to the END of `list`, returning
+/// the (possibly new) head. O(n): callers must capture `xs := APND(xs,v)`.
+/// An empty list (NIL=0) yields a fresh single-cell list. Build by
+/// `LIST`/prepend (O(1)) when order permits — APND is the slow
+/// compatibility path. Every value is a 64-bit word (floats arrive
+/// bit-cast to i64 by codegen), so there is one entry, not per-type.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn APND(head: i64, value: i64) -> i64 {
+    let new_cell = __newbcpl_cons_alloc();
     unsafe {
-        let h = &mut *hdr;
-        if h.head.is_null() {
-            h.head = atom;
-            h.tail = atom;
-        } else {
-            (*h.tail).next = atom;
-            h.tail = atom;
+        (*new_cell).hd = value;
+        (*new_cell).tl = 0;
+    }
+    if head == 0 {
+        return new_cell as i64;
+    }
+    let mut cur = head as *mut ConsCell;
+    loop {
+        let next = unsafe { (*cur).tl };
+        if next == 0 {
+            break;
         }
-        h.length += 1;
+        cur = next as *mut ConsCell;
+    }
+    unsafe { (*cur).tl = new_cell as i64 };
+    head
+}
+
+/// `CONCAT(a, b)` — a fresh copy of `a`'s cells whose last cell points
+/// at `b` (copy-a, share-b). Returns `b` when `a` is empty. The result
+/// ALIASES `b`'s spine: do not `FREELIST` the result while `b` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn CONCAT(a: i64, b: i64) -> i64 {
+    if a == 0 {
+        return b;
+    }
+    let mut src = a as *mut ConsCell;
+    let result = __newbcpl_cons_alloc();
+    unsafe {
+        (*result).hd = (*src).hd;
+        (*result).tl = 0;
+    }
+    let mut last = result;
+    src = unsafe { (*src).tl } as *mut ConsCell;
+    while !src.is_null() {
+        let cell = __newbcpl_cons_alloc();
+        unsafe {
+            (*cell).hd = (*src).hd;
+            (*cell).tl = 0;
+            (*last).tl = cell as i64;
+        }
+        last = cell;
+        src = unsafe { (*src).tl } as *mut ConsCell;
+    }
+    unsafe { (*last).tl = b };
+    result as i64
+}
+
+/// `FREELIST(list)` — recycle every cell of an OWNED chain back onto the
+/// cons free-list for reuse. BY CONTRACT (like `FREEVEC`): the chain must
+/// not be shared — `TL`/`REST` return interior cells and `CONCAT` shares
+/// `b`'s spine, so freeing a shared list double-frees. The programmer's
+/// explicit responsibility. Returns 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn __newbcpl_freelist(head: i64) -> i64 {
+    let mut cur = head as *mut ConsCell;
+    while !cur.is_null() {
+        let next = unsafe { (*cur).tl } as *mut ConsCell;
+        cons_recycle(cur);
+        cur = next;
+    }
+    0
+}
+
+/// `LEN(list)` — count the cells by walking `tl` (O(n); cons cells carry
+/// no length word). VEC `LEN` still uses `__newbcpl_len` (the p[-1] word).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn __newbcpl_cons_len(head: i64) -> i64 {
+    let mut n = 0i64;
+    let mut cur = head as *const ConsCell;
+    while !cur.is_null() {
+        n += 1;
+        cur = unsafe { (*cur).tl } as *const ConsCell;
+    }
+    n
+}
+
+// Function-call-form list accessors. The prefix operators HD/TL/REST are
+// open-coded inline by codegen (`p!0` / `p!1`); these exist so the
+// call-form `HD(xs)` / `TL(xs)` / `TAIL(xs)` still resolves. Each is a
+// single guarded load (NIL → 0).
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn HD(head: i64) -> i64 {
+    if head == 0 {
+        0
+    } else {
+        unsafe { (*(head as *const ConsCell)).hd }
     }
 }
 
-/// `APND(list, n)` — append an integer atom to `list`. The same
-/// entry point handles boolean / character / packed-word values
-/// since BCPL treats every word identically at the ABI.
 #[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn APND(hdr: *mut ListHeader, value: i64) -> i64 {
-    append_atom(hdr, leak_atom(ATOM_INT, value));
-    0
-}
-
-/// Float-typed append (BCPL `FPND` in the reference; aliased to
-/// `APND_FLOAT` for our emit's per-arg type dispatch). The value
-/// comes in as `f64`; we reinterpret-store its bits in the atom's
-/// `i64` value slot.
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn APND_FLOAT(hdr: *mut ListHeader, value: f64) -> i64 {
-    append_atom(hdr, leak_atom(ATOM_FLOAT, value.to_bits() as i64));
-    0
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn APND_STRING(hdr: *mut ListHeader, ptr: *const u8) -> i64 {
-    append_atom(hdr, leak_atom(ATOM_STRING, ptr as i64));
-    0
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn APND_OBJECT(hdr: *mut ListHeader, ptr: *const u8) -> i64 {
-    append_atom(hdr, leak_atom(ATOM_OBJECT, ptr as i64));
-    0
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn APND_PAIR(hdr: *mut ListHeader, packed: i64) -> i64 {
-    append_atom(hdr, leak_atom(ATOM_PAIR, packed));
-    0
-}
-
-/// `CONCAT(a, b)` — return a fresh list whose atoms are a copy of
-/// `a` followed by a copy of `b`. The reference's
-/// `BCPL_CONCAT_LISTS` is destructive (rewires `a.tail.next`);
-/// we copy for safety since neither header is GC-tracked yet.
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn CONCAT(a: *mut ListHeader, b: *mut ListHeader) -> *mut ListHeader {
-    let result = leak_list_header();
-    for src in [a, b] {
-        if src.is_null() {
-            continue;
-        }
-        let mut cur = unsafe { (*src).head };
-        while !cur.is_null() {
-            let (tt, v) = unsafe { ((*cur).type_tag, (*cur).value) };
-            append_atom(result, leak_atom(tt, v));
-            cur = unsafe { (*cur).next };
-        }
+pub unsafe extern "C-unwind" fn TL(head: i64) -> i64 {
+    if head == 0 {
+        0
+    } else {
+        unsafe { (*(head as *const ConsCell)).tl }
     }
-    result
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn TAIL(head: i64) -> i64 {
+    unsafe { TL(head) }
 }
 
 // ─── vector / list runtime helpers ───────────────────────────────
@@ -1009,25 +1019,9 @@ pub unsafe extern "C-unwind" fn __newbcpl_len(p: *const i64) -> i64 {
     unsafe { *p.offset(-1) }
 }
 
-/// `__newbcpl_list_len(header)` — length of a real `ListHeader`,
-/// O(1) (the length is maintained on every append). Returns 0 for
-/// null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn __newbcpl_list_len(hdr: *const ListHeader) -> i64 {
-    if hdr.is_null() {
-        return 0;
-    }
-    unsafe { (*hdr).length }
-}
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn __newbcpl_freevec(p: *mut i64) -> i64 {
     unsafe { crate::heap::bcpl_heap_free(p as *mut u8) };
-    0
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn __newbcpl_freelist(_p: *mut i64) -> i64 {
     0
 }
 
@@ -1110,103 +1104,6 @@ pub unsafe extern "C-unwind" fn __newbcpl_alloc_rec(size: i64) -> *mut u8 {
     // lands here and is reclaimed by explicit FREEVEC (or leaks for the
     // process lifetime, which is fine for short programs).
     unsafe { crate::heap::bcpl_heap_alloc(size.max(0) as usize) }
-}
-
-/// `HD(list)` — read the value of the first atom. Returns 0 if
-/// the list is null or empty. The atom's `type_tag` is ignored
-/// here; BCPL treats every value as a 64-bit word at the call
-/// site, with the caller responsible for interpretation (`HD` of
-/// a list-of-pairs is an i64-packed PAIR, etc.).
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn __newbcpl_list_hd(hdr: *const ListHeader) -> i64 {
-    if hdr.is_null() {
-        return 0;
-    }
-    let head = unsafe { (*hdr).head };
-    if head.is_null() {
-        return 0;
-    }
-    unsafe { (*head).value }
-}
-
-/// `TL(list)` — return a fresh header whose contents are every
-/// atom after the head, sharing the same nodes. The original
-/// list is unmodified. Returns null for empty / null input.
-///
-/// Sharing nodes is a deliberate choice: BCPL `tl` is the
-/// constant-time list spine — copying every node would change
-/// O(1) into O(n). When the GC migration of list nodes lands,
-/// the sharing is still safe because we mark via the head
-/// pointer's reachability.
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn __newbcpl_list_tl(hdr: *mut ListHeader) -> *mut ListHeader {
-    if hdr.is_null() {
-        return std::ptr::null_mut();
-    }
-    let head = unsafe { (*hdr).head };
-    if head.is_null() {
-        return std::ptr::null_mut();
-    }
-    let next = unsafe { (*head).next };
-    if next.is_null() {
-        // Empty tail — return an empty list header so callers
-        // can chain `TL(TL(...))` without null checks.
-        return leak_list_header();
-    }
-    let new_hdr = leak_list_header();
-    unsafe {
-        (*new_hdr).head = next;
-        (*new_hdr).tail = (*hdr).tail;
-        (*new_hdr).length = (*hdr).length - 1;
-    }
-    new_hdr
-}
-
-/// `REST(list, n)` — skip the first `n` atoms. Same sharing
-/// strategy as `TL`. `n <= 0` returns the original; null in →
-/// null out.
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn __newbcpl_list_rest(hdr: *mut ListHeader, n: i64) -> *mut ListHeader {
-    if hdr.is_null() {
-        return std::ptr::null_mut();
-    }
-    if n <= 0 {
-        return hdr;
-    }
-    let mut cur = unsafe { (*hdr).head };
-    let mut skipped = 0i64;
-    while !cur.is_null() && skipped < n {
-        cur = unsafe { (*cur).next };
-        skipped += 1;
-    }
-    let new_hdr = leak_list_header();
-    unsafe {
-        (*new_hdr).head = cur;
-        (*new_hdr).tail = (*hdr).tail;
-        (*new_hdr).length = (*hdr).length - skipped;
-    }
-    new_hdr
-}
-
-// Function-call-form aliases of the list helpers. BCPL programs
-// can write either the prefix operators (`HD list`, `TL list`) or
-// the function-call form (`HD(list)`, `TAIL(list)`) — sema /
-// lowering treats the function-call form as a free function so we
-// expose the same addresses under those names.
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn HD(hdr: *const ListHeader) -> i64 {
-    unsafe { __newbcpl_list_hd(hdr) }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn TL(hdr: *mut ListHeader) -> *mut ListHeader {
-    unsafe { __newbcpl_list_tl(hdr) }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn TAIL(hdr: *mut ListHeader) -> *mut ListHeader {
-    unsafe { __newbcpl_list_tl(hdr) }
 }
 
 /// `SPLIT(s, delim)` — placeholder. Real implementation needs the
@@ -1314,18 +1211,11 @@ pub fn builtin_addresses() -> &'static [Builtin] {
             builtin!(FREEVEC),
             builtin!(SPLIT),
             builtin!(__newbcpl_len),
-            builtin!(__newbcpl_list_len),
             builtin!(__newbcpl_freevec),
             builtin!(__newbcpl_freelist),
-            builtin!(__newbcpl_list_hd),
-            builtin!(__newbcpl_list_tl),
-            builtin!(__newbcpl_list_rest),
-            builtin!(__newbcpl_list_new_empty),
+            builtin!(__newbcpl_cons_alloc),
+            builtin!(__newbcpl_cons_len),
             builtin!(APND),
-            builtin!(APND_FLOAT),
-            builtin!(APND_STRING),
-            builtin!(APND_OBJECT),
-            builtin!(APND_PAIR),
             builtin!(CONCAT),
             Builtin {
                 name: "__newbcpl_new_rec",
@@ -1360,7 +1250,6 @@ pub fn builtin_addresses() -> &'static [Builtin] {
             builtin!(PAIRWISE_MIN),
             builtin!(PAIRWISE_MAX),
             builtin!(PAIRWISE_ADD),
-            builtin!(TYPE),
             builtin!(SUM),
             builtin!(JOIN),
             builtin!(IGETVEC),
@@ -2020,106 +1909,108 @@ mod heap_tests {
     }
 
     #[test]
-    fn list_append_grows_length_and_preserves_value() {
+    fn list_apnd_builds_cons_chain() {
         let _guard = heap_test_lock();
-        // Spirit of the reference's list-data tests: a fresh
-        // `ListHeader` starts empty; each `APND` bumps the
-        // length by 1 and links a new `ATOM_INT` atom; `HD`
-        // returns the first appended value.
-        let hdr = unsafe { __newbcpl_list_new_empty() };
-        assert!(!hdr.is_null());
-        assert_eq!(unsafe { __newbcpl_list_len(hdr) }, 0);
+        // Cons-cell APND: an empty list is NIL=0; APND returns the
+        // (possibly new) head. Walk via tl; HD reads the first value.
+        let mut xs: i64 = 0;
         unsafe {
-            APND(hdr, 10);
-            APND(hdr, 20);
-            APND(hdr, 30);
+            xs = APND(xs, 10);
+            xs = APND(xs, 20);
+            xs = APND(xs, 30);
         }
-        assert_eq!(unsafe { __newbcpl_list_len(hdr) }, 3);
-        assert_eq!(unsafe { __newbcpl_list_hd(hdr) }, 10);
-        // Walk the chain by hand to confirm node ordering.
-        let mut cur = unsafe { (*hdr).head };
+        assert_ne!(xs, 0);
+        assert_eq!(unsafe { HD(xs) }, 10);
+        let mut cur = xs as *const ConsCell;
         let expected = [10i64, 20, 30];
+        let mut n = 0;
         for want in &expected {
             assert!(!cur.is_null(), "chain ended too soon");
-            assert_eq!(unsafe { (*cur).value }, *want);
-            assert_eq!(unsafe { (*cur).type_tag }, ATOM_INT);
-            cur = unsafe { (*cur).next };
+            assert_eq!(unsafe { (*cur).hd }, *want);
+            cur = unsafe { (*cur).tl } as *const ConsCell;
+            n += 1;
         }
         assert!(cur.is_null(), "chain longer than appended count");
+        assert_eq!(n, 3);
     }
 
     #[test]
-    fn list_tl_shares_tail_nodes() {
+    fn list_tl_returns_shared_tail_cell() {
         let _guard = heap_test_lock();
-        // `TL` returns a new header that re-uses the existing
-        // atom chain — sharing is intentional and O(1). After
-        // `TL`, `HD` of the result is the original list's second
-        // element.
-        let hdr = unsafe { __newbcpl_list_new_empty() };
+        // TL returns the tl word — the SHARED second cell (a cons
+        // pointer), not a copy. HD of it is the second element.
+        let mut xs: i64 = 0;
         unsafe {
-            APND(hdr, 100);
-            APND(hdr, 200);
-            APND(hdr, 300);
+            xs = APND(xs, 100);
+            xs = APND(xs, 200);
+            xs = APND(xs, 300);
         }
-        let tail = unsafe { __newbcpl_list_tl(hdr) };
-        assert!(!tail.is_null());
-        assert_eq!(unsafe { __newbcpl_list_len(tail) }, 2);
-        assert_eq!(unsafe { __newbcpl_list_hd(tail) }, 200);
-        // Original is unmodified.
-        assert_eq!(unsafe { __newbcpl_list_len(hdr) }, 3);
-        assert_eq!(unsafe { __newbcpl_list_hd(hdr) }, 100);
+        let tail = unsafe { TL(xs) };
+        assert_ne!(tail, 0);
+        assert_eq!(unsafe { HD(tail) }, 200);
+        // Sharing: TL aliases the original spine's second cell.
+        let second = unsafe { (*(xs as *const ConsCell)).tl };
+        assert_eq!(tail, second);
+        // Original head unchanged.
+        assert_eq!(unsafe { HD(xs) }, 100);
     }
 
     #[test]
-    fn list_concat_produces_combined_chain() {
+    fn list_concat_combines_chains() {
         let _guard = heap_test_lock();
-        // `CONCAT` makes a fresh header whose atoms copy from
-        // `a` and then `b`. Both inputs survive unchanged.
-        let a = unsafe { __newbcpl_list_new_empty() };
+        // CONCAT copies a's cells, last points at b (copy-a, share-b).
+        let mut a: i64 = 0;
         unsafe {
-            APND(a, 1);
-            APND(a, 2);
+            a = APND(a, 1);
+            a = APND(a, 2);
         }
-        let b = unsafe { __newbcpl_list_new_empty() };
+        let mut b: i64 = 0;
         unsafe {
-            APND(b, 3);
-            APND(b, 4);
-            APND(b, 5);
+            b = APND(b, 3);
+            b = APND(b, 4);
+            b = APND(b, 5);
         }
         let c = unsafe { CONCAT(a, b) };
-        assert_eq!(unsafe { __newbcpl_list_len(c) }, 5);
-        let mut cur = unsafe { (*c).head };
+        let mut cur = c as *const ConsCell;
         for want in 1..=5i64 {
-            assert_eq!(unsafe { (*cur).value }, want);
-            cur = unsafe { (*cur).next };
+            assert!(!cur.is_null());
+            assert_eq!(unsafe { (*cur).hd }, want);
+            cur = unsafe { (*cur).tl } as *const ConsCell;
         }
-        assert_eq!(unsafe { __newbcpl_list_len(a) }, 2);
-        assert_eq!(unsafe { __newbcpl_list_len(b) }, 3);
+        // a's head unchanged (copy-a).
+        assert_eq!(unsafe { HD(a) }, 1);
     }
 
     #[test]
-    fn float_appends_round_trip_through_atom_value() {
+    fn float_round_trips_through_cons_cell() {
         let _guard = heap_test_lock();
-        // `APND_FLOAT` reinterprets the double's bits into the
-        // atom's `i64` value slot. Reading them back as `f64`
-        // bits must restore the original number — confirms the
-        // bit-cast direction and atom-tag bookkeeping.
-        let hdr = unsafe { __newbcpl_list_new_empty() };
+        // A float element is stored as its f64 bit pattern in the hd
+        // word (cons cells are untyped); read back via from_bits.
+        let mut xs: i64 = 0;
         unsafe {
-            APND_FLOAT(hdr, 3.5);
-            APND_FLOAT(hdr, -2.25);
+            xs = APND(xs, 3.5f64.to_bits() as i64);
+            xs = APND(xs, (-2.25f64).to_bits() as i64);
         }
-        let head = unsafe { (*hdr).head };
-        let second = unsafe { (*head).next };
-        assert_eq!(unsafe { (*head).type_tag }, ATOM_FLOAT);
-        assert_eq!(unsafe { (*second).type_tag }, ATOM_FLOAT);
-        assert_eq!(
-            f64::from_bits(unsafe { (*head).value } as u64),
-            3.5,
-        );
-        assert_eq!(
-            f64::from_bits(unsafe { (*second).value } as u64),
-            -2.25,
-        );
+        let h = unsafe { HD(xs) };
+        let s = unsafe { HD(TL(xs)) };
+        assert_eq!(f64::from_bits(h as u64), 3.5);
+        assert_eq!(f64::from_bits(s as u64), -2.25);
+    }
+
+    #[test]
+    fn freelist_recycles_cells() {
+        let _guard = heap_test_lock();
+        // FREELIST returns cells to the pool; the next allocations
+        // reuse them (no crash, recycling works).
+        let mut xs: i64 = 0;
+        unsafe {
+            xs = APND(xs, 1);
+            xs = APND(xs, 2);
+            __newbcpl_freelist(xs);
+            // Rebuild — should reuse recycled cells.
+            let mut ys: i64 = 0;
+            ys = APND(ys, 9);
+            assert_eq!(HD(ys), 9);
+        }
     }
 }

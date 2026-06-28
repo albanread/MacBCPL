@@ -159,7 +159,9 @@ fn list_tl_skips_one_element() {
 fn apnd_grows_an_empty_list() {
     expect(
         "apnd_grows_an_empty_list",
-        "LET START() BE $(\n  LET xs = LIST()\n  APND(xs, 11)\n  APND(xs, 22)\n  APND(xs, 33)\n  WRITEN(LEN(xs))\n  WRITES(\"*S\")\n  WRITEN(HD(xs))\n$)\n",
+        // Cons-cell APND returns the (possibly new) head, so the caller
+        // captures it: `xs := APND(xs, v)` (the first APND is on NIL).
+        "LET START() BE $(\n  LET xs = LIST()\n  xs := APND(xs, 11)\n  xs := APND(xs, 22)\n  xs := APND(xs, 33)\n  WRITEN(LEN(xs))\n  WRITES(\"*S\")\n  WRITEN(HD(xs))\n$)\n",
         "3 11",
     );
 }

@@ -833,16 +833,23 @@ mod tests {
     // ─── list runtime helpers + GOTO / labels ───────────────────
 
     #[test]
-    fn hd_lowers_to_runtime_call() {
+    fn hd_lowers_to_inline_load() {
+        // Cons-cell lists: HD x is open-coded as a GEP + IndirectLoad
+        // (the cell's hd word), NOT a runtime call.
         let m = lower_source("LET S(xs) BE { LET h = HD xs }");
         let s = function(&m, "S");
         let entry = &s.blocks[0];
         let has_call = entry.instrs.iter().any(|i| matches!(
             i,
             Instr::Call { callee: Value::Function(name), .. }
-                if name == "__newbcpl_list_hd"
+                if name.starts_with("__newbcpl_list_hd")
         ));
-        assert!(has_call, "expected runtime call to __newbcpl_list_hd");
+        assert!(!has_call, "HD must be inline, not a runtime call");
+        let has_load = entry
+            .instrs
+            .iter()
+            .any(|i| matches!(i, Instr::IndirectLoad { .. }));
+        assert!(has_load, "expected an inline IndirectLoad for HD");
     }
 
     #[test]
