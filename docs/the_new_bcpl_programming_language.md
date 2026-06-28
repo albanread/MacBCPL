@@ -1085,7 +1085,9 @@ with Cocoa's own `init`/`release`, a collision that would otherwise make
 `[[C alloc] init]` followed by your `CREATE`; a method call is an
 `objc_msgSend`; `SUPER` is `objc_msgSendSuper`; `RETAIN`/release are
 `objc_retain`/`objc_release`. This is also the door to the Cocoa frameworks: the
-same object that runs your BCPL methods can be handed to AppKit.
+same object that runs your BCPL methods can be handed to AppKit. To call Cocoa's
+*own* methods — under their real selectors, not the mangled `bcpl_` ones — use
+the bracket message send of Chapter 10.
 
 > **Exercise 7-1.** Add a `Shape` base class with a `VIRTUAL FUNCTION area()`,
 > and `Circle`/`Square` subclasses. Write a routine that takes a `Shape` and
@@ -1164,9 +1166,13 @@ The foundation was laid in Chapter 7: a `CLASS` instance is a real Objective-C
 object, allocated by the runtime, dispatched by `objc_msgSend`, freed by
 retain/release. This part takes up the Cocoa **types and facilities** that build
 on that foundation. It begins with the one every program already uses without
-thinking about it — the string — which is now an `NSString`. The graphical side
-(windows and drawing over Cocoa/AppKit) is being built on the same bridge and
-will be documented here as it lands.
+thinking about it — the string — which is now an `NSString` (Chapter 9). Chapter
+10 then opens the whole of Cocoa: the **bracket message send**, `[receiver
+selector: arg …]`, which lets a BCPL program call any Objective-C method on any
+object. With it the frameworks are reachable today — the worked examples drive
+`NSProcessInfo`, `NSMutableArray`, `NSFont` geometry, an `NSAlert` dialog, and a
+real `NSWindow` — and a higher-level, BCPL-flavored wrapping of AppKit will grow
+here on top of it.
 
 ---
 
@@ -1341,16 +1347,34 @@ LET initials(s AS STRING) = VALOF $(
 $)
 ```
 
-### 9.7 What is not here yet
+### 9.7 A string is a Cocoa object you can message
 
-A string *is* an `NSString`, but the bridge that lets you call arbitrary Cocoa
-methods on one is not yet wired: a BCPL method call mangles its selector (§7.7),
-so `s.length()` sends `bcpl_length`, which `NSString` does not answer, and the
-program raises an Objective-C *unrecognized selector* exception. Calling Cocoa's
-own methods on a string — `length`, `compare:`, `uppercaseString`, and the rest
-— waits on the raw-selector escape hatch noted in §7.7. Until then, use the
-BCPL built-ins (`LEN`, `%`, `WRITES`, `WRITEF`, `JOIN`) for text work; they are
-code-point-correct, which the raw Cocoa methods (UTF-16-based) are not.
+Because a string is a genuine `NSString`, you can send it any Cocoa message with
+the **bracket syntax** of Chapter 10 — the whole `NSString` interface is open to
+you:
+
+```bcpl
+LET up     = [s uppercaseString]              // a new string: "CAFÉ"
+LET joined = [s stringByAppendingString: " and more"]
+LET n      = [s length]                       // UTF-16 unit count
+```
+
+and a string literal is a valid `NSString` argument or collection element
+anywhere Cocoa expects one:
+
+```bcpl
+[dict setObject: "London" forKey: "city"]
+```
+
+One subtlety pairs with §9.3. Cocoa counts text in UTF-16 code units, so
+`[s length]` is the UTF-16 unit count — which differs from BCPL's `LEN(s)`
+(code points) for characters outside the Basic Multilingual Plane: an emoji is
+one `LEN` but two `[s length]`. Use the code-point-correct BCPL built-ins
+(`LEN`, `%`, `WRITEC`) when the unit should be the character; reach for the
+Cocoa methods when you want Cocoa's own operations — case folding, searching,
+path manipulation. Chapter 10 covers the messaging syntax, the synthesized
+return types, and — the part that bites — who owns the result a message hands
+back.
 
 > **Under the hood.** A literal's bytes are cooked at compile time (escapes
 > resolved to UTF-8) and the `NSString` is built once, on first use, with
@@ -1370,6 +1394,219 @@ code-point-correct, which the raw Cocoa methods (UTF-16-based) are not.
 > **Exercise 9-2.** Write `count(s, c)` returning how many times code point `c`
 > occurs in `s`. Test it on `"mississippi"` and on a string with an emoji, to
 > convince yourself the unit of counting is the character, not the byte.
+
+---
+
+## Chapter 10. Sending Cocoa Messages
+
+A `CLASS` (Chapter 7) lets you *define* objects, and the dot call `obj.method()`
+sends them your own BCPL methods. But the macOS frameworks are millions of lines
+of Objective-C you did not write, reachable only through their *real* selectors —
+`length`, `setObject:forKey:`, `initWithContentRect:styleMask:backing:defer:`.
+For those, New BCPL has the **bracket message send**, borrowed straight from
+Objective-C:
+
+```bcpl
+[receiver selector: arg  selector: arg  …]
+```
+
+Everything in this chapter compiles to a single `objc_msgSend`. With it, a BCPL
+program can drive any Cocoa object.
+
+### 10.1 The forms
+
+A message names a *receiver* and a *selector*, optionally with arguments. The
+selector is read straight from the brackets, unmangled, exactly as Objective-C
+spells it:
+
+```bcpl
+[obj removeAllObjects]                         // zero-argument selector
+[s stringByAppendingString: " World"]          // one keyword + argument
+[d setObject: v forKey: k]                      // multi-keyword: setObject:forKey:
+[NSString stringWithString: other]             // class as receiver (class method)
+[[NSMutableArray alloc] init]                  // nesting: send to a send's result
+```
+
+A multi-keyword selector is assembled from the keyword parts in order, so the
+third line above sends `setObject:forKey:` with two arguments. A message may
+stand alone as a statement when you want only its effect:
+
+```bcpl
+[a addObject: "alpha"]
+```
+
+### 10.2 Receivers
+
+The receiver before the selector may be:
+
+- **a Cocoa class**, written as a bare capitalized name — `NSString`,
+  `NSProcessInfo`, `NSWindow`. An unbound name in receiver position is resolved
+  to the Objective-C class of that name, so class methods just work:
+  `[NSProcessInfo processInfo]`.
+- **an instance** — any expression that evaluates to an object: a variable, a
+  field, a nested bracket send, a parenthesized expression.
+- **`SELF`**, inside a class method, to message your own object with a raw
+  selector.
+
+`SUPER` is *not* a bracket receiver — for a superclass call use the
+`SUPER.method()` form of Chapter 7; the compiler will tell you so if you try
+`[SUPER …]`.
+
+### 10.3 Return types are synthesized
+
+A message's result type matters: an integer comes back in a different machine
+register than a double, and a string must be treated as an `NSString`, not a raw
+word. New BCPL **synthesizes the return type from a selector database** — the
+same `cocoa-selectors.json` (5,500-odd selectors) that records each method's
+Objective-C type encoding. So the common getters need no annotation at all:
+
+```bcpl
+LET n   = [arr count]              // -> INT
+LET x   = [num doubleValue]        // -> FLOAT
+LET up  = [s uppercaseString]      // -> a String (NSString)
+LET obj = [[NSObject alloc] init]  // -> Object
+```
+
+When the database does not cover a selector, or you want to override it, append
+a trailing **`AS Type`**:
+
+```bcpl
+LET clicked = [alert runModal] AS INT
+LET pi      = [thing somethingExotic] AS FLOAT
+```
+
+The same `AS Type` works on an *argument* when a selector expects a particular
+machine type — most often a `double`, which must travel in a floating register:
+
+```bcpl
+LET f = [NSFont systemFontOfSize: 14 AS FLOAT]
+```
+
+The default, absent any annotation or database entry, is `Object`.
+
+### 10.4 Strings and collections
+
+Because a BCPL string is an `NSString` (Chapter 9), strings are first-class in
+this world: they are receivers, arguments, and collection elements without any
+conversion. A small program that builds and queries Cocoa collections:
+
+```bcpl
+LET START() BE $(
+    LET a = [[NSMutableArray alloc] init]
+    [a addObject: "alpha"]
+    [a addObject: "beta"]
+    [a addObject: "gamma"]
+    WRITEN([a count] AS INT)                         // 3
+    WRITES([a objectAtIndex: 0]); NEWLINE()          // alpha
+    WRITES([a componentsJoinedByString: " - "])      // alpha - beta - gamma
+    NEWLINE()
+
+    LET d = [[NSMutableDictionary alloc] init]
+    [d setObject: "Ada Lovelace" forKey: "name"]
+    WRITES([d objectForKey: "name"]); NEWLINE()      // Ada Lovelace
+$)
+```
+
+String methods chain as you would expect, each returning a new string:
+
+```bcpl
+LET who = [["macbcpl" uppercaseString] stringByAppendingString: " on Cocoa"]
+WRITES(who)                                          // MACBCPL on Cocoa
+```
+
+(Remember §9.7: `[s length]` counts UTF-16 units, not code points. For
+character-accurate work use BCPL's `LEN` and `%`.)
+
+### 10.5 Methods that return C structs
+
+Many Cocoa methods return a small C structure — a rectangle, a point, a size, a
+range. New BCPL recognizes the geometry types in the selector database and
+**materializes the struct as a BCPL vector** you index by field name. The field
+names are predeclared constants:
+
+```bcpl
+// NSRange is an integer pair -> a VEC, read with the word subscript `!`
+LET r = ["the quick brown fox" rangeOfString: "brown"]
+WRITEN(r ! NSRange_location)        // 10
+WRITEN(r ! NSRange_length)          // 5
+
+// NSSize / NSPoint are two doubles, NSRect four -> an FVEC, read with `.%`
+LET box = [someFont boundingRectForFont]
+FWRITE(box .% NSRect_width)
+FWRITE(box .% NSRect_height)
+```
+
+The seeded names are `NSRect_x`, `NSRect_y`, `NSRect_width`, `NSRect_height`;
+`NSPoint_x`, `NSPoint_y`; `NSSize_width`, `NSSize_height`; and
+`NSRange_location`, `NSRange_length`. A floating struct (rect, point, size)
+comes back as an `FVEC` read with `.%`; the integer `NSRange` as a `VEC` read
+with `!`. You never deal with the calling-convention details — the arm64 backend
+applies the platform struct-return ABI for you.
+
+### 10.6 Passing a struct by value
+
+The reverse direction works too: where a selector takes a struct *argument* —
+`setFrame:`, `initWithContentRect:`, `valueWithRect:` — you pass an `FVEC` (or
+`VEC`) of the right shape and it is handed over by value:
+
+```bcpl
+LET rect = FVEC [200.0, 200.0, 720.0, 480.0]        // x, y, width, height
+LET w = [[NSWindow alloc] initWithContentRect: rect styleMask: 15
+                          backing: 2 defer: 0]
+[w setTitle: "MacBCPL — Cocoa from BCPL"]
+[w center]
+[w makeKeyAndOrderFront: 0]
+```
+
+That is, in full, how you open a native window from BCPL.
+
+### 10.7 Who owns the result — and a hazard
+
+This is the part to get right. Unlike `NEW` and `JOIN`, **the result of a
+bracket send is not tracked for you.** The compiler does not know, in general,
+whether a message returns something you own or merely borrow, so it does
+nothing automatic — no release at scope exit. You manage these objects
+explicitly, with `[x retain]` / `[x release]` or by binding with `USING`.
+
+There is a sharper edge behind this. The JIT runs with **no autorelease pool**.
+In normal Cocoa, the `+0` "convenience" constructors — `stringWithUTF8String:`,
+`[NSNumber numberWithDouble:]`, and friends — return an object registered with
+the current autorelease pool, which drains later. With no pool, such an object's
+lifetime is undefined: it may be valid now and gone an instant later. The rule
+that keeps you safe is the classic Objective-C one:
+
+> Prefer the **`alloc`/`init`** (`+1`-owned) form over the convenience
+> constructor, and `[x release]` it (or `USING` it) when done.
+
+So write `[[NSMutableArray alloc] init]`, not `[NSMutableArray array]`; build a
+string with `JOIN` or a kept `NSString`, not an untracked `stringWithFormat:`
+result you stash for later. Within a single expression a convenience result is
+fine; it is *keeping* one across time that is unsafe until a pool exists.
+
+### 10.8 Dot or bracket?
+
+Both send Objective-C messages; the difference is whose selectors they reach.
+
+- `obj.method(args)` — Chapter 7 — calls **your** BCPL methods. The selector is
+  mangled to `bcpl_method`, which is what isolates your methods from Cocoa's.
+- `[obj method: args]` — this chapter — calls **Cocoa's** methods under their
+  real, unmangled selectors.
+
+Use the dot for objects you defined with `CLASS`; use brackets to drive the
+frameworks. A single program mixes them freely — a BCPL object can be passed to
+AppKit, and a Cocoa object can be stored in a BCPL field.
+
+> **Exercise 10-1.** Using `NSProcessInfo`, print the process name, the active
+> processor count (`AS INT`), and the operating-system version string. Which
+> results needed an annotation, and why?
+>
+> **Exercise 10-2.** Build an `NSMutableArray` of three strings, then print them
+> joined by `", "` with `componentsJoinedByString:`. Now do the same with BCPL's
+> `JOIN` over a `LIST`. Which owns its result?
+>
+> **Exercise 10-3.** Call a method that returns an `NSRect` (e.g. a font's
+> bounding rectangle) and print its width and height by field name. What kind of
+> vector did you get back, and which subscript reads it?
 
 ---
 
@@ -1591,12 +1828,17 @@ expr        ::= expr "->" expr "," expr                 // conditional
               | expr ".|" expr "|"                       // lane
               | "VALOF" stmt | "FVALOF" stmt
               | "NEW" name ["(" [args] ")"]
+              | objcmsg                                   // Cocoa message send
               | "VEC" expr | "FVEC" expr
               | "TABLE" "(" args ")" | "FTABLE" "(" args ")"
               | "LIST" "(" [args] ")" | "MANIFESTLIST" "(" [args] ")"
               | "PAIR" "(" args ")"  | "QUAD" "(" args ")" | "OCT" "(" args ")"
               | constant | name | "SELF" | "SUPER" | "?"
               | "(" expr ")"
+
+objcmsg     ::= "[" receiver name "]" ["AS" type]                       // unary
+              | "[" receiver { name ":" expr ["AS" type] }+ "]" ["AS" type]  // keyword
+receiver    ::= "SELF" | name | expr        // a bare capitalized name = a Cocoa class
 ```
 
 ---
