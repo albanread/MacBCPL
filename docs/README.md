@@ -25,6 +25,7 @@ big departures from upstream NewBCPL are:
 
 ## Index
 
+- **[the_new_bcpl_programming_language.md](the_new_bcpl_programming_language.md)** — the language manual: a K&R-style tutorial and reference for New BCPL (with Cocoa), covering the lexis, types, control flow, functions, pointers/vectors, lists, classes, and the memory model, with a grammar and standard-library appendix.
 - **[macos_build.md](macos_build.md)** — toolchain, build env, and how to run the JIT on Apple Silicon.
 - **[memory_model.md](memory_model.md)** — the no-GC, three-tier "heap objects with stack scope" model.
 - **[cocoa_objects.md](cocoa_objects.md)** — `CLASS`/`EXTENDS`/`NEW`/`SUPER` lowered onto the Obj-C runtime; object ownership.
