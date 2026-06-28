@@ -585,6 +585,11 @@ pub enum Expr {
         /// `(field_count, is_float)` — the result is materialized as an
         /// N-field FVEC (float) or VEC (word). `None` for scalar/id returns.
         ret_struct: Cell<Option<(u32, bool)>>,
+        /// Set by sema, one slot per `args`: a geometry struct ARGUMENT
+        /// `(field_count, is_float)` (e.g. `setFrame:` takes an NSRect).
+        /// The caller passes an FVEC/VEC and codegen loads its N fields as
+        /// a by-value struct argument. `None` for scalar/id args.
+        arg_structs: std::cell::RefCell<Vec<Option<(u32, bool)>>>,
         span: Span,
         hint: Cell<TypeHint>,
     },

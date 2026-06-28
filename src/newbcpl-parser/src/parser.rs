@@ -2510,6 +2510,7 @@ impl Parser {
             arg_annotations,
             ret_annotation,
             ret_struct: std::cell::Cell::new(None),
+            arg_structs: std::cell::RefCell::new(Vec::new()),
             span: SourceSpan {
                 start,
                 end: close.span.end,

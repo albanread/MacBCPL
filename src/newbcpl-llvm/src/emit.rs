@@ -1246,11 +1246,12 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                 selector,
                 args,
                 arg_hints,
+                arg_structs,
                 ret_struct,
                 hint,
             } => {
                 self.emit_objc_raw_dispatch(
-                    *dst, receiver, selector, args, arg_hints, *ret_struct, *hint,
+                    *dst, receiver, selector, args, arg_hints, arg_structs, *ret_struct, *hint,
                 );
             }
         }
@@ -1271,6 +1272,7 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         selector: &str,
         args: &[Value],
         arg_hints: &[TypeHint],
+        arg_structs: &[Option<(u32, bool)>],
         ret_struct: Option<(u32, bool)>,
         hint: TypeHint,
     ) {
@@ -1309,7 +1311,23 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         call_args.push(sel.into());
         for (i, a) in args.iter().enumerate() {
             let v = self.lower_value(a);
-            if matches!(arg_hints.get(i), Some(TypeHint::Float)) {
+            if let Some((n, is_float)) = arg_structs.get(i).copied().flatten() {
+                // Geometry struct ARGUMENT: the value is an FVEC/VEC data
+                // pointer; load its N fields as a by-value struct so the
+                // arm64 backend places it per ABI (HFA in v-regs, int pair
+                // in x-regs, large via byval). e.g. `setFrame:` (NSRect).
+                let n = n as usize;
+                let elem: inkwell::types::BasicTypeEnum =
+                    if is_float { f64_t.into() } else { i64_t.into() };
+                let struct_ty = self.context.struct_type(&vec![elem; n], false);
+                let ptr = self.as_pointer(v);
+                let sv = self
+                    .builder
+                    .build_load(struct_ty, ptr, "structarg")
+                    .expect("load struct argument");
+                param_types.push(struct_ty.into());
+                call_args.push(sv.into());
+            } else if matches!(arg_hints.get(i), Some(TypeHint::Float)) {
                 param_types.push(f64_t.into());
                 call_args.push(self.as_float_value(v).into());
             } else {

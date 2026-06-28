@@ -1,22 +1,30 @@
-// cocoa-window.bcl — open a real native NSWindow, driven from BCPL via
-// Objective-C bracket message sends. Run it on a desktop session:
+// cocoa-window.bcl — open a real, properly-sized native NSWindow with a
+// button, driven from BCPL via Objective-C bracket message sends. Struct
+// arguments (the NSRect content rect, the button frame) are passed as
+// FVECs and lowered to by-value struct args. Run on a desktop session:
 //
 //   ./newbcpl-driver run examples/cocoa-window.bcl
 //
-// A window appears (default size); close it or press Cmd-Q to quit.
-// (Precise sizing needs struct-valued ARGS — setFrame:/setContentSize: —
-// which are the next bracket-send increment; `center` needs no struct arg.)
+// A 720x480 titled window with a button appears; Cmd-Q to quit.
 
 LET START() BE $(
   LET app = [NSApplication sharedApplication]
-  [app setActivationPolicy: 0]          // NSApplicationActivationPolicyRegular
+  [app setActivationPolicy: 0]              // NSApplicationActivationPolicyRegular
 
-  LET w = [[NSWindow alloc] init]
-  [w setTitle: "MacBCPL — a window sent from BCPL"]
+  // initWithContentRect: takes an NSRect by value; styleMask 15 =
+  // titled|closable|miniaturizable|resizable, backing 2 = buffered.
+  LET rect = FVEC [200.0, 200.0, 720.0, 480.0]
+  LET w = [[NSWindow alloc] initWithContentRect: rect styleMask: 15 backing: 2 defer: 0]
+  [w setTitle: "MacBCPL — Cocoa from BCPL"]
+
+  // A button, positioned with a by-value NSRect frame.
+  LET btn = [[NSButton alloc] initWithFrame: (FVEC [300.0, 210.0, 120.0, 44.0])]
+  [btn setTitle: "Hello!"]
+  [[w contentView] addSubview: btn]
+
   [w center]
   [w makeKeyAndOrderFront: 0]
-
   [app activateIgnoringOtherApps: 1]
-  WRITES("window shown — close it or press Cmd-Q to exit*N")
-  [app run]                             // runs the AppKit event loop
+  WRITES("window shown — Cmd-Q to exit*N")
+  [app run]
 $)

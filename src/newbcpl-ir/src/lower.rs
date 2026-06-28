@@ -2359,8 +2359,14 @@ impl<'a> Lowerer<'a> {
                 selector,
                 args,
                 ret_struct,
+                arg_structs,
                 ..
-            } => self.lower_objc_message(receiver, selector, args, ret_struct.get(), e.hint()),
+            } => {
+                let arg_structs = arg_structs.borrow().clone();
+                self.lower_objc_message(
+                    receiver, selector, args, ret_struct.get(), &arg_structs, e.hint(),
+                )
+            }
         }
     }
 
@@ -2375,6 +2381,7 @@ impl<'a> Lowerer<'a> {
         selector: &str,
         args: &[Expr],
         ret_struct: Option<(u32, bool)>,
+        arg_structs: &[Option<(u32, bool)>],
         hint: TypeHint,
     ) -> Value {
         let recv_val = self.lower_objc_receiver(receiver);
@@ -2390,6 +2397,7 @@ impl<'a> Lowerer<'a> {
             selector: selector.to_string(),
             args: arg_values,
             arg_hints,
+            arg_structs: arg_structs.to_vec(),
             ret_struct,
             hint,
         });

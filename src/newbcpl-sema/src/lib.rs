@@ -70,10 +70,17 @@ fn cocoa_db() -> &'static CocoaDb {
 /// (they stay scalar/Object until the Tier-C wrapper-class path lands) — so
 /// only the ABI-exact all-f64 / all-64-bit-int shapes take the vector path.
 fn objc_geometry_struct(selector: &str) -> Option<(u32, bool)> {
-    match cocoa_db().ret_of(selector) {
-        Some("R") => Some((4, true)),
-        Some("P") | Some("S") => Some((2, true)),
-        Some("N") => Some((2, false)),
+    geometry_shape_of(cocoa_db().ret_of(selector).unwrap_or(""))
+}
+
+/// Map a geometry kind token (`R`/`P`/`S`/`N`) to `(field_count, is_float)`.
+/// Used for both struct RETURNS and struct ARGUMENTS. Complex `{…}`
+/// descriptors return None (handled by the wrapper-class path, later).
+fn geometry_shape_of(kind: &str) -> Option<(u32, bool)> {
+    match kind {
+        "R" => Some((4, true)),  // NSRect: x,y,width,height
+        "P" | "S" => Some((2, true)), // NSPoint / NSSize
+        "N" => Some((2, false)), // NSRange: location,length
         _ => None,
     }
 }
@@ -2113,6 +2120,7 @@ impl Sema {
                 arg_annotations,
                 ret_annotation,
                 ret_struct,
+                arg_structs,
                 span,
                 ..
             } => {
@@ -2132,6 +2140,22 @@ impl Sema {
                         a.set_hint(h);
                     }
                 }
+                // Per-arg geometry struct shapes from the DB arg-kinds: a
+                // selector like `setFrame:` takes an NSRect by value, so the
+                // caller's FVEC/VEC is loaded as a struct argument. (NSString
+                // `args` is one kind-char per argument.)
+                let arg_kinds: Vec<u8> = cocoa_db()
+                    .lookup(selector)
+                    .map(|s| s.args.bytes().collect())
+                    .unwrap_or_default();
+                let shapes: Vec<Option<(u32, bool)>> = (0..args.len())
+                    .map(|i| {
+                        arg_kinds
+                            .get(i)
+                            .and_then(|&b| geometry_shape_of(&(b as char).to_string()))
+                    })
+                    .collect();
+                *arg_structs.borrow_mut() = shapes;
                 // `[SUPER ...]` raw sends aren't supported in v1 — direct
                 // them to the dot form, which does static parent dispatch.
                 // `[SELF ...]` is only valid inside a class method (else

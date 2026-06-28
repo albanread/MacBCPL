@@ -224,6 +224,11 @@ pub enum Instr {
         selector: String,
         args: Vec<Value>,
         arg_hints: Vec<TypeHint>,
+        /// Per-arg geometry struct shape `(field_count, is_float)`: the arg
+        /// value is an FVEC/VEC whose N fields are loaded and passed as a
+        /// by-value struct argument (NSRect/NSPoint/NSSize/NSRange). `None`
+        /// at an index means a scalar/id arg (the arg_hints path).
+        arg_structs: Vec<Option<(u32, bool)>>,
         /// A geometry struct return: `(field_count, is_float)`. When set,
         /// codegen declares the real struct return type (HFA/int-pair, ABI
         /// handled by the backend), extracts the fields, and materializes

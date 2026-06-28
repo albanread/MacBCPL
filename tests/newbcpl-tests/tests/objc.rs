@@ -106,6 +106,33 @@ fn struct_return_nsrect_to_fvec() {
     );
 }
 
+// ─── Struct ARGUMENTS (by-value structs passed from an FVEC) ─────────
+
+/// An NSRect passed BY VALUE as a struct argument (`valueWithRect:`, DB
+/// arg "R"): the FVEC's 4 doubles are loaded and placed per the arm64 HFA
+/// ABI (v0..v3), then read back via `rectValue` (struct return). NSValue
+/// round-trips with no window/screen constraints, so it is deterministic.
+#[test]
+fn struct_arg_nsvalue_rect_roundtrip() {
+    expect(
+        "objc_structarg_rect",
+        "LET START() BE $(\n  LET r = [[NSValue valueWithRect: (FVEC [1.0, 2.0, 3.0, 4.0])] rectValue]\n  FWRITE(r .% NSRect_x) FWRITE(r .% NSRect_y) FWRITE(r .% NSRect_width) FWRITE(r .% NSRect_height)\n$)\n",
+        "1234",
+    );
+}
+
+/// An NSSize struct argument (`valueWithSize:`, DB arg "S") round-trips via
+/// `sizeValue`. Exercises a 2-double HFA struct arg interleaved with the
+/// receiver/sel in x0/x1.
+#[test]
+fn struct_arg_nsvalue_size_roundtrip() {
+    expect(
+        "objc_structarg_size",
+        "LET START() BE $(\n  LET s = [[NSValue valueWithSize: (FVEC [12.0, 34.0])] sizeValue]\n  FWRITE(s .% NSSize_width) FWRITE(s .% NSSize_height)\n$)\n",
+        "1234",
+    );
+}
+
 // ─── Implementation-review regression probes ────────────────────────
 
 /// REVIEW #1: `%` / LEN on a bracket-send NSString result must not deref
