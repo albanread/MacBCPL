@@ -127,6 +127,42 @@ fn looped_scope_local_objects() {
     );
 }
 
+// ─── USING: deterministic object disposal (the explicit edge-case tool)
+//
+// USING runs the user RELEASE method (if any) AND frees the object's
+// memory at scope exit, deterministically. It's the explicit ownership
+// tool for objects the automatic scope-release can't prove (e.g. ones
+// returned from a factory call). The user RELEASE printing is the
+// observable signal that cleanup ran in order.
+
+const RES_CLASS: &str = "CLASS Res $(\n  DECL id\n  LET CREATE(v) BE SELF.id := v\n  LET get() = SELF.id\n  LET RELEASE() BE $( WRITES(\"rel \") ; WRITEN(SELF.id) $)\n$)\n";
+
+/// USING on a freshly-NEW'd object: body runs, then RELEASE at scope
+/// exit (before code after the USING block).
+#[test]
+fn using_disposes_new_object() {
+    expect(
+        "using_new_object",
+        &format!(
+            "{RES_CLASS}LET START() BE $(\n  USING r = NEW Res(9) DO WRITES(\"use \")\n  WRITES(\"end\")\n$)\n"
+        ),
+        "use rel 9end",
+    );
+}
+
+/// USING on a factory-returned object (direct `= NEW` factory): the
+/// returned object's class is inferred, so USING disposes it.
+#[test]
+fn using_disposes_factory_object() {
+    expect(
+        "using_factory_object",
+        &format!(
+            "{RES_CLASS}LET MK(v) = NEW Res(v)\nLET START() BE $(\n  USING r = MK(4) DO WRITEN(r.get())\n  WRITES(\" end\")\n$)\n"
+        ),
+        "4rel 4 end",
+    );
+}
+
 /// Explicit GETVEC/FREEVEC round-trip on the manual heap still works
 /// (the manual tier is independent of the arena tier).
 #[test]

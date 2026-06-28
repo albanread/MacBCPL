@@ -27,7 +27,21 @@ use crate::ir::*;
 /// caller must have run `newbcpl_sema::analyze(&program)` first so
 /// expressions carry their hints.
 pub fn lower(program: &Program, sema: &SemaOutput, module_name: &str) -> Module {
-    let mut lowerer = Lowerer::new(&sema.layouts, &sema.manifests, &sema.globals);
+    // Map every free function/routine that returns a class instance to
+    // its result class, so `class_name_of_expr` can resolve a call like
+    // `MK()` the same way it resolves `NEW Foo()` — enabling USING and
+    // class-typed bindings on factory-returned objects.
+    let fn_result_classes: HashMap<String, String> = sema
+        .functions
+        .iter()
+        .filter_map(|f| f.result_class_name.clone().map(|c| (f.name.clone(), c)))
+        .collect();
+    let mut lowerer = Lowerer::new(
+        &sema.layouts,
+        &sema.manifests,
+        &sema.globals,
+        &fn_result_classes,
+    );
     for decl in &program.items {
         match decl {
             Decl::Routine(r) => lowerer.lower_routine(r),
@@ -75,6 +89,10 @@ struct Lowerer<'a> {
     /// module-level `@<name>` slot instead of treating it as a
     /// stack-local or an unbound extern.
     globals: &'a std::collections::HashMap<String, Option<i64>>,
+    /// Free function/routine name → its result class (for functions that
+    /// return an object). Lets `class_name_of_expr` resolve a factory
+    /// call `MK()` to its class. Built from sema's `FunctionInfo`.
+    fn_result_classes: &'a std::collections::HashMap<String, String>,
     /// Set while lowering a class method body. Allows bare-field
     /// identifiers (`x` inside `Point.set`) to resolve as
     /// SELF-relative field accesses, and lets `class_name_of_expr`
@@ -347,6 +365,7 @@ impl<'a> Lowerer<'a> {
         layouts: &'a [ClassLayout],
         manifests: &'a std::collections::HashMap<String, i64>,
         globals: &'a std::collections::HashMap<String, Option<i64>>,
+        fn_result_classes: &'a std::collections::HashMap<String, String>,
     ) -> Self {
         Self {
             functions: Vec::new(),
@@ -355,6 +374,7 @@ impl<'a> Lowerer<'a> {
             layouts,
             manifests,
             globals,
+            fn_result_classes,
             current_class: None,
             using_cleanups: Vec::new(),
             escaping_locals: HashSet::new(),
@@ -1034,42 +1054,57 @@ impl<'a> Lowerer<'a> {
             .unwrap_or(false)
     }
 
-    /// Synthesise `name.RELEASE()` as an IR method call. Mirrors
-    /// what `lower_call` would emit for an explicit source-level call.
+    /// Emit `USING` scope-exit cleanup for one binding: run the user's
+    /// `RELEASE` method (if the class defines one — application-level
+    /// cleanup, e.g. close a file) and THEN `objc release` the object
+    /// to free its memory. `USING` is the explicit "I own this, dispose
+    /// it deterministically at scope exit" construct, so it always
+    /// releases the memory — this is the primary tool for objects whose
+    /// ownership the automatic scope-release can't prove (e.g. objects
+    /// returned from a call). The object is `nil`-safe (`objc_msgSend`
+    /// on nil is a no-op), so an unset binding releases harmlessly.
     fn emit_release_call(&mut self, cleanup: &UsingCleanup) {
-        // No RELEASE method on this class (or any ancestor) → cleanup
-        // is a no-op; emitting an objc_msgSend "RELEASE" would crash.
-        if !self.class_has_release(&cleanup.class_name) {
+        let Some(binding_slot) = self.b().lookup_local_slot(&cleanup.name) else {
             return;
+        };
+
+        // 1. User RELEASE method (cleanup), only if the class defines it.
+        if self.class_has_release(&cleanup.class_name) {
+            if let Some(slot) = self.lookup_method_slot(&cleanup.class_name, "RELEASE") {
+                let recv = {
+                    let dst = self.b().alloc_value();
+                    self.b().emit(Instr::Load {
+                        dst,
+                        slot: binding_slot,
+                        hint: TypeHint::Object,
+                    });
+                    Value::Local(dst)
+                };
+                let dst = self.b().alloc_value();
+                self.b().emit(Instr::MethodCall {
+                    dst: Some(dst),
+                    receiver: recv,
+                    class_name: cleanup.class_name.clone(),
+                    vtable_slot: slot,
+                    method_name: "RELEASE".to_string(),
+                    args: Vec::new(),
+                    hint: TypeHint::Word,
+                });
+            }
         }
-        let Some(slot_hint_slot) = self.b().lookup_local_slot(&cleanup.name) else {
-            return;
-        };
-        // Load the binding's current value (the heap pointer) and
-        // dispatch RELEASE through the class's vtable. Slot 1 is the
-        // reserved RELEASE slot; classes without an explicit RELEASE
-        // get the runtime's no-op default-method stub bound there at
-        // module-load time, so this is always safe.
-        let receiver_value = {
-            let dst = self.b().alloc_value();
-            self.b().emit(Instr::Load {
-                dst,
-                slot: slot_hint_slot,
-                hint: TypeHint::Object,
-            });
-            Value::Local(dst)
-        };
-        let Some(slot) = self.lookup_method_slot(&cleanup.class_name, "RELEASE") else {
-            return;
-        };
-        let dst = self.b().alloc_value();
-        self.b().emit(Instr::MethodCall {
-            dst: Some(dst),
-            receiver: receiver_value,
-            class_name: cleanup.class_name.clone(),
-            vtable_slot: slot,
-            method_name: "RELEASE".to_string(),
-            args: Vec::new(),
+
+        // 2. Free the object's memory (objc release). Always — that is
+        //    what USING promises.
+        let obj = self.b().alloc_value();
+        self.b().emit(Instr::Load {
+            dst: obj,
+            slot: binding_slot,
+            hint: TypeHint::Object,
+        });
+        self.b().emit(Instr::Call {
+            dst: None,
+            callee: Value::Function("bcpl_objc_release".to_string()),
+            args: vec![Value::Local(obj)],
             hint: TypeHint::Word,
         });
         let _ = cleanup.span;
@@ -2104,28 +2139,35 @@ impl<'a> Lowerer<'a> {
                 None
             }
             Expr::Call { callee, .. } => {
-                if let Expr::Binary {
-                    op: BinaryOp::Dot,
-                    lhs,
-                    rhs,
-                    ..
-                } = callee.as_ref()
-                {
-                    let receiver_class = self.class_name_of_expr(lhs)?;
-                    if let Expr::Ident { name: method, .. } = rhs.as_ref() {
-                        let layout = self
-                            .layouts
-                            .iter()
-                            .find(|l| l.class_name == receiver_class)?;
-                        return layout
-                            .vtable
-                            .iter()
-                            .find(|v| v.method_name == *method)?
-                            .result_class
-                            .clone();
+                match callee.as_ref() {
+                    // Method call `obj.m(...)` → the method's result class.
+                    Expr::Binary {
+                        op: BinaryOp::Dot,
+                        lhs,
+                        rhs,
+                        ..
+                    } => {
+                        let receiver_class = self.class_name_of_expr(lhs)?;
+                        if let Expr::Ident { name: method, .. } = rhs.as_ref() {
+                            let layout = self
+                                .layouts
+                                .iter()
+                                .find(|l| l.class_name == receiver_class)?;
+                            return layout
+                                .vtable
+                                .iter()
+                                .find(|v| v.method_name == *method)?
+                                .result_class
+                                .clone();
+                        }
+                        None
                     }
+                    // Free-function call `f(...)` → its result class (a
+                    // factory). Lets USING / class-typed bindings see the
+                    // returned object's class.
+                    Expr::Ident { name, .. } => self.fn_result_classes.get(name).cloned(),
+                    _ => None,
                 }
-                None
             }
             _ => None,
         }
