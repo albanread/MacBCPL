@@ -76,6 +76,57 @@ fn vector_before_loop_survives_loop() {
     );
 }
 
+// ─── Cocoa-object scope lifetimes ───────────────────────────────────
+//
+// A `LET o = NEW C()` is a +1-owned Obj-C object. Scope-local ones are
+// `release`d at the procedure epilogue (stack-scope object lifetime);
+// escaping ones transfer ownership and are NOT released. A wrong
+// classification crashes (over-release → SIGABRT) or reads freed memory,
+// so these correct-value probes are the safety guard.
+
+const PT_CLASS: &str =
+    "CLASS Pt $(\n  DECL x\n  LET CREATE(v) BE SELF.x := v\n  LET get() = SELF.x\n$)\n";
+
+/// A scope-local object: created, a method called, released at epilogue.
+/// Must compute correctly and not crash (no over-release).
+#[test]
+fn scope_local_object_released_cleanly() {
+    expect(
+        "obj_scope_local",
+        &format!(
+            "{PT_CLASS}LET START() BE $(\n  LET p = NEW Pt(42)\n  WRITEN(p.get())\n$)\n"
+        ),
+        "42",
+    );
+}
+
+/// An object RETURNED (RESULTIS p) escapes — must NOT be released in the
+/// creating function, and must stay valid in the caller.
+#[test]
+fn returned_object_survives_callee() {
+    expect(
+        "obj_returned",
+        &format!(
+            "{PT_CLASS}LET MK() = VALOF $(\n  LET p = NEW Pt(7)\n  RESULTIS p\n$)\nLET START() BE $(\n  LET q = MK()\n  WRITEN(q.get())\n$)\n"
+        ),
+        "7",
+    );
+}
+
+/// Many scope-local objects created in a loop, each released at the
+/// helper's epilogue — a double-release or leak-then-reuse would surface
+/// as a crash here.
+#[test]
+fn looped_scope_local_objects() {
+    expect(
+        "obj_loop",
+        &format!(
+            "{PT_CLASS}LET use(n) BE $(\n  LET p = NEW Pt(n)\n  WRITEN(p.get())\n$)\nLET START() BE $(\n  FOR i = 1 TO 3 DO use(i)\n$)\n"
+        ),
+        "123",
+    );
+}
+
 /// Explicit GETVEC/FREEVEC round-trip on the manual heap still works
 /// (the manual tier is independent of the arena tier).
 #[test]

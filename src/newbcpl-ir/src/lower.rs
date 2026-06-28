@@ -98,6 +98,14 @@ struct Lowerer<'a> {
     /// function entered an arena. `emit_arena_free` loads it on every
     /// true function-exit edge. `None` between functions.
     function_arena_slot: Option<ValueId>,
+    /// Slots of scope-local Cocoa objects created with `NEW` (a +1-owned
+    /// Obj-C object whose binding does not escape). Each is sent `release`
+    /// at the function epilogue — the Cocoa-tier analogue of `arena_free`,
+    /// giving objects stack-scope lifetimes too. Only direct `LET o = NEW
+    /// C()` bindings are tracked (we know those are +1-owned); objects
+    /// returned from calls are left alone (unknown ownership). Reset per
+    /// function.
+    function_owned_objects: Vec<ValueId>,
 }
 
 #[derive(Debug, Clone)]
@@ -351,6 +359,7 @@ impl<'a> Lowerer<'a> {
             using_cleanups: Vec::new(),
             escaping_locals: HashSet::new(),
             function_arena_slot: None,
+            function_owned_objects: Vec::new(),
         }
     }
 
@@ -650,6 +659,33 @@ impl<'a> Lowerer<'a> {
         // Reset per-function arena state for the next function.
         self.function_arena_slot = None;
         self.escaping_locals.clear();
+        self.function_owned_objects.clear();
+    }
+
+    /// Send `release` to every scope-local `NEW` object the function
+    /// owns — the Cocoa-tier analogue of `arena_free`. Emitted at the
+    /// epilogue (via `terminate_return`), innermost-last, so a
+    /// scope-local object's +1 from `[[C alloc] init]` is balanced when
+    /// the procedure returns. Objects that escape (returned, RETAINed,
+    /// stored, aliased) are never in this list, so their ownership is
+    /// transferred, not dropped — no over-release.
+    fn emit_owned_object_releases(&mut self) {
+        // Clone to avoid borrowing self while emitting.
+        let slots: Vec<ValueId> = self.function_owned_objects.clone();
+        for slot in slots {
+            let obj = self.b().alloc_value();
+            self.b().emit(Instr::Load {
+                dst: obj,
+                slot,
+                hint: TypeHint::Object,
+            });
+            self.b().emit(Instr::Call {
+                dst: None,
+                callee: Value::Function("bcpl_objc_release".to_string()),
+                args: vec![Value::Local(obj)],
+                hint: TypeHint::Word,
+            });
+        }
     }
 
     /// Enter this function's per-scope arena (Phase 2 stack-scope
@@ -699,6 +735,8 @@ impl<'a> Lowerer<'a> {
     /// emit the `Return`. Using this everywhere a function returns means
     /// arena cleanup can't be forgotten on an exit path.
     fn terminate_return(&mut self, value: Option<Value>) {
+        // Release scope-local Cocoa objects first, then free the arena.
+        self.emit_owned_object_releases();
         self.emit_arena_free();
         self.b().terminate(Terminator::Return(value));
     }
@@ -1850,6 +1888,16 @@ impl<'a> Lowerer<'a> {
             let slot = self.b().alloca(name, slot_hint);
             self.b().emit(Instr::Store { slot, value });
             self.b().declare_local(name, slot, class_name);
+
+            // Cocoa-object scope lifetime: a direct `LET o = NEW C()`
+            // creates a +1-owned Obj-C object. If the binding is
+            // scope-local (doesn't escape), release it at the function
+            // epilogue — the object analogue of arena reclamation. We
+            // only track direct NEW (known +1); objects returned from
+            // calls have unknown ownership and are left alone.
+            if matches!(init, Expr::New { .. }) && !self.escaping_locals.contains(name) {
+                self.function_owned_objects.push(slot);
+            }
         }
     }
 
@@ -3393,13 +3441,22 @@ fn escape_analyze_expr(body: &Expr) -> HashSet<String> {
     esc
 }
 
-fn esc_is_subscript(op: BinaryOp) -> bool {
+/// Binary ops whose left operand is a *base* that is read THROUGH, not
+/// escaped: vector/byte/float subscripts (`v!i`, `v%i`, `v.%i`) and
+/// member access (`obj.field`, `obj.method(...)`, `obj OF field`). The
+/// object/vector is dereferenced to reach the member; its own pointer
+/// does not flow out. (Member access matters for Cocoa objects: calling
+/// `o.show()` must NOT mark `o` as escaping.)
+fn esc_is_through_base(op: BinaryOp) -> bool {
     matches!(
         op,
         BinaryOp::Subscript
             | BinaryOp::Bitfield
             | BinaryOp::CharSubscript
             | BinaryOp::FloatSubscript
+            | BinaryOp::Dot
+            | BinaryOp::Of
+            | BinaryOp::LaneAccess
     )
 }
 
@@ -3419,9 +3476,11 @@ fn esc_base(e: &Expr, esc: &mut HashSet<String>) {
 fn esc_target(t: &Expr, esc: &mut HashSet<String>) {
     match t {
         Expr::Ident { .. } => {}
-        Expr::Binary { op, lhs, rhs, .. } if esc_is_subscript(*op) => {
+        Expr::Binary { op, lhs, rhs, .. } if esc_is_through_base(*op) => {
             esc_base(lhs, esc);
-            esc_value(rhs, esc);
+            if !matches!(op, BinaryOp::Dot | BinaryOp::Of) {
+                esc_value(rhs, esc);
+            }
         }
         Expr::Unary {
             op: UnaryOp::Indirection | UnaryOp::CharIndirection,
@@ -3447,9 +3506,13 @@ fn esc_value(e: &Expr, esc: &mut HashSet<String>) {
         | Expr::BoolLit { .. }
         | Expr::Null { .. } => {}
         Expr::Binary { op, lhs, rhs, .. } => {
-            if esc_is_subscript(*op) {
+            if esc_is_through_base(*op) {
                 esc_base(lhs, esc);
-                esc_value(rhs, esc);
+                // For member access (Dot/Of) the rhs is a field selector,
+                // not a value; for subscripts/lanes it's an index value.
+                if !matches!(op, BinaryOp::Dot | BinaryOp::Of) {
+                    esc_value(rhs, esc);
+                }
             } else {
                 esc_value(lhs, esc);
                 esc_value(rhs, esc);
