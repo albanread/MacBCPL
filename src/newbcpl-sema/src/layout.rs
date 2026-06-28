@@ -63,6 +63,12 @@ pub struct ClassLayout {
     pub has_release: bool,
     /// Whether the class is declared `MANAGED` (manifesto §5).
     pub managed: bool,
+    /// Bytes occupied by THIS class's own (non-inherited) fields.
+    /// Under the Cocoa object model each BCPL class registers an
+    /// Obj-C ivar (`__bcpl_<Class>`) of exactly this size holding only
+    /// its own fields; the Obj-C runtime composes inherited blocks. A
+    /// class with no own fields has `own_fields_size == 0` (no ivar).
+    pub own_fields_size: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +84,12 @@ pub struct FieldLayout {
     /// Lets IR lower chained access (`obj.inner.method()`) resolve
     /// without re-running sema's resolver.
     pub class_name: Option<String>,
+    /// Offset of this field WITHIN its defining class's own field block
+    /// (the `__bcpl_<defining_class>` ivar), starting at 0. This is the
+    /// Cocoa addressing offset: `field_base_for(obj, defining_class) +
+    /// own_offset`. Distinct from `offset`, which is the legacy
+    /// cumulative offset (vtable header + inherited block + own).
+    pub own_offset: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -201,9 +213,13 @@ fn compute_one(
     }
 
     // Append this class's fields, recording GC pointer offsets along
-    // the way. Each field is exactly one word.
+    // the way. Each field is exactly one word. `own_offset` is tracked
+    // independently of the cumulative `offset`: it restarts at 0 for
+    // this class so its fields map into its own `__bcpl_<Class>` ivar.
+    let mut own_offset_next: usize = 0;
     for f in &class.fields {
         let offset = next_offset;
+        let own_offset = own_offset_next;
         if hint_is_pointer(f.hint) || f.class_name.is_some() {
             // Class-typed fields hold a pointer to a heap-allocated
             // instance — the GC must trace them even when the
@@ -217,9 +233,12 @@ fn compute_one(
             offset,
             defining_class: class.name.clone(),
             class_name: f.class_name.clone(),
+            own_offset,
         });
         next_offset += WORD_BYTES;
+        own_offset_next += WORD_BYTES;
     }
+    let own_fields_size = own_offset_next;
 
     // Map existing slots so override detection is O(1). Walk the
     // declared methods: existing name → override the parent's slot;
@@ -274,6 +293,7 @@ fn compute_one(
             ptr_offsets,
             has_release: declared_release,
             managed: class.managed,
+            own_fields_size,
         },
     );
 }

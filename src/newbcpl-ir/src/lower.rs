@@ -418,7 +418,8 @@ impl<'a> Lowerer<'a> {
         initialisers: &[(String, &Expr)],
     ) {
         let mangled = mangle_method(class_name, "CREATE");
-        let params = vec!["SELF".to_string()];
+        // (self, _cmd) — Obj-C IMP ABI; _cmd ignored (see lower_method).
+        let params = vec!["SELF".to_string(), "_cmd".to_string()];
         self.start_function(&mangled, &params, TypeHint::Word);
         if let Some(b) = self.current.as_mut() {
             if let Some(info) = b.scopes.last_mut().and_then(|s| s.get_mut("SELF")) {
@@ -446,11 +447,12 @@ impl<'a> Lowerer<'a> {
     ) {
         for (name, init) in initialisers {
             let value = self.lower_expr(init);
-            if let Some(offset) = self.lookup_field_offset(class_name, name) {
+            if let Some((off, defc)) = self.lookup_field_loc(class_name, name) {
                 let self_v = self.load_self();
                 self.b().emit(Instr::FieldStore {
                     base: self_v,
-                    byte_offset: offset,
+                    byte_offset: off,
+                    defining_class: defc,
                     value,
                 });
             }
@@ -468,12 +470,18 @@ impl<'a> Lowerer<'a> {
         // implicit param. Real BCPL params follow. The SELF slot
         // takes no annotation (its class identity is patched in
         // separately below); user params carry their own.
-        let mut params: Vec<String> = Vec::with_capacity(m.params.len() + 1);
+        // Obj-C IMP ABI: ret f(id self, SEL _cmd, args...). SELF is
+        // param 0, `_cmd` (the selector) is param 1 — ignored by the
+        // body but required so objc_msgSend's (self, _cmd, ...) call
+        // lines up. Real BCPL params follow.
+        let mut params: Vec<String> = Vec::with_capacity(m.params.len() + 2);
         params.push("SELF".to_string());
+        params.push("_cmd".to_string());
         params.extend(m.params.iter().cloned());
         let mut param_annotations: Vec<Option<String>> =
-            Vec::with_capacity(m.params.len() + 1);
+            Vec::with_capacity(m.params.len() + 2);
         param_annotations.push(None); // SELF
+        param_annotations.push(None); // _cmd
         param_annotations.extend(m.param_annotations.iter().cloned());
 
         let return_hint = match &m.body {
@@ -776,25 +784,40 @@ impl<'a> Lowerer<'a> {
                 value: Some(init),
                 ..
             } => {
-                // `RETAIN x = expr` — declares `x` and pins it past
-                // its natural scope. In our GC model the binding is
-                // already tracked as a stack root for as long as the
-                // current scope holds it; the explicit "pin" matters
-                // chiefly across scope boundaries (returning from
-                // VALOF, etc.), which we approximate by lowering the
-                // same as `LET x = expr`. The user-visible behaviour
-                // — `x.field` reads through the value, surviving an
-                // explicit `GC()` while in scope — is preserved.
+                // `RETAIN x = expr` — declare `x` and pin it past its
+                // natural scope. Under the Obj-C object model lifetime
+                // is reference-counted, so pinning is a real `retain`
+                // on the object: it survives the `release` an enclosing
+                // USING would otherwise apply, and lives until the
+                // owner drops the extra count. (Leaking is safe; a
+                // no-op RETAIN would instead over-release.)
                 let class_name = self.class_name_of_expr(init);
                 let value = self.lower_expr(init);
                 let slot_hint = init.hint();
                 let slot = self.b().alloca(name, slot_hint);
-                self.b().emit(Instr::Store { slot, value });
+                self.b().emit(Instr::Store {
+                    slot,
+                    value: value.clone(),
+                });
                 self.b().declare_local(name, slot, class_name);
+                self.emit_objc_retain(value);
             }
-            Stmt::Retain { value: None, .. } => {
-                // `RETAIN x` (mark existing) — no IR effect. The
-                // binding is already a stack root in our model.
+            Stmt::Retain {
+                name,
+                value: None,
+                ..
+            } => {
+                // `RETAIN x` (mark existing) — retain the object the
+                // binding currently holds, pinning it past scope.
+                if let Some(slot) = self.b().lookup_local_slot(name) {
+                    let dst = self.b().alloc_value();
+                    self.b().emit(Instr::Load {
+                        dst,
+                        slot,
+                        hint: TypeHint::Object,
+                    });
+                    self.emit_objc_retain(Value::Local(dst));
+                }
             }
             Stmt::Brk(span) => {
                 // `BRK` debugger breakpoint — emit a call to the
@@ -865,9 +888,38 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Emit `bcpl_objc_retain(value)` — an Obj-C `retain` on an object,
+    /// pinning it past its scope (used by `RETAIN`).
+    fn emit_objc_retain(&mut self, value: Value) {
+        self.b().emit(Instr::Call {
+            dst: None,
+            callee: Value::Function("bcpl_objc_retain".to_string()),
+            args: vec![value],
+            hint: TypeHint::Object,
+        });
+    }
+
+    /// True if `class_name`'s layout declares (or inherits) a RELEASE
+    /// method. Under the Obj-C model a RELEASE dispatch is an
+    /// `objc_msgSend(obj, sel("RELEASE"))`, so we must NOT emit it for
+    /// a class that has no RELEASE (it would raise an unrecognized
+    /// selector). Classes without RELEASE simply have no cleanup.
+    fn class_has_release(&self, class_name: &str) -> bool {
+        self.layouts
+            .iter()
+            .find(|l| l.class_name == class_name)
+            .map(|l| l.has_release)
+            .unwrap_or(false)
+    }
+
     /// Synthesise `name.RELEASE()` as an IR method call. Mirrors
     /// what `lower_call` would emit for an explicit source-level call.
     fn emit_release_call(&mut self, cleanup: &UsingCleanup) {
+        // No RELEASE method on this class (or any ancestor) → cleanup
+        // is a no-op; emitting an objc_msgSend "RELEASE" would crash.
+        if !self.class_has_release(&cleanup.class_name) {
+            return;
+        }
         let Some(slot_hint_slot) = self.b().lookup_local_slot(&cleanup.name) else {
             return;
         };
@@ -1720,13 +1772,14 @@ impl<'a> Lowerer<'a> {
                         // method: `x := initialX` → field store
                         // through SELF when `x` is a field of the
                         // surrounding class.
-                        if let Some(offset) =
-                            self.lookup_field_offset(&class_name, name)
+                        if let Some((off, defc)) =
+                            self.lookup_field_loc(&class_name, name)
                         {
                             let base = self.load_self();
                             self.b().emit(Instr::FieldStore {
                                 base,
-                                byte_offset: offset,
+                                byte_offset: off,
+                                defining_class: defc,
                                 value: v,
                             });
                         }
@@ -1742,11 +1795,12 @@ impl<'a> Lowerer<'a> {
                         (self.class_name_of_expr(lhs), rhs.as_ref())
                     {
                         let base = self.lower_expr(lhs);
-                        if let Some(offset) = self.lookup_field_offset(&class_name, field)
+                        if let Some((off, defc)) = self.lookup_field_loc(&class_name, field)
                         {
                             self.b().emit(Instr::FieldStore {
                                 base,
-                                byte_offset: offset,
+                                byte_offset: off,
+                                defining_class: defc,
                                 value: v,
                             });
                         }
@@ -1960,6 +2014,21 @@ impl<'a> Lowerer<'a> {
             .map(|f| f.offset)
     }
 
+    /// Cocoa field location: `(own_offset, defining_class)` for a field
+    /// reachable from `class_name`. `own_offset` is the offset within
+    /// the defining class's `__bcpl_<defining_class>` ivar block;
+    /// `defining_class` selects which ivar to rebase against (it may be
+    /// an ancestor of `class_name`). This is what codegen needs to emit
+    /// `field_base_for(obj, defining_class) + own_offset`.
+    fn lookup_field_loc(&self, class_name: &str, field: &str) -> Option<(usize, String)> {
+        let layout = self.layouts.iter().find(|l| l.class_name == class_name)?;
+        layout
+            .fields
+            .iter()
+            .find(|f| f.name == field)
+            .map(|f| (f.own_offset, f.defining_class.clone()))
+    }
+
     /// The immediate parent of `class_name` (the `EXTENDS` target),
     /// or `None` if the class has no parent or doesn't appear in our
     /// layout table.
@@ -2162,13 +2231,14 @@ impl<'a> Lowerer<'a> {
         // be a field on `SELF`. Resolve through the surrounding
         // class layout and emit a SELF-relative FieldLoad.
         if let Some(class_name) = self.current_class.clone() {
-            if let Some(offset) = self.lookup_field_offset(&class_name, name) {
+            if let Some((off, defc)) = self.lookup_field_loc(&class_name, name) {
                 let self_v = self.load_self();
                 let dst = self.b().alloc_value();
                 self.b().emit(Instr::FieldLoad {
                     dst,
                     base: self_v,
-                    byte_offset: offset,
+                    byte_offset: off,
+                    defining_class: defc,
                     hint,
                 });
                 return Value::Local(dst);
@@ -2343,11 +2413,12 @@ impl<'a> Lowerer<'a> {
                         value: new_pack,
                     });
                 } else if let Some(class_name) = self.current_class.clone() {
-                    if let Some(offset) = self.lookup_field_offset(&class_name, name) {
+                    if let Some((off, defc)) = self.lookup_field_loc(&class_name, name) {
                         let base = self.load_self();
                         self.b().emit(Instr::FieldStore {
                             base,
-                            byte_offset: offset,
+                            byte_offset: off,
+                            defining_class: defc,
                             value: new_pack,
                         });
                     }
@@ -2363,10 +2434,11 @@ impl<'a> Lowerer<'a> {
                     (self.class_name_of_expr(receiver), rhs.as_ref())
                 {
                     let base = self.lower_expr(receiver);
-                    if let Some(offset) = self.lookup_field_offset(&class_name, field) {
+                    if let Some((off, defc)) = self.lookup_field_loc(&class_name, field) {
                         self.b().emit(Instr::FieldStore {
                             base,
-                            byte_offset: offset,
+                            byte_offset: off,
+                            defining_class: defc,
                             value: new_pack,
                         });
                     }
@@ -2460,12 +2532,13 @@ impl<'a> Lowerer<'a> {
                 (self.class_name_of_expr(lhs), rhs)
             {
                 let base = self.lower_expr(lhs);
-                if let Some(offset) = self.lookup_field_offset(&class_name, field) {
+                if let Some((off, defc)) = self.lookup_field_loc(&class_name, field) {
                     let dst = self.b().alloc_value();
                     self.b().emit(Instr::FieldLoad {
                         dst,
                         base,
-                        byte_offset: offset,
+                        byte_offset: off,
+                        defining_class: defc,
                         hint,
                     });
                     return Value::Local(dst);
@@ -2715,8 +2788,13 @@ impl<'a> Lowerer<'a> {
                     rhs.as_ref(),
                 ) {
                     let receiver = self.load_self();
-                    let mut call_args: Vec<Value> = Vec::with_capacity(args.len() + 1);
+                    let mut call_args: Vec<Value> = Vec::with_capacity(args.len() + 2);
                     call_args.push(receiver);
+                    // _cmd slot — the parent IMP is (self, _cmd, args...).
+                    // A direct SUPER call is static dispatch (not via
+                    // objc_msgSend), so there is no real selector; pass
+                    // null. The parent body ignores _cmd.
+                    call_args.push(Value::Const(Const::Null));
                     for a in args {
                         call_args.push(self.lower_expr(a));
                     }

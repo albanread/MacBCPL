@@ -154,18 +154,27 @@ pub enum Instr {
         class_name: String,
         args: Vec<Value>,
     },
-    /// Load a field from a class instance. `byte_offset` comes from
-    /// the class layout; codegen emits a GEP + load.
+    /// Load a field from a class instance. Under the Cocoa object
+    /// model, codegen rebases `base` through the defining class's
+    /// `__bcpl_<defining_class>` ivar, then GEPs `byte_offset` (which
+    /// is the field's OWN-relative offset within that ivar block).
     FieldLoad {
         dst: ValueId,
         base: Value,
         byte_offset: usize,
+        /// The class whose `__bcpl_<…>` ivar holds this field (the
+        /// field's defining class — may be an ancestor of the static
+        /// receiver class). Empty string for non-class field accesses
+        /// that still use a flat `base + byte_offset` GEP.
+        defining_class: String,
         hint: TypeHint,
     },
-    /// Store a value into a class instance field.
+    /// Store a value into a class instance field. See `FieldLoad` for
+    /// the `defining_class` / own-relative `byte_offset` convention.
     FieldStore {
         base: Value,
         byte_offset: usize,
+        defining_class: String,
         value: Value,
     },
     /// `obj.method(args)` — virtual method dispatch. The receiver's

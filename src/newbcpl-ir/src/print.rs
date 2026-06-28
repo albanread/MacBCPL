@@ -139,21 +139,33 @@ fn render_instr(i: &Instr) -> String {
             dst,
             base,
             byte_offset,
+            defining_class,
             hint,
         } => format!(
-            "%{} = field.load {}, +{} : {}",
+            "%{} = field.load {}, {}+{} : {}",
             dst.0,
             render_value(base),
+            if defining_class.is_empty() {
+                String::new()
+            } else {
+                format!("{defining_class}.")
+            },
             byte_offset,
             hint.as_str()
         ),
         Instr::FieldStore {
             base,
             byte_offset,
+            defining_class,
             value,
         } => format!(
-            "field.store {}, +{}, {}",
+            "field.store {}, {}+{}, {}",
             render_value(base),
+            if defining_class.is_empty() {
+                String::new()
+            } else {
+                format!("{defining_class}.")
+            },
             byte_offset,
             render_value(value)
         ),

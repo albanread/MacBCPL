@@ -185,8 +185,37 @@ pub fn run_source_with_active_folder(
 /// [`run_source_with_active_folder`]: spin up an LLVM Context, emit
 /// the program IR, link every module file's IR into it, JIT, and
 /// invoke `START`.
+/// Obj-C method type encoding `"<ret>@:<args>"` for a JIT'd BCPL method
+/// IMP whose LLVM signature is `(self, _cmd, args…)`. Every BCPL method
+/// param is an i64 word (`"q"`); the return may be `f64` (`"d"`), a
+/// pointer (`"@"`), void (`"v"`), or i64 (`"q"` — including routines,
+/// which physically `ret i64 0`). `@:` are the implicit self/_cmd.
+fn objc_method_type_encoding(fv: inkwell::values::FunctionValue) -> String {
+    use inkwell::types::BasicTypeEnum;
+    let ret = match fv.get_type().get_return_type() {
+        None => "v".to_string(),
+        Some(BasicTypeEnum::FloatType(_)) => "d".to_string(),
+        Some(BasicTypeEnum::PointerType(_)) => "@".to_string(),
+        Some(_) => "q".to_string(),
+    };
+    let nargs = (fv.count_params() as usize).saturating_sub(2); // minus self, _cmd
+    let mut enc = ret;
+    enc.push_str("@:");
+    for _ in 0..nargs {
+        enc.push('q');
+    }
+    enc
+}
+
 fn run_program_ir(ir: &IrModule, modules_dir: Option<&Path>) -> Result<i64, String> {
     let context = Context::create();
+
+    // Begin a new JIT run: installs a unique per-run class-name prefix
+    // so the Obj-C classes this run registers (never disposed — the
+    // engine is leaked) don't collide with classes from a prior run of
+    // a different program in the same process. emit_new bakes the same
+    // prefix into its `bcpl_objc_new` calls, so they agree.
+    emit::begin_run();
 
     // ─── Program emit (first, so we have the host module to link into) ─
     let module = emit::emit(&context, ir);
@@ -388,78 +417,185 @@ fn run_program_ir(ir: &IrModule, modules_dir: Option<&Path>) -> Result<i64, Stri
         }
     }
 
-    // ─── vtable patch loop (NewCP-style for MCJIT) ──────────────
+    // ─── Objective-C class registrar ────────────────────────────────
     //
-    // For each class layout, look up the @Class.vtable global's
-    // runtime storage address and write the JIT'd method addresses
-    // into each slot. We have to do this from Rust because MCJIT's
-    // RuntimeDyld does not reliably apply function-pointer
-    // relocations to constant data globals — the slots stay zero
-    // if you encode them as constant initialisers.
-    //
-    // `LLVMGetGlobalValueAddress` gives us the vtable storage;
-    // `LLVMGetPointerToGlobal` resolves a method's compiled address
-    // (more reliable than name-based `get_function_address` for
-    // non-exported / mangled methods, per NewCP's findings).
-    for layout in &all_layouts {
-        if layout.vtable.is_empty() {
-            continue;
+    // Each BCPL class becomes a REAL Obj-C class (the MacModula2 object
+    // model). For every class layout, at JIT finalize and before START:
+    //   objc_allocateClassPair(super, "<prefix><Class>")
+    //   class_addIvar("__bcpl_<Class>", own-fields-size)   [per-class]
+    //   class_addMethod(sel("<m>"), <JIT'd Class_m IMP>, <type-enc>)
+    //   objc_registerClassPair
+    // Method IMP addresses resolve via LLVMGetPointerToGlobal here — the
+    // exact mechanism the old vtable patch loop relied on. NEW Class
+    // (emit_new) then does [[Class alloc] init]; dispatch is
+    // objc_msgSend; fields live in the per-class ivars.
+    {
+        use core::ffi::c_void;
+        use inkwell::values::AsValueRef;
+        use newbcpl_runtime::objc as rt;
+        use std::collections::HashMap;
+
+        let cstr = |s: &str| CString::new(s).expect("class/selector name has interior NUL");
+
+        // Register base-before-subclass: objc_allocateClassPair needs a
+        // registered superclass. all_layouts is alphabetical, so sort by
+        // inheritance depth (0 = no BCPL parent).
+        let by_name: HashMap<&str, &newbcpl_sema::ClassLayout> = all_layouts
+            .iter()
+            .map(|l| (l.class_name.as_str(), l))
+            .collect();
+        fn depth(
+            name: &str,
+            by_name: &HashMap<&str, &newbcpl_sema::ClassLayout>,
+            guard: usize,
+        ) -> usize {
+            if guard > 1024 {
+                return guard; // cyclic EXTENDS — bail
+            }
+            match by_name.get(name).and_then(|l| l.extends.as_deref()) {
+                Some(parent) if by_name.contains_key(parent) => {
+                    1 + depth(parent, by_name, guard + 1)
+                }
+                _ => 0,
+            }
         }
-        let vt_name = match CString::new(format!("{}.vtable", layout.class_name)) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let vt_addr = unsafe {
-            LLVMGetGlobalValueAddress(engine, vt_name.as_ptr())
-        };
-        if vt_addr == 0 {
-            // Vtable global was DCE'd by an LLVM pass. Skip — any
-            // virtual call into this class will read zero and the
-            // missing-builtin check above won't catch it; tests
-            // that depend on it will print zeros instead of method
-            // results.
-            continue;
-        }
-        let vt_ptr = vt_addr as *mut usize;
-        // Address of the no-op stub used for unbound slots. Cast
-        // once per layout so each entry's fallback is O(1).
-        let default_method_addr =
-            newbcpl_runtime::builtins::__newbcpl_default_method
-                as *const ()
-                as usize;
-        for entry in &layout.vtable {
-            // Resolve the method address. Three outcomes:
-            //   1. Bound: write the JIT'd function's compiled
-            //      address into the slot.
-            //   2. Not declared by this class (inherited default
-            //      CREATE / RELEASE) OR declared but body lives
-            //      in a different JIT module: fall back to the
-            //      `__newbcpl_default_method` stub, which returns
-            //      0 and is safe to call. Without this, an
-            //      explicit `obj.RELEASE()` in user code would
-            //      jump to address 0 and segfault.
-            let fn_addr: usize = match &entry.defining_class {
-                Some(owner) => {
-                    let method_symbol = format!("{owner}_{}", entry.method_name);
-                    match module.get_function(&method_symbol) {
-                        Some(fv) => {
-                            let a = unsafe {
-                                LLVMGetPointerToGlobal(engine, fv.as_value_ref())
-                            } as usize;
-                            if a == 0 {
-                                default_method_addr
-                            } else {
-                                a
+        let mut order: Vec<&newbcpl_sema::ClassLayout> = all_layouts.iter().collect();
+        order.sort_by_key(|l| depth(&l.class_name, &by_name, 0));
+
+        let prefix = emit::class_prefix();
+        let nsobject = cstr("NSObject");
+
+        for layout in order {
+            let objc_name = format!("{prefix}{}", layout.class_name);
+            let cname = cstr(&objc_name);
+
+            // Re-entry guard: START may re-run within this engine and
+            // re-enter the registrar; skip an already-registered class.
+            let existing =
+                unsafe { rt::bcpl_objc_get_class(cname.as_ptr() as *const u8) };
+            if !existing.is_null() {
+                continue;
+            }
+
+            // Superclass: a BCPL parent (prefixed) if present, else a
+            // real Cocoa class of that name, else NSObject.
+            let super_cls: *mut c_void = match &layout.extends {
+                Some(base) => {
+                    let pb = cstr(&format!("{prefix}{base}"));
+                    let s = unsafe { rt::bcpl_objc_get_class(pb.as_ptr() as *const u8) };
+                    if !s.is_null() {
+                        s
+                    } else {
+                        let rb = cstr(base);
+                        let s2 =
+                            unsafe { rt::bcpl_objc_get_class(rb.as_ptr() as *const u8) };
+                        if !s2.is_null() {
+                            s2
+                        } else {
+                            unsafe {
+                                rt::bcpl_objc_get_class(nsobject.as_ptr() as *const u8)
                             }
                         }
-                        None => default_method_addr,
                     }
                 }
-                None => default_method_addr,
+                None => unsafe {
+                    rt::bcpl_objc_get_class(nsobject.as_ptr() as *const u8)
+                },
             };
-            unsafe {
-                vt_ptr.add(entry.slot).write(fn_addr);
+
+            let cls = unsafe {
+                rt::bcpl_objc_allocate_class(super_cls, cname.as_ptr() as *const u8)
+            };
+            if cls.is_null() {
+                continue; // allocation failed (name collision, etc.)
             }
+
+            // One ivar for this class's OWN fields (skip if none —
+            // class_addIvar rejects size 0).
+            if layout.own_fields_size > 0 {
+                let ivar = cstr(&format!("__bcpl_{}", layout.class_name));
+                let enc = cstr(&format!("[{}c]", layout.own_fields_size));
+                unsafe {
+                    rt::bcpl_objc_add_ivar(
+                        cls,
+                        ivar.as_ptr() as *const u8,
+                        layout.own_fields_size as u64,
+                        3, // 2^3 = 8-byte alignment
+                        enc.as_ptr() as *const u8,
+                    );
+                }
+            }
+
+            // Methods DEFINED BY this class become Obj-C methods. (An
+            // inherited method's defining_class != this class — it was
+            // installed when its owner was registered, and Obj-C
+            // dispatch finds it up the chain.)
+            for entry in &layout.vtable {
+                let Some(owner) = entry.defining_class.as_deref() else {
+                    continue;
+                };
+                if owner != layout.class_name {
+                    continue;
+                }
+                let method_symbol = format!("{owner}_{}", entry.method_name);
+                let Some(fv) = module.get_function(&method_symbol) else {
+                    continue;
+                };
+                let imp =
+                    unsafe { LLVMGetPointerToGlobal(engine, fv.as_value_ref()) }
+                        as *mut c_void;
+                if imp.is_null() {
+                    continue;
+                }
+                // Mangled selector (bcpl_<method>) — must match the
+                // dispatch site in emit_objc_dispatch.
+                let sel_name = cstr(&emit::objc_selector(&entry.method_name));
+                let sel = unsafe { rt::bcpl_objc_sel(sel_name.as_ptr() as *const u8) };
+                let enc = cstr(&objc_method_type_encoding(fv));
+                unsafe {
+                    rt::bcpl_objc_add_method(
+                        cls,
+                        sel,
+                        imp,
+                        enc.as_ptr() as *const u8,
+                    );
+                }
+            }
+
+            // Lifecycle no-ops: a root BCPL class with no user CREATE /
+            // RELEASE still needs to respond to those selectors (e.g.
+            // an explicit `obj.RELEASE()`), since the mangled selector
+            // isn't an NSObject method. Bind undefined CREATE/RELEASE
+            // slots to the runtime no-op (returns 0). Subclasses inherit
+            // these; a subclass that defines its own overrides above.
+            if layout.extends.is_none() {
+                let noop = newbcpl_runtime::builtins::__newbcpl_default_method
+                    as *const () as *mut c_void;
+                for m in ["CREATE", "RELEASE"] {
+                    let undefined = layout
+                        .vtable
+                        .iter()
+                        .find(|v| v.method_name == m)
+                        .map(|v| v.defining_class.is_none())
+                        .unwrap_or(true);
+                    if undefined {
+                        let sel_name = cstr(&emit::objc_selector(m));
+                        let sel =
+                            unsafe { rt::bcpl_objc_sel(sel_name.as_ptr() as *const u8) };
+                        let enc = cstr("q@:");
+                        unsafe {
+                            rt::bcpl_objc_add_method(
+                                cls,
+                                sel,
+                                noop,
+                                enc.as_ptr() as *const u8,
+                            );
+                        }
+                    }
+                }
+            }
+
+            unsafe { rt::bcpl_objc_register_class(cls) };
         }
     }
 
@@ -936,15 +1072,11 @@ mod tests {
         let text = emit_text(
             "CLASS Point $( DECL x, y $)\nLET S() BE { LET p = NEW Point }",
         );
-        // `NEW Class` allocates on the GC heap via
-        // `__newbcpl_alloc_rec(size)`. The runtime interns a
-        // TypeDesc per distinct payload size and stamps every
-        // BlockHeader with that stable address — see
-        // `docs/jit_typedesc_lifetime.md`. The size argument is
-        // sema's `instance_size` (24 for Point: 8 vtable header
-        // + 2 word fields).
-        assert!(text.contains("@__newbcpl_alloc_rec"));
-        assert!(text.contains("i64 24"));
+        // `NEW Class` now creates a real Obj-C object via
+        // `bcpl_objc_new("<prefix>Point")` == [[Point alloc] init].
+        // No GC heap allocation, no inline vtable store.
+        assert!(text.contains("@bcpl_objc_new"));
+        assert!(!text.contains("@__newbcpl_alloc_rec"));
     }
 
     #[test]
@@ -952,9 +1084,12 @@ mod tests {
         let text = emit_text(
             "CLASS Point $( DECL x, y $)\nLET S() BE { LET p = NEW Point\n LET v = p.y }",
         );
-        // Field y is at offset 16 (vtable header + 8 for x).
+        // Field access rebases through the defining class's __bcpl ivar
+        // (bcpl_objc_field_base_for), then GEPs the OWN-relative offset.
+        // y is Point's second own field — own offset 8 (x at 0).
+        assert!(text.contains("@bcpl_objc_field_base_for"));
         assert!(text.contains("getelementptr"));
-        assert!(text.contains("i64 16"));
+        assert!(text.contains("i64 8"));
         assert!(text.contains("load i64"));
     }
 
@@ -963,9 +1098,9 @@ mod tests {
         let text = emit_text(
             "CLASS Point $( DECL x, y $)\nLET S() BE { LET p = NEW Point\n p.x := 99 }",
         );
-        assert!(text.contains("getelementptr"));
-        // x is the first field at offset 8.
-        assert!(text.contains("i64 8"));
+        // x is Point's first own field — own offset 0, in Point's
+        // __bcpl ivar reached via bcpl_objc_field_base_for.
+        assert!(text.contains("@bcpl_objc_field_base_for"));
         assert!(text.contains("store i64 99"));
     }
 
@@ -1014,36 +1149,20 @@ mod tests {
     }
 
     #[test]
-    fn jit_run_advances_heap_block_counter() {
-        // End-to-end proof that JIT-emitted `NEW Class` flows
-        // through the GC: compile a program that creates three
-        // class instances, run it, and check the global block
-        // counter advanced by at least three.
-        let tmp = std::env::temp_dir().join("newbcpl_jit_alloc.bcl");
+    fn jit_run_class_program_via_objc() {
+        // End-to-end proof that JIT-emitted `NEW Class` flows through
+        // the Obj-C runtime: compile a program that creates class
+        // instances (each is [[Point alloc] init]), runs their CREATE
+        // constructors, and stores into the per-class __bcpl ivar.
+        // Success (no crash, clean exit) proves the registrar +
+        // bcpl_objc_new + field_base_for path works under the JIT.
+        let tmp = std::env::temp_dir().join("newbcpl_jit_objc_class.bcl");
         std::fs::write(
             &tmp,
-            "CLASS Point $(\n  DECL x, y\n  ROUTINE CREATE(ix, iy) BE $( SELF.x := ix\n SELF.y := iy $)\n$)\nLET START() BE $(\n LET a = NEW Point(1, 2)\n LET b = NEW Point(3, 4)\n LET c = NEW Point(5, 6)\n$)",
+            "CLASS Point $(\n  DECL x, y\n  ROUTINE CREATE(ix, iy) BE $( SELF.x := ix\n SELF.y := iy $)\n  FUNCTION sum() = SELF.x + SELF.y\n$)\nLET START() BE $(\n LET a = NEW Point(1, 2)\n LET b = NEW Point(3, 4)\n LET c = NEW Point(5, 6)\n LET t = a.sum() + b.sum() + c.sum()\n WRITEN(t)\n$)",
         )
         .unwrap();
-        let before = newbcpl_runtime::gc::snapshot();
-        let blocks_before = before
-            .mutators
-            .iter()
-            .map(|m| m.alloc_blocks_lifetime)
-            .sum::<u64>();
-        run(&tmp).expect("JIT run should succeed");
-        let after = newbcpl_runtime::gc::snapshot();
-        let blocks_after = after
-            .mutators
-            .iter()
-            .map(|m| m.alloc_blocks_lifetime)
-            .sum::<u64>();
-        assert!(
-            blocks_after >= blocks_before + 3,
-            "JIT'd START allocated three Point instances but the heap counter \
-             only moved {} → {} (expected ≥ +3)",
-            blocks_before, blocks_after
-        );
+        run(&tmp).expect("JIT run of an Obj-C-backed class program should succeed");
         let _ = std::fs::remove_file(&tmp);
     }
 

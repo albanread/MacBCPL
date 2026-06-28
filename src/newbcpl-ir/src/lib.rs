@@ -422,26 +422,28 @@ mod tests {
         );
         let s = function(&m, "S");
         let entry = &s.blocks[0];
-        // y is the second field — offset 8 (vtable header) + 8 (x) = 16.
+        // y is the second OWN field of root class Point — own-relative
+        // offset 8 (x at 0, y at 8), in Point's own __bcpl ivar.
         let has_field_load = entry.instrs.iter().any(|i| matches!(
             i,
-            Instr::FieldLoad { byte_offset: 16, .. }
+            Instr::FieldLoad { byte_offset: 8, defining_class, .. } if defining_class == "Point"
         ));
-        assert!(has_field_load, "expected FieldLoad with byte_offset=16");
+        assert!(has_field_load, "expected FieldLoad y at own offset 8 in Point");
     }
 
     #[test]
-    fn field_load_first_field_offset_8() {
+    fn field_load_first_field_offset_0() {
         let m = lower_source(
             "CLASS Point $( DECL x, y $)\nLET S() BE { LET p = NEW Point\n LET q = p.x }",
         );
         let s = function(&m, "S");
         let entry = &s.blocks[0];
+        // x is the first OWN field — own-relative offset 0.
         let has_field_load = entry.instrs.iter().any(|i| matches!(
             i,
-            Instr::FieldLoad { byte_offset: 8, .. }
+            Instr::FieldLoad { byte_offset: 0, defining_class, .. } if defining_class == "Point"
         ));
-        assert!(has_field_load, "expected FieldLoad at offset 8");
+        assert!(has_field_load, "expected FieldLoad x at own offset 0 in Point");
     }
 
     #[test]
@@ -454,12 +456,12 @@ mod tests {
         let has_field_store = entry.instrs.iter().any(|i| matches!(
             i,
             Instr::FieldStore {
-                byte_offset: 16,
+                byte_offset: 8,
                 value: Value::Const(Const::Int(99)),
                 ..
             }
         ));
-        assert!(has_field_store, "expected FieldStore at +16 storing 99");
+        assert!(has_field_store, "expected FieldStore at own +8 storing 99");
     }
 
     #[test]

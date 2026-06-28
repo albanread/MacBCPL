@@ -30,6 +30,57 @@ use newbcpl_ir::{
 };
 use newbcpl_sema::{ClassLayout, TypeHint};
 
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Process-monotonic JIT-run counter. Each `run()` gets a unique id so
+/// the Obj-C classes it registers (which are never disposed — the
+/// engine is leaked) don't collide with classes left over from a prior
+/// run of a DIFFERENT program in the same process (e.g. the test suite
+/// running many programs, several of which declare a `Point`).
+static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// The class-name prefix for the current run, e.g. "BCPL_3_".
+    /// Both `emit_new`/dispatch (which name classes for `bcpl_objc_new`)
+    /// and the JIT-finalize registrar read this so they agree.
+    static CLASS_PREFIX: RefCell<String> = RefCell::new("BCPL_".to_string());
+}
+
+/// Begin a new JIT run: bump the run id and install a unique
+/// class-name prefix. Call once at the start of a `run()` before
+/// `emit()` and before the class registrar.
+pub fn begin_run() {
+    let id = RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    CLASS_PREFIX.with(|p| *p.borrow_mut() = format!("BCPL_{id}_"));
+}
+
+/// The current run's class-name prefix.
+pub fn class_prefix() -> String {
+    CLASS_PREFIX.with(|p| p.borrow().clone())
+}
+
+/// The mangled Obj-C class name for a BCPL class in the current run
+/// (e.g. `Point` -> `BCPL_3_Point`). Used by `bcpl_objc_new` in
+/// `emit_new` and by the registrar's `objc_allocateClassPair`.
+pub fn class_objc_name(class_name: &str) -> String {
+    format!("{}{}", class_prefix(), class_name)
+}
+
+/// The Obj-C selector for a BCPL method. BCPL method names live in
+/// their own namespace, so we prefix them to avoid colliding with the
+/// Objective-C runtime's own selectors — a BCPL method called `init`,
+/// `release`, `alloc`, `copy`, `description`, … would otherwise shadow
+/// (or be shadowed by) `NSObject`'s, e.g. overriding `init` with a
+/// routine that returns 0 breaks `[[Class alloc] init]`. Both the
+/// registrar (`class_addMethod`) and dispatch (`objc_msgSend`) use this,
+/// so they always agree. (When BCPL classes later need to override real
+/// Cocoa methods — drawRect:, mouseDown:, … — that will be an explicit
+/// opt-in using the raw selector, separate from this default.)
+pub fn objc_selector(method_name: &str) -> String {
+    format!("bcpl_{method_name}")
+}
+
 /// Top-level entry: produce a finalised LLVM module from our typed
 /// IR. The caller owns the `Context`; the returned `LlvmModule`
 /// borrows from it.
@@ -1076,10 +1127,14 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                 dst,
                 base,
                 byte_offset,
+                defining_class,
                 hint,
             } => {
                 let base_v = self.lower_value(base);
                 let base_ptr = self.as_pointer(base_v);
+                // Rebase to the defining class's __bcpl_<C> ivar block,
+                // then GEP the field's own-relative offset within it.
+                let block_ptr = self.emit_field_base(base_ptr, defining_class);
                 let off = self
                     .context
                     .i64_type()
@@ -1087,7 +1142,7 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                 let i8_t = self.context.i8_type();
                 let field_ptr = unsafe {
                     self.builder
-                        .build_gep(i8_t, base_ptr, &[off], "field.addr")
+                        .build_gep(i8_t, block_ptr, &[off], "field.addr")
                         .expect("gep field")
                 };
                 let ty = self.basic_type_for(*hint);
@@ -1100,10 +1155,12 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             Instr::FieldStore {
                 base,
                 byte_offset,
+                defining_class,
                 value,
             } => {
                 let base_v = self.lower_value(base);
                 let base_ptr = self.as_pointer(base_v);
+                let block_ptr = self.emit_field_base(base_ptr, defining_class);
                 let off = self
                     .context
                     .i64_type()
@@ -1111,7 +1168,7 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                 let i8_t = self.context.i8_type();
                 let field_ptr = unsafe {
                     self.builder
-                        .build_gep(i8_t, base_ptr, &[off], "field.addr")
+                        .build_gep(i8_t, block_ptr, &[off], "field.addr")
                         .expect("gep field")
                 };
                 let v = self.lower_value(value);
@@ -1124,7 +1181,7 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                 receiver,
                 class_name,
                 vtable_slot,
-                method_name: _,
+                method_name,
                 args,
                 hint,
             } => {
@@ -1133,6 +1190,7 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                     receiver,
                     class_name,
                     *vtable_slot,
+                    method_name,
                     args,
                     *hint,
                 );
@@ -1155,96 +1213,33 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         }
     }
 
-    /// `NEW Class(args)` allocates an instance on the GC heap via
-    /// `__newbcpl_new_rec(@Class.desc)`. The runtime stamps the
-    /// `BlockHeader.tag` (at `obj - 16`) with the TypeDesc address
-    /// so the collector can find the layout / size / pointer
-    /// offsets on a sweep. The first word of the data area still
-    /// holds an inline vtable pointer (we keep the cheap
-    /// `obj → vtable → slot` MethodCall path); fields follow at
-    /// `+8`, `+16`, … as sema laid them out. Finally we call the
-    /// mangled `Class_CREATE` to run the constructor — direct
-    /// dispatch because the static class is known here.
-    ///
-    /// On the first allocation per TypeDesc the GC auto-registers
-    /// it (see `__newbcpl_new_rec` in `gc.rs`), so we don't need
-    /// an explicit init pass.
+    /// `NEW Class(args)` creates a real Objective-C object:
+    /// `bcpl_objc_new("<run-prefix>Class")` == `[[Class alloc] init]`.
+    /// The class was registered with the Obj-C runtime at JIT finalize
+    /// (see the registrar in `lib.rs`), so the instance has a proper
+    /// `isa` at word 0 and its fields live in per-class `__bcpl_<C>`
+    /// ivars (reached by `FieldLoad`/`FieldStore` via
+    /// `bcpl_objc_field_base_for`). We then direct-call the defining
+    /// class's `Class_CREATE` constructor — passing a null `_cmd` (the
+    /// Obj-C IMP ABI's selector slot) since this is a static call, not
+    /// an `objc_msgSend`.
     fn emit_new(&mut self, class_name: &str, args: &[Value]) -> BasicValueEnum<'ctx> {
         let i64_t = self.context.i64_type();
-        let ptr_t = self.context.ptr_type(AddressSpace::default());
         let layout = self.lookup_layout(class_name);
-        let size = layout.map(|l| l.instance_size).unwrap_or(8);
 
-        // Allocate the instance on the GC heap via the
-        // size-keyed allocator `__newbcpl_alloc_rec`. The
-        // runtime interns a TypeDesc per distinct payload
-        // size and stamps every BlockHeader with that stable
-        // address — see `docs/jit_typedesc_lifetime.md` for
-        // why we don't pass `@Class.desc` directly. Classes
-        // with no recorded layout fall back to a stack alloca
-        // so simple data-only classes still compile, but in
-        // practice every declared class has a layout.
-        let obj_ptr: PointerValue<'ctx> = if layout.is_some() {
-            let alloc_fn = match self.by_name.get("__newbcpl_alloc_rec") {
-                Some(&f) => f,
-                None => {
-                    // Signature: `ptr fn(i64)`.
-                    let fn_ty = ptr_t.fn_type(&[i64_t.into()], false);
-                    let fv = self.module.add_function(
-                        "__newbcpl_alloc_rec",
-                        fn_ty,
-                        Some(Linkage::External),
-                    );
-                    self.by_name
-                        .insert("__newbcpl_alloc_rec".to_string(), fv);
-                    fv
-                }
-            };
-            let size_arg = i64_t.const_int(size as u64, true);
-            let call_site = self
-                .builder
-                .build_call(
-                    alloc_fn,
-                    &[size_arg.into()],
-                    &format!("new.{class_name}"),
-                )
-                .expect("call __newbcpl_alloc_rec");
-            use inkwell::values::ValueKind;
-            match call_site.try_as_basic_value() {
-                ValueKind::Basic(rv) => self.as_pointer(rv),
-                ValueKind::Instruction(_) => panic!(
-                    "__newbcpl_alloc_rec must return a pointer"
-                ),
-            }
-        } else {
-            let i8_t = self.context.i8_type();
-            let arr_t = i8_t.array_type(size as u32);
-            let alloca = self
-                .builder
-                .build_alloca(arr_t, &format!("obj.{class_name}"))
-                .expect("alloca obj");
-            self.zero_memory(alloca, size);
-            alloca
-        };
-
-        // Install the inline vtable pointer at offset 0 of the
-        // instance. The GC already zeroes the block, so other
-        // fields start as zero — matches sema's documented "zeroed
-        // instance" contract.
-        let vtable_global_name = format!("{class_name}.vtable");
-        if let Some(vtable_global) = self.module.get_global(&vtable_global_name) {
-            let _ = self
-                .builder
-                .build_store(obj_ptr, vtable_global.as_pointer_value())
-                .expect("store vtable header");
-        }
-
-        let _ = i64_t; // silence unused if no other use below
+        // obj = bcpl_objc_new("<prefix>Class")
+        let objc_name = class_objc_name(class_name);
+        let name_ptr = self.cstr_global(&format!("bcpl.cls.{class_name}"), &objc_name);
+        let new_fn = self.runtime_ptr_fn("bcpl_objc_new", 1);
+        let new_call = self
+            .builder
+            .build_call(new_fn, &[name_ptr.into()], &format!("new.{class_name}"))
+            .expect("call bcpl_objc_new");
+        let obj_ptr = self.call_result_ptr(new_call, "bcpl_objc_new");
 
         // Call the mangled CREATE if declared. Use the *defining*
         // class — for `NEW Sub` where Sub inherits CREATE from Base,
-        // we want `Base_CREATE` not `Sub_CREATE`. The layout's
-        // vtable already tracks `defining_class` for slot 0.
+        // we want `Base_CREATE` not `Sub_CREATE`.
         let create_owner = layout.and_then(|l| {
             l.vtable
                 .iter()
@@ -1253,13 +1248,15 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         });
         if let Some(owner) = create_owner {
             let create_name = format!("{owner}_CREATE");
+            // CREATE's ABI is now (self, _cmd, args...) — +2.
             let create_fn = match self.by_name.get(&create_name) {
                 Some(&f) => f,
-                None => self.declare_extern(&create_name, args.len() + 1),
+                None => self.declare_extern(&create_name, args.len() + 2),
             };
             let mut call_args: Vec<BasicMetadataValueEnum> =
-                Vec::with_capacity(args.len() + 1);
+                Vec::with_capacity(args.len() + 2);
             call_args.push(obj_ptr.into());
+            call_args.push(i64_t.const_zero().into()); // null _cmd (SEL slot)
             for a in args {
                 call_args.push(self.lower_value(a).into());
             }
@@ -1270,22 +1267,97 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         obj_ptr.into()
     }
 
-    /// Lower `Instr::MethodCall` to an indirect call through the
-    /// receiver's vtable header. The dispatch sequence is:
-    ///   1. Receiver's first word (offset 0) holds the vtable ptr
-    ///   2. GEP `vtable[slot]` produces the address of the slot
-    ///   3. Load that to get the function pointer
-    ///   4. Indirect call with `(receiver, args...)`
-    /// MCJIT writes the actual method addresses into the vtable
-    /// slots after finalisation; until then the slots read zero,
-    /// which is fine because no method gets called before the
-    /// JIT layer's patch loop runs.
-    fn emit_method_call(
+    /// Get-or-create a private, constant, NUL-terminated byte-array
+    /// global holding `s`, keyed by `sym`. Returns its pointer.
+    fn cstr_global(&mut self, sym: &str, s: &str) -> PointerValue<'ctx> {
+        let i8_t = self.context.i8_type();
+        let g = match self.module.get_global(sym) {
+            Some(g) => g,
+            None => {
+                let mut bytes = s.as_bytes().to_vec();
+                bytes.push(0);
+                let byte_consts: Vec<inkwell::values::IntValue<'ctx>> = bytes
+                    .iter()
+                    .map(|b| i8_t.const_int(*b as u64, false))
+                    .collect();
+                let arr_init = i8_t.const_array(&byte_consts);
+                let g = self.module.add_global(arr_init.get_type(), None, sym);
+                g.set_initializer(&arr_init);
+                g.set_constant(true);
+                g.set_linkage(Linkage::Private);
+                g
+            }
+        };
+        g.as_pointer_value()
+    }
+
+    /// Declare-or-get a runtime bridge function returning `ptr` and
+    /// taking `nptr_params` pointer arguments (the shape of every
+    /// `bcpl_objc_*` helper used by dispatch / field access).
+    fn runtime_ptr_fn(&mut self, name: &str, nptr_params: usize) -> FunctionValue<'ctx> {
+        match self.module.get_function(name) {
+            Some(f) => f,
+            None => {
+                let ptr_t = self.context.ptr_type(AddressSpace::default());
+                let params: Vec<BasicMetadataTypeEnum> = vec![ptr_t.into(); nptr_params];
+                let fn_type = ptr_t.fn_type(&params, false);
+                self.module.add_function(name, fn_type, None)
+            }
+        }
+    }
+
+    /// Extract a pointer result from a freshly-built call.
+    fn call_result_ptr(
+        &self,
+        call: inkwell::values::CallSiteValue<'ctx>,
+        what: &str,
+    ) -> PointerValue<'ctx> {
+        use inkwell::values::ValueKind;
+        match call.try_as_basic_value() {
+            ValueKind::Basic(rv) => rv.into_pointer_value(),
+            ValueKind::Instruction(_) => panic!("{what} did not return a pointer"),
+        }
+    }
+
+    /// Rebase an object pointer to a specific class's field block: the
+    /// address of its `__bcpl_<defining_class>` Obj-C ivar. Returns
+    /// `obj` unchanged for a non-class field access (empty class).
+    fn emit_field_base(
+        &mut self,
+        obj: PointerValue<'ctx>,
+        defining_class: &str,
+    ) -> PointerValue<'ctx> {
+        if defining_class.is_empty() {
+            return obj;
+        }
+        let ivar = format!("__bcpl_{defining_class}");
+        let ivar_ptr = self.cstr_global(&format!("bcpl.ivar.{defining_class}"), &ivar);
+        let f = self.runtime_ptr_fn("bcpl_objc_field_base_for", 2);
+        let call = self
+            .builder
+            .build_call(f, &[obj.into(), ivar_ptr.into()], "fbase")
+            .expect("call bcpl_objc_field_base_for");
+        self.call_result_ptr(call, "bcpl_objc_field_base_for")
+    }
+
+    /// The shared Objective-C dispatch sequence used by BOTH static and
+    /// dynamic method calls. `objc_msgSend` dispatches on the
+    /// receiver's `isa`, so the static class is irrelevant here:
+    ///
+    ///   sel    = bcpl_objc_sel("<method>")
+    ///   fnptr  = bcpl_objc_msgsend_ptr()           // &objc_msgSend
+    ///   result = (cast fnptr to ret(ptr,ptr,i64…)*)(recv, sel, args…)
+    ///
+    /// Every method's params are lowered uniformly as i64 words (sema
+    /// forces TypeHint::Word for all method params), so the msgSend
+    /// signature uses i64 for every user arg; only the return type
+    /// varies (from `hint`). self/_cmd are pointers (ABI-identical to
+    /// i64 in x0/x1 on arm64).
+    fn emit_objc_dispatch(
         &mut self,
         dst: Option<ValueId>,
         receiver: &Value,
-        class_name: &str,
-        slot: usize,
+        method_name: &str,
         args: &[Value],
         hint: TypeHint,
     ) {
@@ -1295,37 +1367,31 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         let recv_v = self.lower_value(receiver);
         let recv_ptr = self.as_pointer(recv_v);
 
-        // 1. Load vtable pointer from offset 0 of the instance.
-        let vtable_ptr = self
+        // sel = bcpl_objc_sel(@"bcpl_<method>\0") — mangled so BCPL
+        // method names never collide with Obj-C runtime selectors.
+        let selector = objc_selector(method_name);
+        let sel_name = self.cstr_global(&format!("bcpl.sel.{method_name}"), &selector);
+        let sel_fn = self.runtime_ptr_fn("bcpl_objc_sel", 1);
+        let sel_call = self
             .builder
-            .build_load(ptr_t, recv_ptr, "vtable_ptr")
-            .expect("load vtable header")
-            .into_pointer_value();
+            .build_call(sel_fn, &[sel_name.into()], "sel")
+            .expect("call bcpl_objc_sel");
+        let sel = self.call_result_ptr(sel_call, "bcpl_objc_sel");
 
-        // 2. GEP vtable_ptr[slot] (each slot is one ptr).
-        let slot_idx = i64_t.const_int(slot as u64, false);
-        let slot_addr = unsafe {
-            self.builder
-                .build_gep(ptr_t, vtable_ptr, &[slot_idx], "vt_slot")
-                .expect("gep vtable slot")
-        };
-
-        // 3. Load the function pointer.
-        let fn_ptr = self
+        // fnptr = bcpl_objc_msgsend_ptr()  (&objc_msgSend)
+        let msgsend_fn = self.runtime_ptr_fn("bcpl_objc_msgsend_ptr", 0);
+        let msgsend_call = self
             .builder
-            .build_load(ptr_t, slot_addr, "fn_ptr")
-            .expect("load fn_ptr")
-            .into_pointer_value();
+            .build_call(msgsend_fn, &[], "msgsendp")
+            .expect("call bcpl_objc_msgsend_ptr");
+        let fnptr = self.call_result_ptr(msgsend_call, "bcpl_objc_msgsend_ptr");
 
-        // 4. Build the indirect call. We need an LLVM FunctionType
-        // matching the method's ABI. We don't have one materialised
-        // (the method may not even live in this module). Synthesise
-        // one from the class layout's view: receiver (ptr) plus N
-        // i64 args, returning the typed result.
+        // Build the call-site-specific objc_msgSend signature:
+        //   ret (ptr recv, ptr sel, i64 arg0, …)
         let return_type = self.return_type_for(hint);
-        let mut param_types: Vec<BasicMetadataTypeEnum> =
-            Vec::with_capacity(args.len() + 1);
-        param_types.push(ptr_t.into());
+        let mut param_types: Vec<BasicMetadataTypeEnum> = Vec::with_capacity(args.len() + 2);
+        param_types.push(ptr_t.into()); // self
+        param_types.push(ptr_t.into()); // _cmd (SEL)
         for _ in args {
             param_types.push(i64_t.into());
         }
@@ -1334,21 +1400,19 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             None => self.context.void_type().fn_type(&param_types, false),
         };
 
-        let mut call_args: Vec<BasicMetadataValueEnum> =
-            Vec::with_capacity(args.len() + 1);
+        let mut call_args: Vec<BasicMetadataValueEnum> = Vec::with_capacity(args.len() + 2);
         call_args.push(recv_ptr.into());
+        call_args.push(sel.into());
         for a in args {
             let v = self.lower_value(a);
-            // Coerce each arg to the i64 word the method expects.
             let iv = self.as_int_word(v);
             call_args.push(iv.into());
         }
         let call_site = self
             .builder
-            .build_indirect_call(fn_type, fn_ptr, &call_args, "vcall")
-            .expect("indirect call");
+            .build_indirect_call(fn_type, fnptr, &call_args, "msgsend")
+            .expect("objc_msgSend indirect call");
 
-        let _ = class_name; // class name was used for slot resolution upstream
         if let Some(d) = dst {
             use inkwell::values::ValueKind;
             match call_site.try_as_basic_value() {
@@ -1363,26 +1427,35 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         }
     }
 
-    /// Lower `Instr::IndirectMethodCall` to a runtime name-keyed
-    /// dispatch. The static class isn't known at this site (typically
-    /// an untyped routine parameter), so codegen emits:
-    ///
-    ///   1. Materialise a private global pointing at the method's
-    ///      null-terminated name string.
-    ///   2. Call `__newbcpl_lookup_method(receiver, name_ptr)` —
-    ///      the runtime walks the receiver's `TypeDesc.method_names`
-    ///      and returns the matching `vtable[i]` function pointer
-    ///      (or null if the method isn't defined on the class).
-    ///   3. Indirect-call through the returned pointer with
-    ///      `(receiver, args...)`.
-    ///
-    /// A null lookup result would dispatch through address 0 and
-    /// crash. We don't guard with a runtime null check here: the
-    /// failure mode is identical to a vtable-slot null today, and
-    /// adding the guard adds a hard-to-explain hidden branch on
-    /// every dynamic dispatch. Programs that hit it have a real
-    /// "method not defined for this class" bug — a BRK at the
-    /// caller will surface it.
+    /// Lower `Instr::MethodCall`. Under the Cocoa object model a method
+    /// call is an `objc_msgSend(recv, sel("<method>"), args…)` — the
+    /// receiver is a real Obj-C object and dispatch goes through its
+    /// `isa`. The static `class_name` / `slot` (a leftover from the old
+    /// vtable scheme) are no longer needed: msgSend resolves the IMP by
+    /// selector on the dynamic class. See `emit_objc_dispatch`.
+    fn emit_method_call(
+        &mut self,
+        dst: Option<ValueId>,
+        receiver: &Value,
+        class_name: &str,
+        slot: usize,
+        method_name: &str,
+        args: &[Value],
+        hint: TypeHint,
+    ) {
+        let _ = (class_name, slot); // vtable-era inputs, now unused
+        self.emit_objc_dispatch(dst, receiver, method_name, args, hint);
+    }
+
+    /// Lower `Instr::IndirectMethodCall`. The static class isn't known
+    /// at this site (typically an untyped routine parameter), but under
+    /// the Cocoa object model that doesn't matter: `objc_msgSend`
+    /// dispatches on the receiver's `isa` by selector, exactly like a
+    /// statically-typed call. So this lowers identically to
+    /// `emit_method_call` — both go through `emit_objc_dispatch`. If the
+    /// receiver's class doesn't respond to the selector, the Obj-C
+    /// runtime raises an unrecognized-selector error (the analogue of
+    /// the old "method not defined for this class" crash).
     fn emit_indirect_method_call(
         &mut self,
         dst: Option<ValueId>,
@@ -1391,110 +1464,7 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         args: &[Value],
         hint: TypeHint,
     ) {
-        let ptr_t = self.context.ptr_type(AddressSpace::default());
-        let i64_t = self.context.i64_type();
-        let i8_t = self.context.i8_type();
-
-        let recv_v = self.lower_value(receiver);
-        let recv_ptr = self.as_pointer(recv_v);
-
-        // 1. Emit a private global holding the null-terminated method
-        // name. Names are interned per-IR-name string to avoid
-        // duplicate globals when the same method is dispatched in
-        // multiple places. Inkwell doesn't easily let us look up a
-        // global by initialiser, so we cache by name via the module's
-        // own symbol table — a `@bcpl.mname.<name>` convention.
-        let mangled_name_sym = format!("bcpl.mname.{method_name}");
-        let name_global = match self.module.get_global(&mangled_name_sym) {
-            Some(g) => g,
-            None => {
-                let mut bytes = method_name.as_bytes().to_vec();
-                bytes.push(0);
-                let byte_consts: Vec<inkwell::values::IntValue<'ctx>> =
-                    bytes
-                        .iter()
-                        .map(|b| i8_t.const_int(*b as u64, false))
-                        .collect();
-                let arr_init = i8_t.const_array(&byte_consts);
-                let g = self
-                    .module
-                    .add_global(arr_init.get_type(), None, &mangled_name_sym);
-                g.set_initializer(&arr_init);
-                g.set_constant(true);
-                g.set_linkage(Linkage::Private);
-                g
-            }
-        };
-
-        // 2. Look the method up via the runtime helper.
-        let lookup_fn = match self.module.get_function("__newbcpl_lookup_method") {
-            Some(f) => f,
-            None => {
-                let fn_type = ptr_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
-                self.module
-                    .add_function("__newbcpl_lookup_method", fn_type, None)
-            }
-        };
-        let lookup_call = self
-            .builder
-            .build_call(
-                lookup_fn,
-                &[
-                    recv_ptr.into(),
-                    name_global.as_pointer_value().into(),
-                ],
-                "method_fn",
-            )
-            .expect("lookup call");
-        use inkwell::values::ValueKind;
-        let resolved_fn = match lookup_call.try_as_basic_value() {
-            ValueKind::Basic(rv) => rv.into_pointer_value(),
-            ValueKind::Instruction(_) => {
-                panic!("__newbcpl_lookup_method did not return a value")
-            }
-        };
-
-        // 3. Indirect-call through the resolved function pointer
-        // with (receiver, args...). Synthesise a function type that
-        // matches the BCPL-routine ABI: ptr receiver, i64 args, then
-        // the typed return value.
-        let return_type = self.return_type_for(hint);
-        let mut param_types: Vec<BasicMetadataTypeEnum> =
-            Vec::with_capacity(args.len() + 1);
-        param_types.push(ptr_t.into());
-        for _ in args {
-            param_types.push(i64_t.into());
-        }
-        let fn_type = match return_type {
-            Some(t) => t.fn_type(&param_types, false),
-            None => self.context.void_type().fn_type(&param_types, false),
-        };
-
-        let mut call_args: Vec<BasicMetadataValueEnum> =
-            Vec::with_capacity(args.len() + 1);
-        call_args.push(recv_ptr.into());
-        for a in args {
-            let v = self.lower_value(a);
-            let iv = self.as_int_word(v);
-            call_args.push(iv.into());
-        }
-        let call_site = self
-            .builder
-            .build_indirect_call(fn_type, resolved_fn, &call_args, "vcall_dyn")
-            .expect("indirect call (dynamic)");
-
-        if let Some(d) = dst {
-            use inkwell::values::ValueKind;
-            match call_site.try_as_basic_value() {
-                ValueKind::Basic(rv) => {
-                    self.value_map.insert(d, rv);
-                }
-                ValueKind::Instruction(_) => {
-                    let z = self.zero(hint);
-                    self.value_map.insert(d, z);
-                }
-            }
-        }
+        self.emit_objc_dispatch(dst, receiver, method_name, args, hint);
     }
 
     fn zero_memory(&self, ptr: PointerValue<'ctx>, bytes: usize) {
