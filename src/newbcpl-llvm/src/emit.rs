@@ -500,6 +500,17 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             inkwell::attributes::AttributeLoc::Function,
             uwtable_attr,
         );
+        // Force a full frame-pointer prologue (`stp x29,x30` + `mov
+        // x29,sp`) on every JIT'd routine. Without this, LLVM saves
+        // x29/x30 but omits the `mov x29,sp`, leaving the arm64 frame-
+        // pointer chain broken — which breaks the BRK / crash-handler
+        // stack walk (we walk the x29 chain by hand because macOS
+        // libunwind can't traverse JIT frames). With it, every BCPL
+        // routine is a proper link in the fp chain.
+        let fp_attr = self
+            .context
+            .create_string_attribute("frame-pointer", "all");
+        fv.add_attribute(inkwell::attributes::AttributeLoc::Function, fp_attr);
         self.by_name.insert(f.name.clone(), fv);
         fv
     }

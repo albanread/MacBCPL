@@ -584,27 +584,28 @@ fn brk_emits_heap_summary() {
 
 #[test]
 fn brk_emits_register_state() {
-    // The context section reports RIP/RSP/RBP plus the GPRs and
-    // flags. We assert on the section header and a couple of the
-    // register names — actual values are unstable.
+    // The context section reports the arm64 pc / sp / fp at the BRK
+    // site. (MacBCPL is an arm64 fork — the upstream x86 rip/rsp/rax
+    // register dump doesn't apply.) Values are unstable; assert on the
+    // header and the register labels.
     expect_stdout_and_stderr_contains(
         "brk_emits_register_state",
         "LET START() BE $(\n  BRK\n  WRITES(\"ok\")\n$)\n",
         "ok",
-        &["context:", "rip=", "rsp=", "rax=", "r15="],
+        &["context:", "pc=", "sp=", "fp="],
     );
 }
 
 #[test]
 fn brk_emits_stack_walk() {
-    // The stack section walks frames via RtlVirtualUnwind. We
-    // can't assert on specific frame addresses, but we assert at
-    // least one frame entry was emitted.
+    // The stack section walks the arm64 frame-pointer chain by hand
+    // (macOS libunwind can't traverse JIT frames). We can't assert on
+    // specific addresses, but at least one frame entry is emitted.
     expect_stdout_and_stderr_contains(
         "brk_emits_stack_walk",
         "LET START() BE $(\n  BRK\n  WRITES(\"ok\")\n$)\n",
         "ok",
-        &["stack:", "#0", "rip="],
+        &["stack:", "#0"],
     );
 }
 

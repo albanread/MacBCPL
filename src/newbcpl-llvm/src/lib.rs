@@ -210,6 +210,14 @@ fn objc_method_type_encoding(fv: inkwell::values::FunctionValue) -> String {
 fn run_program_ir(ir: &IrModule, modules_dir: Option<&Path>) -> Result<i64, String> {
     let context = Context::create();
 
+    // Install the signal-safe crash handler (idempotent). On a fatal
+    // signal — including the SIGABRT from a Rust panic in a runtime
+    // helper that can't unwind through a JIT frame — it writes an
+    // annotated backtrace (BCPL routine names via the JIT registry) to
+    // stderr, then re-raises so the OS still produces its crash report.
+    // This is the macOS replacement for the upstream Windows SEH path.
+    newbcpl_runtime::crash::bcpl_install_crash_handler();
+
     // Begin a new JIT run: installs a unique per-run class-name prefix
     // so the Obj-C classes this run registers (never disposed — the
     // engine is leaked) don't collide with classes from a prior run of
@@ -361,6 +369,13 @@ fn run_program_ir(ir: &IrModule, modules_dir: Option<&Path>) -> Result<i64, Stri
         );
     }
     opts.OptLevel = OptimizationLevel::Default as u32;
+    // Force frame pointers in the MCJIT target machine. Without this,
+    // MCJIT elides them for JIT'd routines (it ignores the per-function
+    // "frame-pointer"="all" attribute), leaving the arm64 x29 chain
+    // broken — so the BRK / crash-handler fp-walk can't see BCPL frames.
+    // With it, every JIT'd routine sets `mov x29,sp` and is a proper
+    // link in the chain.
+    opts.NoFramePointerElim = 1;
     // On Windows we install our custom MCJIT memory manager so JIT'd
     // code's `.pdata`/`.xdata` get registered with the OS SEH unwinder
     // (`RtlAddFunctionTable`). On macOS arm64 we leave `MCJMM` null so
@@ -641,47 +656,18 @@ fn run_program_ir(ir: &IrModule, modules_dir: Option<&Path>) -> Result<i64, Stri
         }
         fopt = f.get_next_function();
     }
+    // Freeze + publish the JIT symbol table so the signal handler's
+    // backtrace can name BCPL routines with a lock-free lookup.
+    newbcpl_runtime::crash::bcpl_finalize_jit_symbols();
 
-    // Register each class's (vtable, method_names) pair with the
-    // runtime's name-keyed dispatch table. The lookup helper
-    // `__newbcpl_lookup_method` reads an instance's inline vtable
-    // pointer (at offset 0) and looks it up here to find the
-    // matching `method_names` array. Without this registration,
-    // IndirectMethodCall sites would all resolve to null and
-    // crash. We walk `all_layouts` rather than the LLVM module
-    // because the layouts already carry the canonical class names
-    // and vtable lengths.
-    for layout in &all_layouts {
-        if layout.vtable.is_empty() {
-            continue;
-        }
-        let vt_sym = format!("{}.vtable", layout.class_name);
-        let names_sym = format!("{}.method_names", layout.class_name);
-        let vt_cname = match CString::new(vt_sym.as_str()) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let names_cname = match CString::new(names_sym.as_str()) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let vt_addr =
-            unsafe { LLVMGetGlobalValueAddress(engine, vt_cname.as_ptr()) };
-        let names_addr =
-            unsafe { LLVMGetGlobalValueAddress(engine, names_cname.as_ptr()) };
-        newbcpl_runtime::gc::register_jit_vtable_methods(
-            vt_addr,
-            names_addr,
-            layout.vtable.len() as u64,
-        );
-    }
+    // (The old name-keyed (vtable, method_names) registration loop is
+    // gone: dispatch is objc_msgSend now, so __newbcpl_lookup_method
+    // and the @Class.vtable / @Class.method_names globals are unused.)
 
-    // Leak the engine. Drop would call LLVMDisposeExecutionEngine
-    // which tears down our memory manager and leaves stale SEH
-    // function tables registered with the OS unwinder. The host
-    // process keeps JIT'd code forever, so leaking is the right
-    // contract; module-retirement support would pair this with
-    // RtlDeleteFunctionTable, but we don't have retirement yet.
+    // Leak the engine. Drop would call LLVMDisposeExecutionEngine,
+    // tearing down JIT'd code the host keeps forever — leaking is the
+    // right contract; module-retirement would pair this with explicit
+    // teardown, but we don't have retirement yet.
     let engine_box = Box::new(engine);
     let _ = Box::leak(engine_box);
 
@@ -717,23 +703,22 @@ fn run_program_ir(ir: &IrModule, modules_dir: Option<&Path>) -> Result<i64, Stri
     }
 }
 
-/// Run `body` with the global panic hook temporarily silenced. Used
-/// around the `catch_unwind` boundary so the default hook doesn't
-/// print "thread … panicked at …" for a panic the host is about to
-/// recover from. `NEWBCPL_LOG_JIT_PANICS=1` keeps the existing hook
-/// so a developer chasing a real bug still sees the message.
+/// Run `body` (the `catch_unwind` boundary), keeping the default panic
+/// hook so a runtime-helper panic's message reaches stderr.
+///
+/// On macOS arm64 a Rust panic raised in a runtime helper called from
+/// JIT'd code cannot unwind through the JIT frame (MCJIT doesn't
+/// register usable DWARF unwind info), so `catch_unwind` never recovers
+/// — the panic runtime aborts (SIGABRT). That's intentional on this
+/// fork: the default hook prints "thread … panicked at … <message>",
+/// then the signal-safe crash handler catches the abort and writes an
+/// annotated backtrace. So we do NOT silence the hook (unlike the
+/// upstream Windows path, which could unwind cleanly and recover).
 fn run_with_quiet_panic_hook<F, R>(body: F) -> R
 where
     F: FnOnce() -> R,
 {
-    if std::env::var_os("NEWBCPL_LOG_JIT_PANICS").is_some() {
-        return body();
-    }
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let result = body();
-    std::panic::set_hook(previous);
-    result
+    body()
 }
 
 /// Best-effort conversion of a `catch_unwind` payload to a human

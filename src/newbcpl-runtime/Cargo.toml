@@ -6,50 +6,13 @@ edition = "2024"
 [dependencies]
 serde_json = "1"
 
-# MacBCPL port note (2026-06-28): the original unconditional
-# `newaudio-core` / `newaudio-abc` deps are dropped here — those crates
-# live outside this repo and aren't part of the macOS port. `audio.rs`
-# is replaced with a self-contained no-op stub that preserves the
-# `Sound_*` / `Music_*` C-ABI symbol surface so `builtins.rs` still
-# registers them. Real sound on macOS can later come through the Cocoa
-# bridge (AVAudioEngine), as MacModula2 does.
+# MacBCPL is a macOS arm64 FORK — Windows compatibility is intentionally
+# dropped (no SEH, no Direct2D, no windows crate). POSIX `libc` backs the
+# signal-safe crash handler (crash.rs, ported from MacModula2), the
+# objc bridge's dlopen/dlsym, and BRK's backtrace.
+libc = "0.2"
 
-# MacBCPL port: the `bcpl-wingui` dependency (Direct2D/DirectWrite GUI,
-# itself depending on the external `wingui-rs`) is dropped — the macOS
-# port replaces the Windows GUI with a Cocoa one built on the
-# MacModula2 objc bridge. Its builtins were only ever registered under
-# `cfg(windows)`.
-
-[target.'cfg(windows)'.dependencies]
-windows-numerics = "0.3"
-
-[target.'cfg(windows)'.dependencies.windows]
-version = "0.62"
-features = [
-    "Win32_Foundation",
-    "Win32_Graphics_Direct2D",
-    "Win32_Graphics_Direct2D_Common",
-    "Win32_Graphics_Direct3D",
-    "Win32_Graphics_Direct3D11",
-    "Win32_Graphics_DirectWrite",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
-    "Win32_Graphics_Gdi",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Com",
-    "Win32_System_Console",
-    "Win32_System_DataExchange",
-    "Win32_System_Diagnostics_Debug",
-    "Win32_System_IO",
-    "Win32_System_Kernel",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Memory",
-    "Win32_System_Ole",
-    "Win32_System_Performance",
-    "Win32_System_Threading",
-    "Win32_UI_HiDpi",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_UI_Controls",
-    "Win32_UI_Controls_Dialogs",
-]
+# Dropped vs upstream NewBCPL: `newaudio-core`/`newaudio-abc` (external,
+# not part of the port — audio.rs is a no-op stub) and `bcpl-wingui` +
+# the `windows`/`windows-numerics` crates (Windows GUI / Win32; replaced
+# by the Cocoa bridge in objc.rs).

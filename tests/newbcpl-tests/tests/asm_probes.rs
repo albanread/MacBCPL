@@ -20,6 +20,7 @@ use newbcpl_tests::expect_stdout as expect;
 // ─── Integer ABI ──────────────────────────────────────────────────
 
 #[test]
+#[ignore = "inline x86 ASM is unsupported on the arm64 fork (new-asm is stubbed)"]
 fn function_returns_a_word() {
     // `= ASM` puts the body in a value-producing function. Two i64
     // params land in rcx (slot 0) and rdx (slot 1); the result must
@@ -32,6 +33,7 @@ fn function_returns_a_word() {
 }
 
 #[test]
+#[ignore = "inline x86 ASM is unsupported on the arm64 fork (new-asm is stubbed)"]
 fn routine_runs_without_returning() {
     // `BE ASM` puts the body in a no-result routine. Sema must
     // type it as Routine, not Function — the body never touches rax
@@ -44,6 +46,7 @@ fn routine_runs_without_returning() {
 }
 
 #[test]
+#[ignore = "inline x86 ASM is unsupported on the arm64 fork (new-asm is stubbed)"]
 fn five_params_use_the_shadow_space() {
     // Win64 puts the first four args in rcx/rdx/r8/r9 and spills
     // the rest above the 32-byte shadow home. Slot 4 lives at
@@ -59,6 +62,7 @@ fn five_params_use_the_shadow_space() {
 // ─── Float ABI ────────────────────────────────────────────────────
 
 #[test]
+#[ignore = "inline x86 ASM is unsupported on the arm64 fork (new-asm is stubbed)"]
 fn float_function_returns_a_double() {
     // `AS FLOAT` on each parameter routes them through XMM (slot 0
     // → xmm0, slot 1 → xmm1). The trailing `AS FLOAT` after the
@@ -75,6 +79,7 @@ fn float_function_returns_a_double() {
 // ─── Lexer corner cases ───────────────────────────────────────────
 
 #[test]
+#[ignore = "inline x86 ASM is unsupported on the arm64 fork (new-asm is stubbed)"]
 fn body_with_local_label_assembles_cleanly() {
     // Local labels in the body must survive `scan_asm_body` (the
     // brace counter walks tokens) and `build_module_asm_string`
@@ -87,6 +92,7 @@ fn body_with_local_label_assembles_cleanly() {
 }
 
 #[test]
+#[ignore = "inline x86 ASM is unsupported on the arm64 fork (new-asm is stubbed)"]
 fn hash_comment_inside_body_survives() {
     // A bare `#` followed by a non-digit used to be a lexer error
     // (the number-literal scanner expected a digit). The ASM

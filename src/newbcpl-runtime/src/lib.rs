@@ -25,6 +25,11 @@
 pub mod builtins;
 pub mod gc;
 
+/// Signal-safe crash handler (macOS arm64) + the JIT-symbol registry
+/// shared with `BRK`. Ported from MacModula2; replaces the upstream
+/// Windows SEH machinery (this is a fork — no Windows support).
+pub mod crash;
+
 #[cfg(windows)]
 pub mod igui;
 
