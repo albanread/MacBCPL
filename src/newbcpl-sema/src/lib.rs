@@ -64,6 +64,24 @@ fn cocoa_db() -> &'static CocoaDb {
 /// class); else an `id`/Object. Struct returns (geometry tags R/P/S/N or a
 /// `{…}` descriptor) are left as Object for now — Tier B/C will materialize
 /// them into vectors / wrapper objects.
+/// A struct-returning send's shape for Tier-B geometry tags only:
+/// `(field_count, is_float)`. R(NSRect)=4 doubles, P(NSPoint)/S(NSSize)=2
+/// doubles, N(NSRange)=2 words. Complex `{…}` descriptors return None here
+/// (they stay scalar/Object until the Tier-C wrapper-class path lands) — so
+/// only the ABI-exact all-f64 / all-64-bit-int shapes take the vector path.
+fn objc_geometry_struct(selector: &str) -> Option<(u32, bool)> {
+    match cocoa_db().ret_of(selector) {
+        Some("R") => Some((4, true)),
+        Some("P") | Some("S") => Some((2, true)),
+        Some("N") => Some((2, false)),
+        _ => None,
+    }
+}
+
+/// Synthesize a bracket-send's return `TypeHint` from (priority order): an
+/// explicit `AS Type`; the selector DB's return kind; a curated
+/// NSString-returning selector; else `id`/Object. Geometry struct returns
+/// (R/P/S→FVec, N→Vec) are materialized as vectors (see objc_geometry_struct).
 fn objc_message_ret_hint(selector: &str, ret_annotation: Option<&str>) -> TypeHint {
     if let Some(h) = ret_annotation.and_then(type_hint_from_annotation) {
         return h;
@@ -71,10 +89,12 @@ fn objc_message_ret_hint(selector: &str, ret_annotation: Option<&str>) -> TypeHi
     match cocoa_db().ret_of(selector) {
         Some("i") | Some("u") | Some("B") => TypeHint::Int,
         Some("d") => TypeHint::Float,
+        Some("R") | Some("P") | Some("S") => TypeHint::FVec,
+        Some("N") => TypeHint::Vec,
         Some("@") if objc_selector_returns_string(selector) => TypeHint::String,
         Some("@") => TypeHint::Object,
-        // void / SEL / struct / other, or absent from the DB: fall back to
-        // a String for curated string selectors, else an id/Object.
+        // void / SEL / complex struct / other, or absent from the DB: a
+        // String for curated string selectors, else an id/Object.
         _ if objc_selector_returns_string(selector) => TypeHint::String,
         _ => TypeHint::Object,
     }
@@ -700,6 +720,20 @@ impl Sema {
             ("TYPE_LIST", 4),
             ("TYPE_OBJECT", 5),
             ("TYPE_PAIR", 6),
+            // Field indices for geometry struct returns (Tier B). A
+            // struct send returns a vector; read fields by name, e.g.
+            // `LET r = [v bounds]; LET w = r .% NSRect_width`. Order
+            // matches the materialized element order (origin then size).
+            ("NSRect_x", 0),
+            ("NSRect_y", 1),
+            ("NSRect_width", 2),
+            ("NSRect_height", 3),
+            ("NSPoint_x", 0),
+            ("NSPoint_y", 1),
+            ("NSSize_width", 0),
+            ("NSSize_height", 1),
+            ("NSRange_location", 0),
+            ("NSRange_length", 1),
         ];
         for (name, value) in PRELUDE {
             self.manifests.insert((*name).to_string(), *value);
@@ -2078,6 +2112,7 @@ impl Sema {
                 args,
                 arg_annotations,
                 ret_annotation,
+                ret_struct,
                 span,
                 ..
             } => {
@@ -2115,9 +2150,16 @@ impl Sema {
                         );
                     }
                 }
+                // A geometry struct return (no `AS` override) is
+                // materialized as a vector — record its shape for codegen.
+                if ret_annotation.is_none() {
+                    ret_struct.set(objc_geometry_struct(selector));
+                } else {
+                    ret_struct.set(None);
+                }
                 // Return type synthesized from the selector DB (ints,
-                // floats, ids) refined by the curated string set, with an
-                // explicit `AS Type` overriding everything.
+                // floats, ids, geometry vectors) refined by the curated
+                // string set, with an explicit `AS Type` overriding everything.
                 objc_message_ret_hint(selector, ret_annotation.as_deref())
             }
         }

@@ -224,6 +224,11 @@ pub enum Instr {
         selector: String,
         args: Vec<Value>,
         arg_hints: Vec<TypeHint>,
+        /// A geometry struct return: `(field_count, is_float)`. When set,
+        /// codegen declares the real struct return type (HFA/int-pair, ABI
+        /// handled by the backend), extracts the fields, and materializes
+        /// them into an N-field FVEC (float) / VEC (word). `None` = scalar/id.
+        ret_struct: Option<(u32, bool)>,
         hint: TypeHint,
     },
     /// `!ptr` — load the value at an address. Used for both prefix

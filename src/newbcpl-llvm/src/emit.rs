@@ -1246,9 +1246,12 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                 selector,
                 args,
                 arg_hints,
+                ret_struct,
                 hint,
             } => {
-                self.emit_objc_raw_dispatch(*dst, receiver, selector, args, arg_hints, *hint);
+                self.emit_objc_raw_dispatch(
+                    *dst, receiver, selector, args, arg_hints, *ret_struct, *hint,
+                );
             }
         }
     }
@@ -1268,6 +1271,7 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         selector: &str,
         args: &[Value],
         arg_hints: &[TypeHint],
+        ret_struct: Option<(u32, bool)>,
         hint: TypeHint,
     ) {
         let ptr_t = self.context.ptr_type(AddressSpace::default());
@@ -1312,6 +1316,48 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                 param_types.push(i64_t.into());
                 call_args.push(self.as_int_word(v).into());
             }
+        }
+
+        // Geometry struct return (Tier B): declare the real struct return
+        // type so the arm64 backend applies the AAPCS64 struct-return ABI
+        // automatically (HFA all-float in v0..v3, integer pair in x0/x1,
+        // >16B via the hidden sret x8 pointer — no explicit attribute), then
+        // extract the fields and materialize an N-element FVEC (float) / VEC
+        // (word) laid out like emit_vec_construct (length word at buf+0,
+        // data at buf+8) so `r .% k` / `r ! k` read the fields.
+        if let Some((n, is_float)) = ret_struct {
+            use inkwell::values::ValueKind;
+            let n = n as usize;
+            let elem: inkwell::types::BasicTypeEnum =
+                if is_float { f64_t.into() } else { i64_t.into() };
+            let field_types = vec![elem; n];
+            let struct_ty = self.context.struct_type(&field_types, false);
+            let fn_type = struct_ty.fn_type(&param_types, false);
+            let call_site = self
+                .builder
+                .build_indirect_call(fn_type, fnptr, &call_args, "objc_send_struct")
+                .expect("raw objc_msgSend struct return");
+            let Some(d) = dst else { return };
+            let struct_val = match call_site.try_as_basic_value() {
+                ValueKind::Basic(rv) => rv.into_struct_value(),
+                ValueKind::Instruction(_) => {
+                    let z = self.zero(TypeHint::Vec);
+                    self.value_map.insert(d, z);
+                    return;
+                }
+            };
+            let buf = self.alloc_rec_bytes(((n + 1) * 8) as u64, AllocTarget::Heap);
+            self.store_word_at_offset(buf, 0, i64_t.const_int(n as u64, false).into());
+            for i in 0..n {
+                let fld = self
+                    .builder
+                    .build_extract_value(struct_val, i as u32, "fld")
+                    .expect("extract struct field");
+                self.store_word_at_offset(buf, ((i + 1) * 8) as u64, fld);
+            }
+            let data = self.byte_offset_ptr(buf, 8, "structvec.data");
+            self.value_map.insert(d, data.into());
+            return;
         }
 
         let return_type = self.return_type_for(hint);

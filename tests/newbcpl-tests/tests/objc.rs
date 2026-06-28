@@ -81,6 +81,31 @@ fn multi_keyword_send() {
     );
 }
 
+// ─── Tier B: struct returns materialized as vectors ─────────────────
+
+/// NSRange return (DB tag N) -> a 2-word VEC via the arm64 integer-pair
+/// (x0/x1) ABI. Field names resolve via seeded manifests. Exact values.
+#[test]
+fn struct_return_nsrange_to_vec() {
+    expect(
+        "objc_nsrange",
+        "LET START() BE $(\n  LET r = [\"hello world\" rangeOfString: \"world\"]\n  WRITEN(r ! NSRange_location)\n  WRITEN(r ! NSRange_length)\n$)\n",
+        "65",
+    );
+}
+
+/// NSRect return (DB tag R, 32B) -> a 4-double FVEC via the hidden sret
+/// (x8) ABI. A zero-initialised NSView has a zero frame -> deterministic.
+/// Reads the float fields via the `.%` float subscript + seeded manifests.
+#[test]
+fn struct_return_nsrect_to_fvec() {
+    expect(
+        "objc_nsrect",
+        "LET START() BE $(\n  LET v = [[NSView alloc] init]\n  LET fr = [v frame]\n  FWRITE(fr .% NSRect_x)\n  FWRITE(fr .% NSRect_y)\n  FWRITE(fr .% NSRect_width)\n  FWRITE(fr .% NSRect_height)\n$)\n",
+        "0000",
+    );
+}
+
 // ─── Implementation-review regression probes ────────────────────────
 
 /// REVIEW #1: `%` / LEN on a bracket-send NSString result must not deref

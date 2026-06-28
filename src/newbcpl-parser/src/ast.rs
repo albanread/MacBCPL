@@ -581,6 +581,10 @@ pub enum Expr {
         /// `double` selector param via `... numberWithDouble: 7 AS FLOAT`.
         arg_annotations: Vec<Option<String>>,
         ret_annotation: Option<String>,
+        /// Set by sema for a struct-returning send (Tier B geometry):
+        /// `(field_count, is_float)` — the result is materialized as an
+        /// N-field FVEC (float) or VEC (word). `None` for scalar/id returns.
+        ret_struct: Cell<Option<(u32, bool)>>,
         span: Span,
         hint: Cell<TypeHint>,
     },
