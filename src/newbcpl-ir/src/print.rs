@@ -387,5 +387,6 @@ fn render_const(c: &Const) -> String {
         Const::Bool(b) => format!("{b}"),
         Const::Null => "?".to_string(),
         Const::String(s) => s.clone(),
+        Const::CStr(s) => format!("c{s:?}"),
     }
 }

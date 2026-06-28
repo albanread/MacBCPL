@@ -1130,9 +1130,15 @@ impl Sema {
                 }
             }
             self.declare(name, hint, class_name, l.span);
-            // Record direct `LET o = NEW C()` bindings as owning a +1
-            // object, so a later reassignment can be flagged as a leak.
-            if matches!(expr, Expr::New { .. }) {
+            // Record bindings that own a +1 heap value, so a later
+            // reassignment can be flagged as a leak (the "always USING"
+            // rule). True for `LET o = NEW C()` (a +1 Obj-C object) and
+            // for an owned-String producer — a String-typed function call
+            // such as `LET s = JOIN(...)` (a +1 NSString id). String
+            // literals (not a Call) and bare copies stay non-owning.
+            let owns_alloc = matches!(expr, Expr::New { .. })
+                || (matches!(hint, TypeHint::String) && matches!(expr, Expr::Call { .. }));
+            if owns_alloc {
                 if let Some(top) = self.scopes.last_mut() {
                     if let Some(b) = top.get_mut(name) {
                         b.owns_new = true;
@@ -1612,6 +1618,27 @@ impl Sema {
                     );
                 }
             }
+            // A BCPL String is now an immutable NSString object, so the
+            // old in-place byte poke `s % i := c` is no longer meaningful
+            // (and was UB on read-only literal bytes before). Reject it
+            // with a clear migration hint. Byte buffers (`%` on a VEC)
+            // are unaffected.
+            if let Expr::Binary {
+                op: BinaryOp::CharSubscript,
+                lhs,
+                span,
+                ..
+            } = t
+            {
+                if self.type_of(lhs) == TypeHint::String {
+                    self.error(
+                        "cannot assign to `s % i` on a String — NSStrings are \
+                         immutable; build a new string, or use a byte VEC for \
+                         mutable character storage",
+                        *span,
+                    );
+                }
+            }
             // Back-fill the receiver class's field-class identity for
             // assignments of the shape `SELF.field := <class-typed-expr>`.
             // Field types are declared as bag-of-bits Word; their class
@@ -1785,8 +1812,12 @@ impl Sema {
                         | "__newbcpl_len" | "__newbcpl_list_len" | "RDCH" => {
                             return TypeHint::Int;
                         }
-                        // String-returning queries.
-                        "TYPE" | "TYPEOF" => return TypeHint::String,
+                        // String-returning queries. JOIN now returns an
+                        // owned NSString id (a BCPL `String`), so its
+                        // result must be String-typed — this drives the
+                        // owned-string scope tracking in the lowerer and
+                        // `%`/LEN dispatch on the result.
+                        "TYPE" | "TYPEOF" | "JOIN" => return TypeHint::String,
                         // List-returning builtins. `HD` is omitted
                         // — it returns a single atom's value
                         // (typically Word), not a list.
@@ -2722,6 +2753,46 @@ mod tests {
         assert!(
             out.warnings.iter().any(|w| w.message.contains("leaks the object it owns")),
             "expected a leak warning on reassigning an owned binding; got {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn reassigning_owned_string_warns() {
+        // `LET s = JOIN(...)` owns a +1 NSString — reassigning it without
+        // USING leaks, same as a NEW object (the "always USING" rule).
+        let out = analyze_str(
+            "LET START() BE $( LET s = JOIN(LIST(\"a\"), \"\")\n s := JOIN(LIST(\"b\"), \"\") $)\n",
+        );
+        assert!(
+            out.warnings.iter().any(|w| w.message.contains("leaks the object it owns")),
+            "expected a leak warning on reassigning an owned string; got {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn string_byte_poke_is_rejected() {
+        // A String is an immutable NSString — `s % i := c` must be a hard
+        // error directing the user to a byte VEC.
+        let out = analyze_str("LET START() BE $( LET s = \"abc\"\n s % 0 := 88 $)\n");
+        assert!(
+            out.errors.iter().any(|e| e.message.contains("NSStrings are")),
+            "expected an immutable-string error on `s % i := c`; got {:?}",
+            out.errors
+        );
+    }
+
+    #[test]
+    fn string_literal_init_does_not_warn_on_reassign() {
+        // A literal-initialised binding is NOT owned (immortal), so
+        // reassigning it must not warn.
+        let out = analyze_str(
+            "LET START() BE $( LET s = \"a\"\n s := \"b\" $)\n",
+        );
+        assert!(
+            !out.warnings.iter().any(|w| w.message.contains("leaks the object it owns")),
+            "did not expect a leak warning for a literal-init binding; got {:?}",
             out.warnings
         );
     }

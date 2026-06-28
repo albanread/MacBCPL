@@ -403,9 +403,15 @@ pub enum Const {
     Bool(bool),
     Null,
     /// Raw lexeme including surrounding quotes and unprocessed
-    /// `*`-escape sequences. Codegen cooks the escapes when
-    /// emitting the string-table entry.
+    /// `*`-escape sequences. Codegen cooks the escapes and materialises
+    /// an **immortal NSString `id`** (a BCPL `String` value is a Cocoa
+    /// object, not a C byte pointer).
     String(String),
+    /// A raw cooked C string (`i8*` into read-only data), NOT an
+    /// NSString. The ONE sanctioned C-string carve-out — used for
+    /// compiler-generated routine names handed to `__newbcpl_brk`, which
+    /// must stay a `*const u8`. Never a user-visible `String` value.
+    CStr(String),
 }
 
 /// IR binary operations. The op variant encodes integer-vs-float

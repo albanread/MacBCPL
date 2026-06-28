@@ -22,7 +22,9 @@ use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::{Linkage, Module as LlvmModule};
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum};
-use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue};
+use inkwell::values::{
+    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, GlobalValue, PointerValue,
+};
 
 use newbcpl_ir::{
     AllocTarget, BasicBlock as IrBlock, BlockId, Const, Function as IrFunction, Instr, IrBinOp,
@@ -110,8 +112,15 @@ struct Emitter<'ctx, 'l> {
     /// first encounter.
     by_name: HashMap<String, FunctionValue<'ctx>>,
     /// String literal pool — coalesces duplicate literals so each
-    /// distinct string emits one global.
+    /// distinct string emits one `.str.N` UTF-8 SEED global (used as the
+    /// initialiser for an NSString and for the `Const::CStr` i8* seam).
     string_pool: HashMap<String, PointerValue<'ctx>>,
+    /// Immortal-NSString cache slots — one private `@.nsstr.N : ptr =
+    /// null` per distinct cooked literal, lazily filled at first use with
+    /// the `+1` NSString id and held forever (the unbalanced +1 IS the
+    /// immortality, like an Obj-C `@"..."` constant). Dedup'd by cooked
+    /// content, parallel to `string_pool`.
+    nsstr_pool: HashMap<String, GlobalValue<'ctx>>,
     /// Counter for anonymous string globals.
     string_counter: u32,
     /// Type hint each Alloca'd slot was created with. Used by
@@ -133,6 +142,7 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             block_map: HashMap::new(),
             by_name: HashMap::new(),
             string_pool: HashMap::new(),
+            nsstr_pool: HashMap::new(),
             string_counter: 0,
             slot_hint: HashMap::new(),
         }
@@ -529,8 +539,16 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         let f64_t = self.context.f64_type();
         let ptr_t = self.context.ptr_type(AddressSpace::default());
         let fn_type = match name {
-            // String-arg builtin: WRITES takes a single ptr.
+            // String-arg builtin: WRITES takes a single ptr (an NSString
+            // id; id IS a ptr at the ABI).
             "WRITES" => i64_t.fn_type(&[ptr_t.into()], false),
+            // NSString string runtime — a BCPL `String` value is an
+            // Obj-C `id` (= ptr). Immortal/owned builder, byte access,
+            // length, and the evict-then-release wrapper.
+            "bcpl_objc_nsstring_immortal" => ptr_t.fn_type(&[ptr_t.into()], false),
+            "bcpl_str_char" => i64_t.fn_type(&[ptr_t.into(), i64_t.into()], false),
+            "bcpl_str_len" => i64_t.fn_type(&[ptr_t.into()], false),
+            "bcpl_str_release" => i64_t.fn_type(&[ptr_t.into()], false),
             // The WRITEF family is fixed-arity per arity-suffix:
             // WRITEF takes only the format; WRITEF1..WRITEF7 take
             // the format plus N additional `i64` payload words.
@@ -2297,12 +2315,86 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                 self.zero(hint)
             }
             Const::String(raw) => {
-                // The lexeme arrives wrapped in quotes; codegen pool
-                // stores the cooked bytes.
+                // A BCPL `String` value is an immortal NSString id, not a
+                // C byte pointer. The lexeme arrives wrapped in quotes;
+                // cook it to the UTF-8 seed, then materialise (once,
+                // cached) the immortal NSString. Self-routes regardless of
+                // the incoming `hint` (Const::String ALWAYS means String).
                 let cooked = cook_bcpl_string(raw);
-                self.intern_string(&cooked).into()
+                self.materialize_immortal_string(&cooked).into()
+            }
+            Const::CStr(raw) => {
+                // The C-string carve-out (BRK routine names): a raw i8*
+                // into read-only data, NOT an NSString. Not cooked — the
+                // bytes are a plain compiler-generated name.
+                self.intern_string(raw).into()
             }
         }
+    }
+
+    /// Materialise an **immortal NSString id** for a cooked string
+    /// literal. Two-level interning: the `.str.N` UTF-8 seed (shared via
+    /// `string_pool`) plus a private `@.nsstr.N : ptr = null` cache slot
+    /// (shared via `nsstr_pool`). At the use site we emit a lazy
+    /// load / null-check / create / store so identical literals across
+    /// the module share ONE immortal NSString, created on first use and
+    /// retained forever (the unbalanced +1 is the immortality). The JIT
+    /// is single-threaded, so the load/store needs no atomics.
+    fn materialize_immortal_string(&mut self, cooked: &str) -> PointerValue<'ctx> {
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let seed = self.intern_string(cooked);
+        let cache = if let Some(&g) = self.nsstr_pool.get(cooked) {
+            g
+        } else {
+            let name = format!(".nsstr.{}", self.string_counter);
+            self.string_counter += 1;
+            let g = self.module.add_global(ptr_t, None, &name);
+            g.set_initializer(&ptr_t.const_null());
+            g.set_linkage(Linkage::Private);
+            self.nsstr_pool.insert(cooked.to_string(), g);
+            g
+        };
+        let cache_ptr = cache.as_pointer_value();
+        let cur_fn = self
+            .builder
+            .get_insert_block()
+            .and_then(|b| b.get_parent())
+            .expect("string literal lowered outside a function");
+        let create_bb = self.context.append_basic_block(cur_fn, "nsstr.create");
+        let cont_bb = self.context.append_basic_block(cur_fn, "nsstr.cont");
+        // cached = load @.nsstr.N
+        let cached0 = self
+            .builder
+            .build_load(ptr_t, cache_ptr, "nsstr.cached")
+            .expect("load nsstr cache")
+            .into_pointer_value();
+        let is_null = self
+            .builder
+            .build_is_null(cached0, "nsstr.isnull")
+            .expect("is_null");
+        self.builder
+            .build_conditional_branch(is_null, create_bb, cont_bb)
+            .expect("cond br");
+        // create: id = bcpl_objc_nsstring_immortal(seed); store it.
+        self.builder.position_at_end(create_bb);
+        let builder_fn = self.declare_extern("bcpl_objc_nsstring_immortal", 1);
+        let call = self
+            .builder
+            .build_call(builder_fn, &[seed.into()], "nsstr.make")
+            .expect("call nsstring_immortal");
+        let made = self.call_result_ptr(call, "bcpl_objc_nsstring_immortal");
+        self.builder
+            .build_store(cache_ptr, made)
+            .expect("store nsstr cache");
+        self.builder
+            .build_unconditional_branch(cont_bb)
+            .expect("br cont");
+        // cont: reload the (now non-null) cached id and yield it.
+        self.builder.position_at_end(cont_bb);
+        self.builder
+            .build_load(ptr_t, cache_ptr, "nsstr")
+            .expect("reload nsstr")
+            .into_pointer_value()
     }
 
     /// Coerce a value to a pointer for use as the base of a load /

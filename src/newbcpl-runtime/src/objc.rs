@@ -186,6 +186,141 @@ pub unsafe extern "C-unwind" fn bcpl_objc_nsstring_to_utf8(
     n as u64
 }
 
+/// Build an **owned (+1)** `NSString*` from a BCPL UTF-8 string via
+/// `[[NSString alloc] initWithUTF8String:]`. Unlike `bcpl_objc_nsstring`
+/// (which uses the `+0`/autoreleased `stringWithUTF8String:` and would
+/// dangle in this pool-less JIT process), the result is retain-count +1
+/// and pool-independent. This single builder serves BOTH immortal string
+/// literals (codegen caches the +1 forever in a `@.nsstr.N` slot) AND
+/// owned operation results (JOIN etc. transfer the +1 to the caller, who
+/// releases it via `bcpl_str_release`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_objc_nsstring_immortal(text: *const u8) -> *mut c_void {
+    bootstrap();
+    let Some(c) = (unsafe { cstr(text) }) else {
+        return std::ptr::null_mut();
+    };
+    let get_class = sym_or_null("objc_getClass");
+    let reg_sel = sym_or_null("sel_registerName");
+    let msg_send = sym_or_null("objc_msgSend");
+    if get_class.is_null() || reg_sel.is_null() || msg_send.is_null() {
+        return std::ptr::null_mut();
+    }
+    let get_class: extern "C" fn(*const i8) -> *mut c_void = unsafe { std::mem::transmute(get_class) };
+    let reg_sel: extern "C" fn(*const i8) -> *mut c_void = unsafe { std::mem::transmute(reg_sel) };
+    let send0: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+        unsafe { std::mem::transmute(msg_send) };
+    let send1: extern "C" fn(*mut c_void, *mut c_void, *const i8) -> *mut c_void =
+        unsafe { std::mem::transmute(msg_send) };
+    let cls = get_class(c"NSString".as_ptr());
+    if cls.is_null() {
+        return std::ptr::null_mut();
+    }
+    let obj = send0(cls, reg_sel(c"alloc".as_ptr()));
+    if obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    send1(obj, reg_sel(c"initWithUTF8String:".as_ptr()), c.as_ptr())
+}
+
+// ─── NSString byte access (`s % i`, LEN, WRITES) ────────────────────
+//
+// A BCPL `String` value is an NSString `id`. Byte-level access (`s % i`,
+// `LEN s`) and the WRITES/WRITEF text sinks go through `-UTF8String`,
+// which returns a buffer of undefined lifetime under a (here, absent)
+// autorelease pool — so we COPY the bytes synchronously into runtime
+// memory while the source string is provably alive (the caller holds it
+// for the duration of the call). No raw `-UTF8String` pointer ever
+// leaves a single runtime call frame, so nothing can dangle.
+
+/// Copy an `NSString*`'s UTF-8 bytes into an owned `Vec`. Synchronous;
+/// the source must be live for the call. `None` on nil / failure.
+pub(crate) unsafe fn nsstring_utf8_bytes(nsstr: *mut c_void) -> Option<Vec<u8>> {
+    if nsstr.is_null() {
+        return None;
+    }
+    let msg = sym_or_null("objc_msgSend");
+    let reg = sym_or_null("sel_registerName");
+    if msg.is_null() || reg.is_null() {
+        return None;
+    }
+    let reg: extern "C" fn(*const i8) -> *mut c_void = unsafe { std::mem::transmute(reg) };
+    let send: extern "C" fn(*mut c_void, *mut c_void) -> *const i8 = unsafe { std::mem::transmute(msg) };
+    let utf8 = send(nsstr, reg(c"UTF8String".as_ptr()));
+    if utf8.is_null() {
+        return None;
+    }
+    Some(unsafe { CStr::from_ptr(utf8) }.to_bytes().to_vec())
+}
+
+thread_local! {
+    // One-entry UTF-8 memo so `FOR i ... s % i` is O(n) per string, not
+    // O(n^2) of selector dispatches. Keyed by the id value. Tagged-pointer
+    // NSStrings encode their content in the pointer bits, so identical
+    // keys ALWAYS mean identical content (no bleed). Heap NSStrings can be
+    // reissued at a freed address — `bcpl_str_release` evicts this memo on
+    // every owned-string release so a reused address never serves stale
+    // bytes.
+    static STR_MEMO: std::cell::RefCell<(usize, Vec<u8>)> =
+        const { std::cell::RefCell::new((0usize, Vec::new())) };
+}
+
+#[inline]
+fn str_memo_with<R>(nsstr: *mut c_void, f: impl FnOnce(&[u8]) -> R, dflt: R) -> R {
+    if nsstr.is_null() {
+        return dflt;
+    }
+    let key = nsstr as usize;
+    STR_MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.0 != key {
+            match unsafe { nsstring_utf8_bytes(nsstr) } {
+                Some(b) => *m = (key, b),
+                None => return dflt,
+            }
+        }
+        f(&m.1)
+    })
+}
+
+/// `LEN(s)` for a String: the UTF-8 **byte** count (so the index domain
+/// agrees with `s % i`). nil => 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_str_len(nsstr: *mut c_void) -> i64 {
+    str_memo_with(nsstr, |b| b.len() as i64, 0)
+}
+
+/// `s % i` for a String: the i-th UTF-8 byte, zero-extended (0..255).
+/// Returns 0 for nil / out-of-range / negative index (BCPL's tolerant
+/// byte-read convention).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_str_char(nsstr: *mut c_void, idx: i64) -> i64 {
+    if idx < 0 {
+        return 0;
+    }
+    let i = idx as usize;
+    str_memo_with(nsstr, |b| b.get(i).map(|&c| c as i64).unwrap_or(0), 0)
+}
+
+/// Release an owned String: EVICT the UTF-8 memo for this id first (so a
+/// later string reissued at the same address can't read stale bytes),
+/// then send `release`. Used by the owned-string epilogue / USING / strong
+/// store paths. Safe (and harmless) on any object id.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_str_release(obj: *mut c_void) {
+    if obj.is_null() {
+        return;
+    }
+    let key = obj as usize;
+    STR_MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.0 == key {
+            *m = (0usize, Vec::new());
+        }
+    });
+    unsafe { bcpl_objc_release(obj) };
+}
+
 // ─── object lifecycle ───────────────────────────────────────────────
 
 /// `[[Class alloc] init]` — allocate and initialise an instance of a
@@ -709,6 +844,13 @@ pub fn builtin_addresses() -> Vec<(&'static str, usize)> {
             "bcpl_objc_nsstring_to_utf8",
             bcpl_objc_nsstring_to_utf8 as *const () as usize,
         ),
+        (
+            "bcpl_objc_nsstring_immortal",
+            bcpl_objc_nsstring_immortal as *const () as usize,
+        ),
+        ("bcpl_str_len", bcpl_str_len as *const () as usize),
+        ("bcpl_str_char", bcpl_str_char as *const () as usize),
+        ("bcpl_str_release", bcpl_str_release as *const () as usize),
         ("bcpl_objc_new", bcpl_objc_new as *const () as usize),
         ("bcpl_objc_alloc_init", bcpl_objc_alloc_init as *const () as usize),
         ("bcpl_objc_release", bcpl_objc_release as *const () as usize),

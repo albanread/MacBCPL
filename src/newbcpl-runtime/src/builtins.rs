@@ -49,17 +49,19 @@ where
 
 // ─── primitive I/O ────────────────────────────────────────────────
 
-/// `WRITES("foo*N")` — print a null-terminated UTF-8 string. The
-/// string lives in the LLVM module's read-only data segment; sema
-/// already cooked the BCPL `*N` / `*T` etc. escapes when emitting
-/// the global.
+/// `WRITES(s)` — print a BCPL `String`, which is now an NSString `id`
+/// (a Cocoa object), not a C byte pointer. Extract its UTF-8 bytes
+/// synchronously (the caller holds the string for the call, so the
+/// copy can't dangle) and write them. nil => no output. The `*N`/`*T`
+/// escapes were cooked into the literal's bytes at compile time.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn WRITES(s: *const u8) -> i64 {
     if s.is_null() {
         return 0;
     }
-    let cstr = unsafe { CStr::from_ptr(s as *const i8) };
-    write_bytes(cstr.to_bytes());
+    if let Some(bytes) = unsafe { crate::objc::nsstring_utf8_bytes(s as *mut core::ffi::c_void) } {
+        write_bytes(&bytes);
+    }
     0
 }
 
@@ -291,41 +293,41 @@ pub unsafe extern "C-unwind" fn SUM(v1: *const i64, v2: *const i64) -> *mut i64 
     out
 }
 
-/// `JOIN(list, separator)` — render each atom of `list` as text and
-/// concatenate with `separator` between adjacent atoms. Returns a
-/// fresh null-terminated UTF-8 buffer on the GC heap. Null inputs
-/// return null; an empty list returns an empty string ("").
+/// `JOIN(list, separator)` — join a cons list of BCPL `String`s (each
+/// `hd` is an NSString `id`) with `separator` (also a String id) between
+/// adjacent elements. Returns a fresh **owned (+1)** NSString id; the
+/// caller releases it via the owned-string scope machinery. nil list =>
+/// nil; an empty list yields an empty string. (Cons cells are untyped
+/// words, so JOIN now assumes the elements are string ids — joining a
+/// list of non-strings is no longer supported.)
 pub unsafe extern "C-unwind" fn JOIN(list: i64, separator: *const u8) -> *const u8 {
     if list == 0 {
         return std::ptr::null();
     }
-    let sep_str = unsafe { cstr_to_str(separator) };
-    let mut out = String::new();
+    let sep =
+        unsafe { crate::objc::nsstring_utf8_bytes(separator as *mut core::ffi::c_void) }
+            .unwrap_or_default();
+    let mut out: Vec<u8> = Vec::new();
     let mut cur = list as *const ConsCell;
     let mut first = true;
-    // Cons cells are untyped words; JOIN renders each hd as a string
-    // pointer (the classic "join a list of strings" use).
     while !cur.is_null() {
         if !first {
-            out.push_str(sep_str);
+            out.extend_from_slice(&sep);
         }
         first = false;
         let hd = unsafe { (*cur).hd };
         if hd != 0 {
-            out.push_str(unsafe { cstr_to_str(hd as *const u8) });
+            if let Some(b) =
+                unsafe { crate::objc::nsstring_utf8_bytes(hd as *mut core::ffi::c_void) }
+            {
+                out.extend_from_slice(&b);
+            }
         }
         cur = unsafe { (*cur).tl } as *const ConsCell;
     }
-    // Materialise into a GC-managed byte vector so the result has a
-    // process-stable address and gets cleaned up by the collector.
-    let bytes = out.into_bytes();
-    let total_bytes = bytes.len() + 1;
-    let buf = unsafe { __newbcpl_alloc_rec(total_bytes as i64) } as *mut u8;
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
-        *buf.add(bytes.len()) = 0;
-    }
-    buf as *const u8
+    // NUL-terminate for initWithUTF8String: and return an owned +1 id.
+    out.push(0);
+    unsafe { crate::objc::bcpl_objc_nsstring_immortal(out.as_ptr()) as *const u8 }
 }
 
 /// Read a null-terminated UTF-8 string off a raw pointer. Treats
@@ -461,8 +463,11 @@ fn writef_impl(format: *const u8, args: &[i64]) {
         write_bytes(b"(null format)");
         return;
     }
-    let cstr = unsafe { CStr::from_ptr(format as *const i8) };
-    let bytes = cstr.to_bytes();
+    // The format is now an NSString `id`; extract its UTF-8 once.
+    let fmt_owned =
+        unsafe { crate::objc::nsstring_utf8_bytes(format as *mut core::ffi::c_void) }
+            .unwrap_or_default();
+    let bytes: &[u8] = &fmt_owned;
     // Build into an in-memory buffer so the whole formatted line
     // reaches `write_bytes` as one chunk — that's important for the
     // GUI callback's line-buffer flush logic, and harmless for the
@@ -503,11 +508,12 @@ fn writef_impl(format: *const u8, args: &[i64]) {
                     out.push((a & 0xff) as u8);
                 }
                 b's' => {
-                    if a == 0 {
-                        out.extend_from_slice(b"(null)");
-                    } else {
-                        let s = unsafe { CStr::from_ptr(a as *const i8) };
-                        out.extend_from_slice(s.to_bytes());
+                    // `%s` arg is an NSString id (a BCPL String).
+                    match unsafe {
+                        crate::objc::nsstring_utf8_bytes(a as *mut core::ffi::c_void)
+                    } {
+                        Some(b) => out.extend_from_slice(&b),
+                        None => out.extend_from_slice(b"(null)"),
                     }
                 }
                 b'f' | b'F' => {

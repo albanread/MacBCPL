@@ -699,9 +699,14 @@ impl<'a> Lowerer<'a> {
                 slot,
                 hint: TypeHint::Object,
             });
+            // `bcpl_str_release` = evict the UTF-8 byte memo for this id
+            // (so an address reissued later can't serve stale bytes) THEN
+            // send `release`. Safe + correct for plain objects too (the
+            // evict is a no-op when the id isn't memoised), so the owned
+            // epilogue uses it uniformly for objects and strings.
             self.b().emit(Instr::Call {
                 dst: None,
-                callee: Value::Function("bcpl_objc_release".to_string()),
+                callee: Value::Function("bcpl_str_release".to_string()),
                 args: vec![Value::Local(obj)],
                 hint: TypeHint::Word,
             });
@@ -971,7 +976,10 @@ impl<'a> Lowerer<'a> {
                 // handler returns we drop back into the regular
                 // flow — BRK is a snapshot, not a halt.
                 let routine_name = self.b().function.name.clone();
-                let name_value = Value::Const(Const::String(routine_name));
+                // C-string carve-out: `__newbcpl_brk` takes a *const u8,
+                // not an NSString id — use Const::CStr so the routine
+                // name keeps the raw i8* path.
+                let name_value = Value::Const(Const::CStr(routine_name));
                 let line_value =
                     Value::Const(Const::Int(span.start.line as i64));
                 self.b().emit(Instr::Call {
@@ -1093,8 +1101,9 @@ impl<'a> Lowerer<'a> {
             }
         }
 
-        // 2. Free the object's memory (objc release). Always — that is
-        //    what USING promises.
+        // 2. Free the object's memory (objc release, via the string-aware
+        //    wrapper so an owned NSString's UTF-8 memo is evicted too).
+        //    Always — that is what USING promises.
         let obj = self.b().alloc_value();
         self.b().emit(Instr::Load {
             dst: obj,
@@ -1103,7 +1112,7 @@ impl<'a> Lowerer<'a> {
         });
         self.b().emit(Instr::Call {
             dst: None,
-            callee: Value::Function("bcpl_objc_release".to_string()),
+            callee: Value::Function("bcpl_str_release".to_string()),
             args: vec![Value::Local(obj)],
             hint: TypeHint::Word,
         });
@@ -1894,12 +1903,14 @@ impl<'a> Lowerer<'a> {
             self.b().declare_local(name, slot, class_name);
 
             // Cocoa-object scope lifetime: a direct `LET o = NEW C()`
-            // creates a +1-owned Obj-C object. If the binding is
+            // creates a +1-owned Obj-C object; an owned-String producer
+            // (`LET s = JOIN(...)` or a String-returning function call)
+            // likewise returns a +1 NSString id. If the binding is
             // scope-local (doesn't escape), release it at the function
-            // epilogue — the object analogue of arena reclamation. We
-            // only track direct NEW (known +1); objects returned from
-            // calls have unknown ownership and are left alone.
-            if matches!(init, Expr::New { .. }) && !self.escaping_locals.contains(name) {
+            // epilogue — the object analogue of arena reclamation.
+            // EXCLUDED: string literals (immortal, never released) and
+            // bare-Ident copies `LET t = s` (a borrow, no +1 created).
+            if is_owned_alloc_producer(init) && !self.escaping_locals.contains(name) {
                 self.function_owned_objects.push(slot);
             }
         }
@@ -1911,7 +1922,46 @@ impl<'a> Lowerer<'a> {
             match target {
                 Expr::Ident { name, .. } => {
                     if let Some(slot) = self.b().lookup_local_slot(name) {
-                        self.b().emit(Instr::Store { slot, value: v });
+                        if self.function_owned_objects.contains(&slot) {
+                            // STRONG STORE into an owned (+1) slot. ARC-style
+                            // setter order — retain the new value FIRST, then
+                            // release the old, so it is safe even for a
+                            // degenerate `s := s` and for aliasing another
+                            // owned binding. A borrowed/immortal RHS (literal
+                            // or bare Ident copy) is retained so the slot
+                            // always owns exactly one reference; an owned
+                            // producer (NEW / String-returning call) is
+                            // already +1 and stored directly. This is the fix
+                            // for over-releasing an immortal on reassignment
+                            // AND for the per-iteration owned-string loop leak.
+                            let stored = if is_owned_alloc_producer(value) {
+                                v
+                            } else {
+                                let r = self.b().alloc_value();
+                                self.b().emit(Instr::Call {
+                                    dst: Some(r),
+                                    callee: Value::Function("bcpl_objc_retain".to_string()),
+                                    args: vec![v],
+                                    hint: TypeHint::Object,
+                                });
+                                Value::Local(r)
+                            };
+                            let old = self.b().alloc_value();
+                            self.b().emit(Instr::Load {
+                                dst: old,
+                                slot,
+                                hint: TypeHint::Object,
+                            });
+                            self.b().emit(Instr::Call {
+                                dst: None,
+                                callee: Value::Function("bcpl_str_release".to_string()),
+                                args: vec![Value::Local(old)],
+                                hint: TypeHint::Word,
+                            });
+                            self.b().emit(Instr::Store { slot, value: stored });
+                        } else {
+                            self.b().emit(Instr::Store { slot, value: v });
+                        }
                     } else if self.globals.contains_key(name) {
                         // GLOBAL binding: store to the module-level
                         // slot via `@<name>`. The symbol must already
@@ -2674,6 +2724,24 @@ impl<'a> Lowerer<'a> {
             });
             return Value::Local(dst);
         }
+        // `s % i` on a STRING (an NSString id) can't be a raw byte load
+        // — the base is an object pointer, not a byte buffer. Dispatch on
+        // the static hint (parallel to LEN's list/vec fork): a String
+        // base lowers to a runtime char-fetch returning the i-th UTF-8
+        // byte; a vector/byte-buffer base falls through to the fast inline
+        // byte load below, unchanged (FIXED DECISION A).
+        if matches!(op, BinaryOp::CharSubscript) && matches!(lhs.hint(), TypeHint::String) {
+            let s = self.lower_expr(lhs);
+            let idx = self.lower_expr(rhs);
+            let dst = self.b().alloc_value();
+            self.b().emit(Instr::Call {
+                dst: Some(dst),
+                callee: Value::Function("bcpl_str_char".to_string()),
+                args: vec![s, idx],
+                hint: TypeHint::Int,
+            });
+            return Value::Local(dst);
+        }
         // Subscript family: `v ! i` / `v % i` / `v .% i` lower to
         // GEP + IndirectLoad. The element stride drives both the
         // address calculation and the load width — stride 1 means
@@ -2791,14 +2859,18 @@ impl<'a> Lowerer<'a> {
         // calls. The runtime helper names line up with NewCP's
         // convention so the GC and ABI shapes match.
         if let Some(default_name) = unary_runtime_helper(op) {
-            // `LEN` differs by operand shape: a VEC carries its length
-            // one word *before* the data pointer (`__newbcpl_len`); a
-            // cons list has no length word, so it is counted by an O(n)
+            // `LEN` differs by operand shape: a STRING (NSString id) has
+            // no length word — its length is the UTF-8 byte count via
+            // `bcpl_str_len` (so the index domain matches `s % i`); a VEC
+            // carries its length one word *before* the data pointer
+            // (`__newbcpl_len`); a cons list has none, counted by an O(n)
             // walk (`__newbcpl_cons_len`).
-            let runtime_name = if matches!(op, UnaryOp::Len)
-                && matches!(operand.hint(), TypeHint::List)
-            {
-                "__newbcpl_cons_len"
+            let runtime_name = if matches!(op, UnaryOp::Len) {
+                match operand.hint() {
+                    TypeHint::String => "bcpl_str_len",
+                    TypeHint::List => "__newbcpl_cons_len",
+                    _ => default_name,
+                }
             } else {
                 default_name
             };
@@ -3075,6 +3147,26 @@ impl<'a> Lowerer<'a> {
 
         let callee_v = self.lower_expr(callee);
         let arg_values: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
+        // Anonymous owned-string temps: an argument that is itself a +1
+        // owned-String producer (e.g. `WRITES(JOIN(xs, sep))`) has no
+        // binding to release it. When the callee is a non-capturing sink
+        // (it reads the bytes and doesn't store the id), release each such
+        // temp right after the call — exactly once, no leak, no
+        // over-release. Literals (immortal) and bare Idents (borrows) are
+        // not producers, so they are correctly left alone.
+        let callee_non_capturing = matches!(
+            callee,
+            Expr::Ident { name, .. } if is_non_capturing_builtin(name)
+        );
+        let temps_to_release: Vec<Value> = if callee_non_capturing {
+            args.iter()
+                .zip(arg_values.iter())
+                .filter(|(a, _)| is_owned_alloc_producer(a))
+                .map(|(_, v)| v.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         // Always capture the call's result. The hint tells us the
         // *type* of what comes back, not whether to discard it — a
         // user-defined function returning WORD still has a meaningful
@@ -3087,6 +3179,14 @@ impl<'a> Lowerer<'a> {
             args: arg_values,
             hint,
         });
+        for v in temps_to_release {
+            self.b().emit(Instr::Call {
+                dst: None,
+                callee: Value::Function("bcpl_str_release".to_string()),
+                args: vec![v],
+                hint: TypeHint::Word,
+            });
+        }
         Value::Local(dst)
     }
 
@@ -3419,6 +3519,22 @@ fn collect_field_initialisers(c: &ClassDecl) -> Vec<(String, &Expr)> {
 /// `__newbcpl_*` runtime API; matches the NewCP-derived GC and
 /// list-data conventions described in
 /// `reference/runtime/ListDataTypes.h`.
+/// Does this initialiser/RHS produce a fresh **+1-owned** heap value
+/// whose ownership the binding must take on (released at the epilogue
+/// unless it escapes)? True for `NEW C()` (a +1 Obj-C object) and for a
+/// String-returning function call (JOIN / a string-returning user fn,
+/// a +1 NSString id). FALSE for string literals (immortal, never
+/// released) and bare-Ident copies (a borrow — no new +1). Used by the
+/// owned-object gate AND the strong-store assignment path so they agree
+/// on what "owns a +1" means.
+fn is_owned_alloc_producer(e: &Expr) -> bool {
+    match e {
+        Expr::New { .. } => true,
+        Expr::Call { .. } => matches!(e.hint(), TypeHint::String),
+        _ => false,
+    }
+}
+
 fn unary_runtime_helper(op: UnaryOp) -> Option<&'static str> {
     Some(match op {
         // HD / TL / REST are open-coded inline (see lower_unary +
@@ -3539,6 +3655,27 @@ fn esc_target(t: &Expr, esc: &mut HashSet<String>) {
 /// `e` is used as a value (its pointer may flow out): any bare local here
 /// escapes. Subscript / deref bases recurse via `esc_base` (exempt when
 /// bare).
+/// Builtins that read their (string) arguments and return without ever
+/// storing/capturing them. A bare local passed to one of these does not
+/// escape, so an owned scope-local string used only here stays tracked
+/// for epilogue release. ONLY genuine read-and-return sinks belong here —
+/// adding a capturing builtin would release an escaped +1 (use-after-free).
+fn is_non_capturing_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "WRITES"
+            | "WRITEF"
+            | "WRITEF1"
+            | "WRITEF2"
+            | "WRITEF3"
+            | "WRITEF4"
+            | "WRITEF5"
+            | "WRITEF6"
+            | "WRITEF7"
+            | "JOIN"
+    )
+}
+
 fn esc_value(e: &Expr, esc: &mut HashSet<String>) {
     match e {
         Expr::Ident { name, .. } => {
@@ -3579,14 +3716,28 @@ fn esc_value(e: &Expr, esc: &mut HashSet<String>) {
             UnaryOp::Neg | UnaryOp::Not | UnaryOp::LogNot => esc_value(operand, esc),
         },
         Expr::Call { callee, args, .. } => {
-            // No allowlist in v1: any value passed to any callee may be
-            // captured, so it escapes. (Conservative; the common
-            // scratch-vector pattern never passes the bare pointer.)
+            // Allowlist of read-and-return sinks that never CAPTURE their
+            // arguments (they read the bytes and return). A bare local
+            // passed to one of these does NOT escape — load-bearing so a
+            // scope-local owned string used only as `WRITES(s)` stays in
+            // function_owned_objects and gets its +1 released at the
+            // epilogue (otherwise it would be marked escaping and leak).
+            // Everything else is conservative: any arg may be captured.
+            let non_capturing = matches!(
+                callee.as_ref(),
+                Expr::Ident { name, .. } if is_non_capturing_builtin(name)
+            );
             if !matches!(callee.as_ref(), Expr::Ident { .. }) {
                 esc_value(callee, esc);
             }
             for a in args {
-                esc_value(a, esc);
+                if non_capturing {
+                    // Walk for nested escapes through a base, but a bare
+                    // Ident arg is not stored, so it does not escape.
+                    esc_base(a, esc);
+                } else {
+                    esc_value(a, esc);
+                }
             }
         }
         Expr::Conditional {
