@@ -1,0 +1,25 @@
+// cocoa-geometry.bcl — Cocoa methods that return C structs. The selector
+// DB tags them (NSRect/NSPoint/NSSize/NSRange); codegen declares the real
+// struct return type and the arm64 backend handles the ABI (HFA in v0..v3,
+// integer pair in x0/x1, sret in x8) automatically. The result arrives as
+// a BCPL vector, read by field name via seeded manifest constants.
+//
+//   ./newbcpl-driver run examples/cocoa-geometry.bcl
+
+LET START() BE $(
+  // NSRange (integer pair) -> VEC; read with `!` (word subscript).
+  LET r = ["the quick brown fox" rangeOfString: "brown"]
+  WRITES("range : loc=") ; WRITEN(r ! NSRange_location)
+  WRITES(" len=") ; WRITEN(r ! NSRange_length) ; NEWLINE()
+
+  LET f = [NSFont systemFontOfSize: 14 AS FLOAT]
+
+  // NSSize (HFA, 2 doubles) -> FVEC; read with `.%` (float subscript).
+  LET adv = [f maximumAdvancement]
+  WRITES("advance: w=") ; FWRITE(adv .% NSSize_width) ; NEWLINE()
+
+  // NSRect (32 bytes, returned via sret) -> FVEC.
+  LET bb = [f boundingRectForFont]
+  WRITES("bbox  : ") ; FWRITE(bb .% NSRect_width)
+  WRITES(" x ") ; FWRITE(bb .% NSRect_height) ; NEWLINE()
+$)

@@ -1,0 +1,22 @@
+// cocoa-window.bcl — open a real native NSWindow, driven from BCPL via
+// Objective-C bracket message sends. Run it on a desktop session:
+//
+//   ./newbcpl-driver run examples/cocoa-window.bcl
+//
+// A window appears (default size); close it or press Cmd-Q to quit.
+// (Precise sizing needs struct-valued ARGS — setFrame:/setContentSize: —
+// which are the next bracket-send increment; `center` needs no struct arg.)
+
+LET START() BE $(
+  LET app = [NSApplication sharedApplication]
+  [app setActivationPolicy: 0]          // NSApplicationActivationPolicyRegular
+
+  LET w = [[NSWindow alloc] init]
+  [w setTitle: "MacBCPL — a window sent from BCPL"]
+  [w center]
+  [w makeKeyAndOrderFront: 0]
+
+  [app activateIgnoringOtherApps: 1]
+  WRITES("window shown — close it or press Cmd-Q to exit*N")
+  [app run]                             // runs the AppKit event loop
+$)

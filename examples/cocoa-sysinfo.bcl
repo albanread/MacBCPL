@@ -1,0 +1,21 @@
+// cocoa-sysinfo.bcl — query the running system through Cocoa, driven
+// entirely by Objective-C bracket message sends compiled from BCPL.
+// Return types are synthesized from the selector DB (strings need no
+// annotation; integer getters take `AS INT`).
+//
+//   ./newbcpl-driver run examples/cocoa-sysinfo.bcl
+
+LET START() BE $(
+  LET pi = [NSProcessInfo processInfo]
+  WRITES("Process : ") ; WRITES([pi processName]) ; NEWLINE()
+  WRITES("macOS   : ") ; WRITES([pi operatingSystemVersionString]) ; NEWLINE()
+  WRITES("CPUs    : ") ; WRITEN([pi activeProcessorCount] AS INT) ; NEWLINE()
+  WRITES("Memory  : ") ; WRITEN([pi physicalMemory] AS INT) ; WRITES(" bytes") ; NEWLINE()
+
+  LET fm = [NSFileManager defaultManager]
+  WRITES("CWD     : ") ; WRITES([fm currentDirectoryPath]) ; NEWLINE()
+
+  // A string built by chaining Cocoa NSString methods.
+  LET who = [["macbcpl" uppercaseString] stringByAppendingString: " on Cocoa"]
+  WRITES("Banner  : ") ; WRITES(who) ; NEWLINE()
+$)

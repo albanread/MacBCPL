@@ -1,0 +1,21 @@
+// cocoa-alert.bcl — show a native macOS NSAlert dialog from BCPL.
+// Every line here is an Objective-C message send compiled from BCPL.
+//
+//   ./newbcpl-driver run examples/cocoa-alert.bcl
+//
+// A dialog appears; `runModal` returns the clicked button (NSModalResponse).
+
+LET START() BE $(
+  LET app = [NSApplication sharedApplication]
+  [app setActivationPolicy: 0]
+
+  LET alert = [[NSAlert alloc] init]
+  [alert setMessageText: "Hello from MacBCPL!"]
+  [alert setInformativeText: "This native dialog was built and shown by Cocoa message sends compiled from BCPL."]
+  [alert addButtonWithTitle: "Splendid"]
+  [alert addButtonWithTitle: "Cancel"]
+
+  [app activateIgnoringOtherApps: 1]
+  LET clicked = [alert runModal] AS INT
+  WRITES("you clicked button #") ; WRITEN(clicked - 1000) ; NEWLINE()
+$)

@@ -1,0 +1,22 @@
+// cocoa-collections.bcl — NSMutableArray / NSMutableDictionary driven
+// from BCPL via bracket message sends. BCPL string literals are NSStrings,
+// so they are valid Cocoa collection elements/keys.
+//
+//   ./newbcpl-driver run examples/cocoa-collections.bcl
+
+LET START() BE $(
+  LET a = [[NSMutableArray alloc] init]
+  [a addObject: "alpha"]
+  [a addObject: "beta"]
+  [a addObject: "gamma"]
+  WRITES("count   : ") ; WRITEN([a count] AS INT) ; NEWLINE()
+  WRITES("first   : ") ; WRITES([a objectAtIndex: 0]) ; NEWLINE()
+  WRITES("joined  : ") ; WRITES([a componentsJoinedByString: " - "]) ; NEWLINE()
+
+  LET d = [[NSMutableDictionary alloc] init]
+  [d setObject: "Ada Lovelace" forKey: "name"]
+  [d setObject: "London" forKey: "city"]
+  WRITES("name    : ") ; WRITES([d objectForKey: "name"]) ; NEWLINE()
+  WRITES("city    : ") ; WRITES([d objectForKey: "city"]) ; NEWLINE()
+  WRITES("entries : ") ; WRITEN([d count] AS INT) ; NEWLINE()
+$)
