@@ -25,6 +25,10 @@
 pub mod builtins;
 pub mod gc;
 
+/// Manual free-list heap (Tier 2 of the no-GC memory model): explicit
+/// GETVEC/FREEVEC + the promotion target for escaping allocations.
+pub mod heap;
+
 /// Signal-safe crash handler (macOS arm64) + the JIT-symbol registry
 /// shared with `BRK`. Ported from MacModula2; replaces the upstream
 /// Windows SEH machinery (this is a fork — no Windows support).

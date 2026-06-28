@@ -989,9 +989,10 @@ pub unsafe extern "C-unwind" fn QGETVEC(n_words: i64) -> *mut i64 {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn FREEVEC(_p: *mut i64) -> i64 {
-    // Leak — proper free needs the GC's metadata. Tests don't
-    // assert on memory pressure yet, so this is fine for now.
+pub unsafe extern "C-unwind" fn FREEVEC(p: *mut i64) -> i64 {
+    // Real manual free now (no-GC model): return the block to the manual
+    // heap. Safe on null / non-heap pointers (best-effort header guard).
+    unsafe { crate::heap::bcpl_heap_free(p as *mut u8) };
     0
 }
 
@@ -1020,7 +1021,8 @@ pub unsafe extern "C-unwind" fn __newbcpl_list_len(hdr: *const ListHeader) -> i6
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn __newbcpl_freevec(_p: *mut i64) -> i64 {
+pub unsafe extern "C-unwind" fn __newbcpl_freevec(p: *mut i64) -> i64 {
+    unsafe { crate::heap::bcpl_heap_free(p as *mut u8) };
     0
 }
 
@@ -1102,9 +1104,12 @@ fn intern_typedesc_for_size(size: usize) -> *const crate::gc::TypeDesc {
 /// `layout.instance_size` from sema.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn __newbcpl_alloc_rec(size: i64) -> *mut u8 {
-    let size = size.max(0) as usize;
-    let td = intern_typedesc_for_size(size);
-    unsafe { crate::gc::__newbcpl_new_rec(td) }
+    // No-GC model: the single allocation choke point now draws from the
+    // manual heap (Tier 2). Lowering will later route proven-scope-local
+    // sites to a per-scope arena (Tier 1) instead; until then everything
+    // lands here and is reclaimed by explicit FREEVEC (or leaks for the
+    // process lifetime, which is fine for short programs).
+    unsafe { crate::heap::bcpl_heap_alloc(size.max(0) as usize) }
 }
 
 /// `HD(list)` — read the value of the first atom. Returns 0 if
@@ -1926,6 +1931,7 @@ mod heap_tests {
     }
 
     #[test]
+    #[ignore = "no-GC fork: auto-collect removed — allocation no longer triggers a sweep (Tier-2 manual heap + Tier-1 arenas instead)"]
     fn alloc_pressure_auto_triggers_collect() {
         let _guard = heap_test_lock();
         // Lower the auto-trigger threshold so the test doesn't

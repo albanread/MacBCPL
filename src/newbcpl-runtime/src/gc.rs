@@ -808,71 +808,12 @@ pub unsafe extern "C-unwind" fn __newbcpl_register_module_named(
 /// allocation entry point for managed CP code.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn __newbcpl_new_rec(tag: *const TypeDesc) -> *mut u8 {
-    // Allocation is implicitly a safepoint: poll before doing the work
-    // so a concurrent collector can pause us cleanly.  Without this
-    // poll, a tight loop of allocations that all hit the TLAB / cluster
-    // bump fast-path could prevent the collector from making progress.
-    if SAFEPOINT_REQUESTED.load(Ordering::Acquire) != 0 {
-        park_self_for_safepoint();
-    }
-
-    let mut spill_buf = [0usize; 16];
-    let sp = capture_sp(&mut spill_buf);
-
-    let mutator = ensure_mutator_for_current_thread();
+    // No-GC model: route record allocation to the manual heap (Tier 2).
+    // The tag's only remaining use is its payload size — there is no
+    // tracing, marking, mutator registration, or auto-collect anymore.
+    // (The legacy mark-sweep machinery below this function is now dead.)
     let payload_size = unsafe { (*tag).size as usize };
-    let total_size = total_block_size(payload_size);
-    let header_size = std::mem::size_of::<BlockHeader>();
-
-    // Threshold-based auto-collect. We collect *before* the
-    // allocation so the new block can't be reclaimed by the
-    // sweep that fires (no root references it yet — the JIT'd
-    // caller hasn't received the pointer). After the cycle we
-    // re-baseline the threshold to `live_bytes * GROWTH` so
-    // collection cost amortises.
-    let threshold = HEAP_COUNTERS.collect_threshold.load(Ordering::Acquire);
-    if threshold != 0 {
-        let bytes_since_load =
-            HEAP_COUNTERS.alloc_bytes_since_collect.load(Ordering::Acquire);
-        if bytes_since_load.saturating_add(total_size as u64) >= threshold {
-            collect_stw(&mutator, sp, &spill_buf);
-            HEAP_COUNTERS
-                .alloc_bytes_since_collect
-                .store(0, Ordering::Release);
-            let live = HEAP_COUNTERS.live_bytes.load(Ordering::Acquire);
-            let new_threshold = std::cmp::max(
-                INITIAL_COLLECT_THRESHOLD,
-                live.saturating_mul(COLLECT_GROWTH_FACTOR),
-            );
-            HEAP_COUNTERS
-                .collect_threshold
-                .store(new_threshold, Ordering::Release);
-        }
-    }
-
-    let block = alloc_under_lock(total_size, &mutator, sp, &spill_buf);
-
-    unsafe {
-        let hdr = block as *mut BlockHeader;
-        (*hdr).tag = tag as usize;
-        (*hdr).block_size = total_size;
-        let mut heap = heap_lock();
-        heap.type_descs.inc(tag as usize);
-    }
-
-    HEAP_COUNTERS.alloc_blocks_lifetime.fetch_add(1, Ordering::Relaxed);
-    HEAP_COUNTERS
-        .alloc_bytes_lifetime
-        .fetch_add(total_size as u64, Ordering::Relaxed);
-    HEAP_COUNTERS
-        .alloc_bytes_since_collect
-        .fetch_add(total_size as u64, Ordering::Relaxed);
-    mutator.alloc_blocks_lifetime.fetch_add(1, Ordering::Relaxed);
-    mutator
-        .alloc_bytes_lifetime
-        .fetch_add(total_size as u64, Ordering::Relaxed);
-
-    unsafe { block.add(header_size) }
+    unsafe { crate::heap::bcpl_heap_alloc(payload_size) }
 }
 
 /// `__newbcpl_collect()` — extern wrapper around `collect()` so
@@ -882,7 +823,9 @@ pub unsafe extern "C-unwind" fn __newbcpl_new_rec(tag: *const TypeDesc) -> *mut 
 /// just freed a huge thing").
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn __newbcpl_collect() -> i64 {
-    collect();
+    // No-GC model: there is no collector. `GC()` is a no-op (memory is
+    // reclaimed by scope-exit arena frees and explicit FREEVEC, not by
+    // tracing). Kept so the `GC()` builtin still links.
     0
 }
 
