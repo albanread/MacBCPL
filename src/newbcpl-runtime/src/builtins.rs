@@ -1564,6 +1564,14 @@ pub fn builtin_addresses() -> &'static [Builtin] {
                 v.push(Builtin { name, address });
             }
         }
+        // No-GC memory model: per-scope arena + promote entry points
+        // (the manual heap's alloc/free are reached via __newbcpl_alloc_rec
+        // / FREEVEC which are already registered above).
+        {
+            for (name, address) in crate::heap::builtin_addresses() {
+                v.push(Builtin { name, address });
+            }
+        }
         // NewAudio shims — slot bookkeeping and synthesis work
         // everywhere; live waveOut / midiOut output is Windows-only
         // and gated inside the shim. The names match
