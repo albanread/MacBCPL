@@ -1549,6 +1549,16 @@ pub fn builtin_addresses() -> &'static [Builtin] {
                 v.push(Builtin { name, address });
             }
         }
+        // macOS Objective-C runtime bridge — the `bcpl_objc_*` /
+        // `bcpl_cocoa_*` primitives that make BCPL objects Cocoa objects
+        // and underpin the Cocoa GUI. Registered so the JIT resolver
+        // binds them like any other runtime builtin.
+        #[cfg(not(windows))]
+        {
+            for (name, address) in crate::objc::builtin_addresses() {
+                v.push(Builtin { name, address });
+            }
+        }
         // NewAudio shims — slot bookkeeping and synthesis work
         // everywhere; live waveOut / midiOut output is Windows-only
         // and gated inside the shim. The names match

@@ -37,6 +37,13 @@ pub mod igui_builtins;
 #[cfg(not(windows))]
 pub mod igui_mac;
 
+/// macOS Objective-C runtime bridge — the substrate that makes BCPL
+/// `CLASS` objects *be* Cocoa objects (objc_getClass / sel_registerName
+/// / objc_msgSend / objc_allocateClassPair / class_addMethod / …),
+/// ported from MacModula2. Also the foundation for the Cocoa GUI.
+#[cfg(not(windows))]
+pub mod objc;
+
 /// BCPL `Sound_*` / `Music_*` runtime — game-focused SFX synth and
 /// ABC → MIDI playback, backed by NewAudio. Slot bookkeeping and
 /// synthesis work on every target; live waveOut / midiOut playback

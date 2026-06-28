@@ -1,0 +1,613 @@
+//! macOS Objective-C runtime bridge for MacBCPL.
+//!
+//! Ported from MacModula2's `src/newm2-runtime/src/objc.rs`, adapted to
+//! BCPL's string ABI. Where MacModula2 passes `ARRAY OF CHAR` as a
+//! UTF-16 open array `(ptr, high)`, BCPL strings are NUL-terminated
+//! UTF-8 byte strings (`*const u8`) — matching the convention the
+//! existing `iGui_*` / runtime builtins already use. So every
+//! name-taking entry point here takes a `*const u8` and reads to the
+//! first NUL.
+//!
+//! This is the substrate that makes BCPL objects *be* Objective-C
+//! objects (the MacModula2 model): a BCPL `CLASS` is registered with
+//! `objc_allocateClassPair` + `class_addIvar("__bcpl", size)` +
+//! `class_addMethod`; `NEW Class` is `[[Class alloc] init]`; method
+//! dispatch is `objc_msgSend`; fields live in the `__bcpl` ivar.
+//!
+//! Everything resolves through `dlsym(RTLD_DEFAULT, …)` at runtime, so
+//! the JIT host gains no static link dependency on libobjc; `bootstrap`
+//! `dlopen`s the umbrella frameworks first.
+
+#![cfg(not(windows))]
+#![allow(clippy::missing_safety_doc)]
+
+use core::ffi::c_void;
+use std::ffi::{CStr, CString};
+use std::sync::OnceLock;
+
+const RTLD_DEFAULT: *mut c_void = (-2isize) as *mut c_void;
+const RTLD_NOW: i32 = 0x2;
+
+unsafe extern "C" {
+    fn dlopen(path: *const i8, mode: i32) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const i8) -> *mut c_void;
+}
+
+/// Map the umbrella frameworks into the process so libobjc, the `NS*`
+/// classes, and the AppKit/Foundation/CoreGraphics exports resolve via
+/// `dlsym(RTLD_DEFAULT, …)`. Idempotent; runs once.
+pub fn bootstrap() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        for path in [
+            "/System/Library/Frameworks/Cocoa.framework/Cocoa",
+            "/System/Library/Frameworks/AppKit.framework/AppKit",
+            "/System/Library/Frameworks/Foundation.framework/Foundation",
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+            "/usr/lib/libobjc.A.dylib",
+        ] {
+            if let Ok(c) = CString::new(path) {
+                unsafe { dlopen(c.as_ptr(), RTLD_NOW) };
+            }
+        }
+    });
+}
+
+/// Resolve a symbol by name across everything loaded into the process.
+/// After `bootstrap()`, every libSystem / libobjc / framework C entry
+/// point (`objc_msgSend`, `CGColorCreate`, …) resolves here.
+pub fn dlsym_default(name: &str) -> Option<*const ()> {
+    bootstrap();
+    let c = CString::new(name).ok()?;
+    let p = unsafe { dlsym(RTLD_DEFAULT, c.as_ptr()) };
+    if p.is_null() { None } else { Some(p as *const ()) }
+}
+
+fn sym_or_null(name: &str) -> *mut c_void {
+    dlsym_default(name)
+        .map(|p| p as *mut c_void)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Borrow a BCPL NUL-terminated UTF-8 string as a `&CStr` (no copy).
+/// Returns `None` if the pointer is null.
+///
+/// # Safety
+/// `ptr` must be null or point to a valid NUL-terminated C string that
+/// outlives the returned borrow.
+unsafe fn cstr<'a>(ptr: *const u8) -> Option<&'a CStr> {
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { CStr::from_ptr(ptr as *const i8) })
+    }
+}
+
+// ─── class / selector lookup ────────────────────────────────────────
+
+/// `objc_getClass(name)` — look up an Objective-C class by name.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_objc_get_class(name: *const u8) -> *mut c_void {
+    let Some(c) = (unsafe { cstr(name) }) else {
+        return std::ptr::null_mut();
+    };
+    let f = sym_or_null("objc_getClass");
+    if f.is_null() {
+        return std::ptr::null_mut();
+    }
+    let f: extern "C" fn(*const i8) -> *mut c_void = unsafe { std::mem::transmute(f) };
+    f(c.as_ptr())
+}
+
+/// `sel_registerName(name)` — intern a selector from a name.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_objc_sel(name: *const u8) -> *mut c_void {
+    let Some(c) = (unsafe { cstr(name) }) else {
+        return std::ptr::null_mut();
+    };
+    let f = sym_or_null("sel_registerName");
+    if f.is_null() {
+        return std::ptr::null_mut();
+    }
+    let f: extern "C" fn(*const i8) -> *mut c_void = unsafe { std::mem::transmute(f) };
+    f(c.as_ptr())
+}
+
+/// The address of `objc_msgSend`, which BCPL casts to a typed function
+/// pointer per call site so each carries its own ABI signature (the
+/// macOS analogue of a COM vtable slot). Returns null if unavailable.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn bcpl_objc_msgsend_ptr() -> *mut c_void {
+    sym_or_null("objc_msgSend")
+}
+
+/// The address of `objc_msgSendSuper` — for `SUPER.method(...)`.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn bcpl_objc_msgsend_super_ptr() -> *mut c_void {
+    sym_or_null("objc_msgSendSuper")
+}
+
+// ─── NSString bridge ────────────────────────────────────────────────
+
+/// Build an autoreleased `NSString*` from a BCPL UTF-8 string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_objc_nsstring(text: *const u8) -> *mut c_void {
+    bootstrap();
+    let Some(c) = (unsafe { cstr(text) }) else {
+        return std::ptr::null_mut();
+    };
+    let get_class = sym_or_null("objc_getClass");
+    let reg_sel = sym_or_null("sel_registerName");
+    let msg_send = sym_or_null("objc_msgSend");
+    if get_class.is_null() || reg_sel.is_null() || msg_send.is_null() {
+        return std::ptr::null_mut();
+    }
+    let get_class: extern "C" fn(*const i8) -> *mut c_void = unsafe { std::mem::transmute(get_class) };
+    let reg_sel: extern "C" fn(*const i8) -> *mut c_void = unsafe { std::mem::transmute(reg_sel) };
+    let send: extern "C" fn(*mut c_void, *mut c_void, *const i8) -> *mut c_void =
+        unsafe { std::mem::transmute(msg_send) };
+    let cls = get_class(c"NSString".as_ptr());
+    let sel = reg_sel(c"stringWithUTF8String:".as_ptr());
+    if cls.is_null() || sel.is_null() {
+        return std::ptr::null_mut();
+    }
+    send(cls, sel, c.as_ptr())
+}
+
+/// Extract an `NSString*`'s text into a BCPL UTF-8 buffer (NUL
+/// terminated). `dest_cap` is the buffer capacity in bytes. Returns the
+/// number of bytes written (excluding the NUL).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_objc_nsstring_to_utf8(
+    nsstr: *mut c_void,
+    dest: *mut u8,
+    dest_cap: u64,
+) -> u64 {
+    if nsstr.is_null() || dest.is_null() || dest_cap == 0 {
+        return 0;
+    }
+    let msg = sym_or_null("objc_msgSend");
+    let reg = sym_or_null("sel_registerName");
+    if msg.is_null() || reg.is_null() {
+        return 0;
+    }
+    let reg: extern "C" fn(*const i8) -> *mut c_void = unsafe { std::mem::transmute(reg) };
+    let send: extern "C" fn(*mut c_void, *mut c_void) -> *const i8 = unsafe { std::mem::transmute(msg) };
+    let utf8 = send(nsstr, reg(c"UTF8String".as_ptr()));
+    if utf8.is_null() {
+        return 0;
+    }
+    let bytes = unsafe { CStr::from_ptr(utf8) }.to_bytes();
+    let n = bytes.len().min((dest_cap as usize).saturating_sub(1));
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, n);
+        *dest.add(n) = 0;
+    }
+    n as u64
+}
+
+// ─── object lifecycle ───────────────────────────────────────────────
+
+/// `[[Class alloc] init]` — allocate and initialise an instance of a
+/// (already-registered) class looked up by name. This is the lowering
+/// target for `NEW Class`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_objc_new(name: *const u8) -> *mut c_void {
+    bootstrap();
+    let cls = unsafe { bcpl_objc_get_class(name) };
+    if cls.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { bcpl_objc_alloc_init(cls) }
+}
+
+/// `[[cls alloc] init]` on an already-resolved Class object.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_objc_alloc_init(cls: *mut c_void) -> *mut c_void {
+    if cls.is_null() {
+        return std::ptr::null_mut();
+    }
+    let reg_sel = sym_or_null("sel_registerName");
+    let msg_send = sym_or_null("objc_msgSend");
+    if reg_sel.is_null() || msg_send.is_null() {
+        return std::ptr::null_mut();
+    }
+    let reg_sel: extern "C" fn(*const i8) -> *mut c_void = unsafe { std::mem::transmute(reg_sel) };
+    let send0: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+        unsafe { std::mem::transmute(msg_send) };
+    let obj = send0(cls, reg_sel(c"alloc".as_ptr()));
+    if obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    send0(obj, reg_sel(c"init".as_ptr()))
+}
+
+/// Send `release` to an object (BCPL `RELEASE` / end of `USING`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_objc_release(obj: *mut c_void) {
+    if obj.is_null() {
+        return;
+    }
+    let reg_sel = sym_or_null("sel_registerName");
+    let msg_send = sym_or_null("objc_msgSend");
+    if reg_sel.is_null() || msg_send.is_null() {
+        return;
+    }
+    let reg_sel: extern "C" fn(*const i8) -> *mut c_void = unsafe { std::mem::transmute(reg_sel) };
+    let send0: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+        unsafe { std::mem::transmute(msg_send) };
+    send0(obj, reg_sel(c"release".as_ptr()));
+}
+
+/// Send `retain` to an object (BCPL `RETAIN`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_objc_retain(obj: *mut c_void) -> *mut c_void {
+    if obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    let reg_sel = sym_or_null("sel_registerName");
+    let msg_send = sym_or_null("objc_msgSend");
+    if reg_sel.is_null() || msg_send.is_null() {
+        return std::ptr::null_mut();
+    }
+    let reg_sel: extern "C" fn(*const i8) -> *mut c_void = unsafe { std::mem::transmute(reg_sel) };
+    let send0: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+        unsafe { std::mem::transmute(msg_send) };
+    send0(obj, reg_sel(c"retain".as_ptr()))
+}
+
+// ─── runtime class definition ───────────────────────────────────────
+
+/// `objc_allocateClassPair(super, name, 0)` — begin defining a new
+/// Objective-C class. Add ivars/methods, then `register_class`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_objc_allocate_class(
+    superclass: *mut c_void,
+    name: *const u8,
+) -> *mut c_void {
+    bootstrap();
+    let Some(c) = (unsafe { cstr(name) }) else {
+        return std::ptr::null_mut();
+    };
+    let f = sym_or_null("objc_allocateClassPair");
+    if f.is_null() {
+        return std::ptr::null_mut();
+    }
+    let f: extern "C" fn(*mut c_void, *const i8, usize) -> *mut c_void =
+        unsafe { std::mem::transmute(f) };
+    f(superclass, c.as_ptr(), 0)
+}
+
+/// `class_addIvar(cls, name, size, alignment_log2, types)` — add an
+/// instance variable to a class still being defined. BCPL classes use a
+/// single ivar `__bcpl` holding the whole field block. Returns 1 on
+/// success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_objc_add_ivar(
+    cls: *mut c_void,
+    name: *const u8,
+    size: u64,
+    alignment_log2: u8,
+    types: *const u8,
+) -> i32 {
+    let (Some(n), Some(t)) = (unsafe { cstr(name) }, unsafe { cstr(types) }) else {
+        return 0;
+    };
+    let f = sym_or_null("class_addIvar");
+    if f.is_null() {
+        return 0;
+    }
+    let f: extern "C" fn(*mut c_void, *const i8, usize, u8, *const i8) -> i8 =
+        unsafe { std::mem::transmute(f) };
+    f(cls, n.as_ptr(), size as usize, alignment_log2, t.as_ptr()) as i32
+}
+
+/// `class_addMethod(cls, sel, imp, types)` — install a method whose
+/// implementation is `imp` (a plain C-ABI function — a JIT'd BCPL
+/// routine works directly, since an Obj-C IMP is
+/// `ret (*)(id self, SEL _cmd, …)`). `types` is the Obj-C type encoding,
+/// e.g. "v@:@" for `-(void)act:(id)x`. Returns 1 on success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_objc_add_method(
+    cls: *mut c_void,
+    sel: *mut c_void,
+    imp: *mut c_void,
+    types: *const u8,
+) -> i32 {
+    let Some(c) = (unsafe { cstr(types) }) else {
+        return 0;
+    };
+    let f = sym_or_null("class_addMethod");
+    if f.is_null() {
+        return 0;
+    }
+    let f: extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *const i8) -> i8 =
+        unsafe { std::mem::transmute(f) };
+    f(cls, sel, imp, c.as_ptr()) as i32
+}
+
+/// `objc_registerClassPair(cls)` — finalize a class begun with
+/// `allocate_class`. After this, instances can be allocated and no more
+/// ivars/methods may be added.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_objc_register_class(cls: *mut c_void) {
+    let f = sym_or_null("objc_registerClassPair");
+    if f.is_null() {
+        return;
+    }
+    let f: extern "C" fn(*mut c_void) = unsafe { std::mem::transmute(f) };
+    f(cls);
+}
+
+/// Base pointer of a BCPL object's field block: the address of its
+/// `__bcpl` ivar. Returns `obj` unchanged if the ivar isn't found.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_objc_field_base(obj: *mut c_void) -> *mut c_void {
+    if obj.is_null() {
+        return obj;
+    }
+    let obj_get_class = sym_or_null("object_getClass");
+    let class_get_ivar = sym_or_null("class_getInstanceVariable");
+    let ivar_get_offset = sym_or_null("ivar_getOffset");
+    if obj_get_class.is_null() || class_get_ivar.is_null() || ivar_get_offset.is_null() {
+        return obj;
+    }
+    let obj_get_class: extern "C" fn(*mut c_void) -> *mut c_void =
+        unsafe { std::mem::transmute(obj_get_class) };
+    let class_get_ivar: extern "C" fn(*mut c_void, *const i8) -> *mut c_void =
+        unsafe { std::mem::transmute(class_get_ivar) };
+    let ivar_get_offset: extern "C" fn(*mut c_void) -> isize =
+        unsafe { std::mem::transmute(ivar_get_offset) };
+    let cls = obj_get_class(obj);
+    let ivar = class_get_ivar(cls, c"__bcpl".as_ptr());
+    if ivar.is_null() {
+        return obj;
+    }
+    let off = ivar_get_offset(ivar);
+    unsafe { (obj as *mut u8).offset(off) as *mut c_void }
+}
+
+/// `[obj isKindOfClass: objc_getClass(name)]` — runtime type test.
+/// Returns 1 (true) / 0 (false).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_objc_is_kind_of(obj: *mut c_void, name: *const u8) -> i64 {
+    if obj.is_null() {
+        return 0;
+    }
+    let cls = unsafe { bcpl_objc_get_class(name) };
+    if cls.is_null() {
+        return 0;
+    }
+    let reg_sel = sym_or_null("sel_registerName");
+    let msg_send = sym_or_null("objc_msgSend");
+    if reg_sel.is_null() || msg_send.is_null() {
+        return 0;
+    }
+    let reg_sel: extern "C" fn(*const i8) -> *mut c_void = unsafe { std::mem::transmute(reg_sel) };
+    let send: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool =
+        unsafe { std::mem::transmute(msg_send) };
+    if send(obj, reg_sel(c"isKindOfClass:".as_ptr()), cls) {
+        1
+    } else {
+        0
+    }
+}
+
+// ─── Objective-C blocks ─────────────────────────────────────────────
+
+#[repr(C)]
+struct BlockDescriptor {
+    reserved: usize,
+    size: usize,
+}
+
+#[repr(C)]
+struct BlockLiteral {
+    isa: *const c_void,
+    flags: i32,
+    reserved: i32,
+    invoke: *const c_void,
+    descriptor: *const BlockDescriptor,
+}
+
+const BLOCK_IS_GLOBAL: i32 = 1 << 28;
+
+/// Wrap a plain C-ABI function as a capture-free *global* Objective-C
+/// block, so a BCPL routine can be passed to any Cocoa API taking a
+/// block. `invoke` must have the block invoke ABI —
+/// `ret invoke(void *block, <args…>)` — i.e. its first parameter is the
+/// block itself (usually ignored). The block lives for the program's
+/// lifetime.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_objc_make_block(invoke: *mut c_void) -> *mut c_void {
+    bootstrap();
+    let isa = sym_or_null("_NSConcreteGlobalBlock");
+    if isa.is_null() || invoke.is_null() {
+        return std::ptr::null_mut();
+    }
+    let descriptor = Box::into_raw(Box::new(BlockDescriptor {
+        reserved: 0,
+        size: std::mem::size_of::<BlockLiteral>(),
+    }));
+    let literal = Box::into_raw(Box::new(BlockLiteral {
+        isa: isa as *const c_void,
+        flags: BLOCK_IS_GLOBAL,
+        reserved: 0,
+        invoke: invoke as *const c_void,
+        descriptor,
+    }));
+    literal as *mut c_void
+}
+
+// ─── headless snapshot (the native way to *see* the UI) ──────────────
+
+/// An `NSRect` / `CGRect` — four CGFloat (f64), passed in v0–v3 on arm64.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NsRect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+/// Render an `NSView` (and its subviews) offscreen into a bitmap and
+/// write it as a PNG at `path` (a BCPL UTF-8 string). Works without a
+/// window server (`cacheDisplayInRect:` draws into a CGBitmapContext),
+/// so a Cocoa UI can be captured headlessly. Returns nonzero on success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_cocoa_snapshot_view(
+    view: *mut c_void,
+    path: *const u8,
+) -> i32 {
+    bootstrap();
+    if view.is_null() {
+        return 0;
+    }
+    let msg = sym_or_null("objc_msgSend");
+    let reg = sym_or_null("sel_registerName");
+    if msg.is_null() || reg.is_null() {
+        return 0;
+    }
+    let sel = |s: &CStr| -> *mut c_void {
+        let f: extern "C" fn(*const i8) -> *mut c_void = unsafe { std::mem::transmute(reg) };
+        f(s.as_ptr())
+    };
+
+    let send_rect_ret: extern "C" fn(*mut c_void, *mut c_void) -> NsRect =
+        unsafe { std::mem::transmute(msg) };
+    let bounds = send_rect_ret(view, sel(c"bounds"));
+    if bounds.w < 1.0 || bounds.h < 1.0 {
+        return 0;
+    }
+
+    let send_rect_arg: extern "C" fn(*mut c_void, *mut c_void, NsRect) -> *mut c_void =
+        unsafe { std::mem::transmute(msg) };
+    let rep = send_rect_arg(view, sel(c"bitmapImageRepForCachingDisplayInRect:"), bounds);
+    if rep.is_null() {
+        return 0;
+    }
+
+    let send_rect_rep: extern "C" fn(*mut c_void, *mut c_void, NsRect, *mut c_void) =
+        unsafe { std::mem::transmute(msg) };
+    send_rect_rep(view, sel(c"cacheDisplayInRect:toBitmapImageRep:"), bounds, rep);
+
+    let send_png: extern "C" fn(*mut c_void, *mut c_void, u64, *mut c_void) -> *mut c_void =
+        unsafe { std::mem::transmute(msg) };
+    let data = send_png(rep, sel(c"representationUsingType:properties:"), 4, std::ptr::null_mut());
+    if data.is_null() {
+        return 0;
+    }
+
+    let path_str = unsafe { bcpl_objc_nsstring(path) };
+    if path_str.is_null() {
+        return 0;
+    }
+    let send_write: extern "C" fn(*mut c_void, *mut c_void, *mut c_void, bool) -> bool =
+        unsafe { std::mem::transmute(msg) };
+    let ok = send_write(data, sel(c"writeToFile:atomically:"), path_str, false);
+    if ok { 1 } else { 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_class_finds_nsobject() {
+        let cls = unsafe { bcpl_objc_get_class(c"NSObject".as_ptr() as *const u8) };
+        assert!(!cls.is_null(), "objc_getClass(NSObject) should resolve");
+    }
+
+    #[test]
+    fn nsstring_roundtrips() {
+        let ns = unsafe { bcpl_objc_nsstring(c"hello, cocoa".as_ptr() as *const u8) };
+        assert!(!ns.is_null(), "NSString creation should succeed");
+        let mut buf = [0u8; 64];
+        let n = unsafe { bcpl_objc_nsstring_to_utf8(ns, buf.as_mut_ptr(), buf.len() as u64) };
+        let got = std::str::from_utf8(&buf[..n as usize]).unwrap();
+        assert_eq!(got, "hello, cocoa");
+    }
+
+    #[test]
+    fn define_instantiate_class() {
+        // Dynamically build a class — the exact mechanism BCPL CLASS
+        // lowering will use: allocateClassPair + addIvar + register +
+        // alloc/init + field_base.
+        let sup = unsafe { bcpl_objc_get_class(c"NSObject".as_ptr() as *const u8) };
+        assert!(!sup.is_null());
+        let cls =
+            unsafe { bcpl_objc_allocate_class(sup, c"BcplTestPoint".as_ptr() as *const u8) };
+        assert!(!cls.is_null(), "allocateClassPair should succeed");
+        // one ivar "__bcpl" holding a 24-byte field block, 8-byte aligned.
+        let ok = unsafe {
+            bcpl_objc_add_ivar(
+                cls,
+                c"__bcpl".as_ptr() as *const u8,
+                24,
+                3,
+                c"[24c]".as_ptr() as *const u8,
+            )
+        };
+        assert_eq!(ok, 1, "class_addIvar(__bcpl) should succeed");
+        unsafe { bcpl_objc_register_class(cls) };
+
+        let obj = unsafe { bcpl_objc_alloc_init(cls) };
+        assert!(!obj.is_null(), "[[cls alloc] init] should succeed");
+
+        // field_base must land inside the object and be writable.
+        let base = unsafe { bcpl_objc_field_base(obj) } as *mut i64;
+        assert!(!base.is_null());
+        unsafe {
+            *base = 0x1234_5678;
+            assert_eq!(*base, 0x1234_5678, "field block must be writable");
+        }
+        assert_eq!(
+            unsafe { bcpl_objc_is_kind_of(obj, c"NSObject".as_ptr() as *const u8) },
+            1,
+            "instance should be kind-of NSObject"
+        );
+        unsafe { bcpl_objc_release(obj) };
+    }
+}
+
+/// Table of `(symbol_name, address)` for every bridge entry point, so
+/// the JIT symbol resolver can bind them the same way as the other
+/// runtime builtins.
+pub fn builtin_addresses() -> Vec<(&'static str, usize)> {
+    vec![
+        ("bcpl_objc_get_class", bcpl_objc_get_class as *const () as usize),
+        ("bcpl_objc_sel", bcpl_objc_sel as *const () as usize),
+        ("bcpl_objc_msgsend_ptr", bcpl_objc_msgsend_ptr as *const () as usize),
+        (
+            "bcpl_objc_msgsend_super_ptr",
+            bcpl_objc_msgsend_super_ptr as *const () as usize,
+        ),
+        ("bcpl_objc_nsstring", bcpl_objc_nsstring as *const () as usize),
+        (
+            "bcpl_objc_nsstring_to_utf8",
+            bcpl_objc_nsstring_to_utf8 as *const () as usize,
+        ),
+        ("bcpl_objc_new", bcpl_objc_new as *const () as usize),
+        ("bcpl_objc_alloc_init", bcpl_objc_alloc_init as *const () as usize),
+        ("bcpl_objc_release", bcpl_objc_release as *const () as usize),
+        ("bcpl_objc_retain", bcpl_objc_retain as *const () as usize),
+        (
+            "bcpl_objc_allocate_class",
+            bcpl_objc_allocate_class as *const () as usize,
+        ),
+        ("bcpl_objc_add_ivar", bcpl_objc_add_ivar as *const () as usize),
+        ("bcpl_objc_add_method", bcpl_objc_add_method as *const () as usize),
+        (
+            "bcpl_objc_register_class",
+            bcpl_objc_register_class as *const () as usize,
+        ),
+        ("bcpl_objc_field_base", bcpl_objc_field_base as *const () as usize),
+        ("bcpl_objc_is_kind_of", bcpl_objc_is_kind_of as *const () as usize),
+        ("bcpl_objc_make_block", bcpl_objc_make_block as *const () as usize),
+        (
+            "bcpl_cocoa_snapshot_view",
+            bcpl_cocoa_snapshot_view as *const () as usize,
+        ),
+    ]
+}
