@@ -64,6 +64,24 @@ fn cocoa_db() -> &'static CocoaDb {
 /// class); else an `id`/Object. Struct returns (geometry tags R/P/S/N or a
 /// `{…}` descriptor) are left as Object for now — Tier B/C will materialize
 /// them into vectors / wrapper objects.
+/// The statically-known element count of a VEC/FVEC constructor, used to
+/// validate a struct argument's width. `FVEC [a,b,c,d]` → 4 (init list);
+/// `FVEC k` (a single integer literal) → k+1 cells. None if the arg isn't
+/// a vector constructor (its length is unknown at compile time).
+fn static_vec_count(e: &Expr) -> Option<usize> {
+    if let Expr::TypedConstruct { kind, args, .. } = e {
+        if matches!(kind, TypeConstructorKind::Vec | TypeConstructorKind::FVec) {
+            if args.len() == 1 {
+                if let Expr::IntLit { value, .. } = &args[0] {
+                    return Some((*value as usize).saturating_add(1));
+                }
+            }
+            return Some(args.len());
+        }
+    }
+    None
+}
+
 /// A struct-returning send's shape for Tier-B geometry tags only:
 /// `(field_count, is_float)`. R(NSRect)=4 doubles, P(NSPoint)/S(NSSize)=2
 /// doubles, N(NSRange)=2 words. Complex `{…}` descriptors return None here
@@ -2155,6 +2173,38 @@ impl Sema {
                             .and_then(|&b| geometry_shape_of(&(b as char).to_string()))
                     })
                     .collect();
+                // Validate struct args at compile time so a mismatch is a
+                // clean error, not a runtime deref/over-read. A scalar at a
+                // struct position would be inttoptr+deref'd (crash); a
+                // wrong-width FVEC/VEC would over-read past the buffer.
+                for (i, shape) in shapes.iter().enumerate() {
+                    let Some((fields, _)) = shape else { continue };
+                    let arg = &args[i];
+                    if matches!(
+                        arg.hint(),
+                        TypeHint::Int | TypeHint::Float | TypeHint::Null
+                    ) {
+                        self.error(
+                            format!(
+                                "argument {} of `{selector}` expects a struct value \
+                                 (an FVEC/VEC of {fields} fields), not a scalar",
+                                i + 1
+                            ),
+                            *span,
+                        );
+                    } else if let Some(cnt) = static_vec_count(arg) {
+                        if cnt != *fields as usize {
+                            self.error(
+                                format!(
+                                    "argument {} of `{selector}` expects {fields} \
+                                     fields, got a {cnt}-element vector",
+                                    i + 1
+                                ),
+                                *span,
+                            );
+                        }
+                    }
+                }
                 *arg_structs.borrow_mut() = shapes;
                 // `[SUPER ...]` raw sends aren't supported in v1 — direct
                 // them to the dot form, which does static parent dispatch.
@@ -3029,6 +3079,33 @@ mod tests {
         assert!(
             out.errors.iter().any(|e| e.message.contains("[SUPER ...]")),
             "expected a `[SUPER ...]` rejection; got {:?}",
+            out.errors
+        );
+    }
+
+    #[test]
+    fn struct_arg_scalar_is_rejected() {
+        // A scalar at a struct-arg position would be inttoptr+deref'd
+        // (crash) — sema must reject it.
+        let out = analyze_str(
+            "LET START() BE $( LET w = [[NSWindow alloc] init]\n [w setFrame: 0 display: 0] $)\n",
+        );
+        assert!(
+            out.errors.iter().any(|e| e.message.contains("not a scalar")),
+            "expected a scalar-struct-arg error; got {:?}",
+            out.errors
+        );
+    }
+
+    #[test]
+    fn struct_arg_wrong_width_is_rejected() {
+        // A too-short FVEC at a struct-arg position would over-read.
+        let out = analyze_str(
+            "LET START() BE $( LET w = [[NSWindow alloc] init]\n [w setFrame: (FVEC [1.0, 2.0]) display: 0] $)\n",
+        );
+        assert!(
+            out.errors.iter().any(|e| e.message.contains("expects 4 fields")),
+            "expected a field-count error; got {:?}",
             out.errors
         );
     }

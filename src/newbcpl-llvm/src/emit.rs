@@ -1311,16 +1311,22 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         call_args.push(sel.into());
         for (i, a) in args.iter().enumerate() {
             let v = self.lower_value(a);
-            if let Some((n, is_float)) = arg_structs.get(i).copied().flatten() {
-                // Geometry struct ARGUMENT: the value is an FVEC/VEC data
-                // pointer; load its N fields as a by-value struct so the
-                // arm64 backend places it per ABI (HFA in v-regs, int pair
-                // in x-regs, large via byval). e.g. `setFrame:` (NSRect).
+            // Take the by-value struct-argument path ONLY when the arg is
+            // actually a pointer (an FVEC/VEC). The DB shape alone is not
+            // enough: a scalar/null at a struct selector position (e.g. the
+            // idiomatic `[w setFrame: 0]`) must NOT be inttoptr+deref'd —
+            // that is a value-controlled SIGSEGV. Sema also rejects this at
+            // compile time; this is the codegen safety net.
+            let struct_shape = arg_structs.get(i).copied().flatten();
+            if let (Some((n, is_float)), BasicValueEnum::PointerValue(ptr)) = (struct_shape, v) {
+                // Geometry struct ARGUMENT: load the N fields from the FVEC/
+                // VEC data pointer as a by-value struct so the arm64 backend
+                // places it per ABI (HFA in v-regs, int pair in x-regs,
+                // large via byval). e.g. `setFrame:` (NSRect).
                 let n = n as usize;
                 let elem: inkwell::types::BasicTypeEnum =
                     if is_float { f64_t.into() } else { i64_t.into() };
                 let struct_ty = self.context.struct_type(&vec![elem; n], false);
-                let ptr = self.as_pointer(v);
                 let sv = self
                     .builder
                     .build_load(struct_ty, ptr, "structarg")
