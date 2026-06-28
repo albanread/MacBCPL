@@ -972,12 +972,16 @@ impl Sema {
                     // the binding so `p.method()` dispatches against
                     // `Class`'s vtable and `p.field` runs the same
                     // visibility check that a class-typed local does.
-                    let class_name = f
-                        .param_annotations
-                        .get(idx)
-                        .and_then(|a| a.as_deref())
-                        .and_then(|a| self.class_name_from_annotation(a));
-                    self.declare(p, TypeHint::Word, class_name, f.span);
+                    let ann = f.param_annotations.get(idx).and_then(|a| a.as_deref());
+                    let class_name = ann.and_then(|a| self.class_name_from_annotation(a));
+                    // `AS STRING` (and other base-type annotations) give the
+                    // parameter a real hint so `%`/LEN dispatch reaches the
+                    // NSString helpers — without it a string passed to a
+                    // helper would be a Word-hinted id read as a byte buffer.
+                    let phint = ann
+                        .and_then(type_hint_from_annotation)
+                        .unwrap_or(TypeHint::Word);
+                    self.declare(p, phint, class_name, f.span);
                 }
                 let body_hint = self.type_of(&f.body);
                 let body_class = self.class_of_expr(&f.body);
@@ -997,12 +1001,12 @@ impl Sema {
                 self.declare(&r.name, TypeHint::Function, None, r.span);
                 self.push_scope();
                 for (idx, p) in r.params.iter().enumerate() {
-                    let class_name = r
-                        .param_annotations
-                        .get(idx)
-                        .and_then(|a| a.as_deref())
-                        .and_then(|a| self.class_name_from_annotation(a));
-                    self.declare(p, TypeHint::Word, class_name, r.span);
+                    let ann = r.param_annotations.get(idx).and_then(|a| a.as_deref());
+                    let class_name = ann.and_then(|a| self.class_name_from_annotation(a));
+                    let phint = ann
+                        .and_then(type_hint_from_annotation)
+                        .unwrap_or(TypeHint::Word);
+                    self.declare(p, phint, class_name, r.span);
                 }
                 self.analyze_stmt(&r.body);
                 self.pop_scope();
@@ -1136,8 +1140,14 @@ impl Sema {
             // for an owned-String producer — a String-typed function call
             // such as `LET s = JOIN(...)` (a +1 NSString id). String
             // literals (not a Call) and bare copies stay non-owning.
+            // Only NEW and the known +1 String builtin (JOIN) create an
+            // owned value; a user String-returning call may be a borrow,
+            // so it is NOT owned (matches the lowerer's
+            // is_owned_alloc_producer — keep them in lock-step).
             let owns_alloc = matches!(expr, Expr::New { .. })
-                || (matches!(hint, TypeHint::String) && matches!(expr, Expr::Call { .. }));
+                || (matches!(hint, TypeHint::String)
+                    && matches!(expr, Expr::Call { callee, .. }
+                        if matches!(callee.as_ref(), Expr::Ident { name, .. } if name == "JOIN")));
             if owns_alloc {
                 if let Some(top) = self.scopes.last_mut() {
                     if let Some(b) = top.get_mut(name) {
@@ -1210,12 +1220,12 @@ impl Sema {
                     method.span,
                 );
                 for (idx, p) in method.params.iter().enumerate() {
-                    let class_name = method
-                        .param_annotations
-                        .get(idx)
-                        .and_then(|a| a.as_deref())
-                        .and_then(|a| self.class_name_from_annotation(a));
-                    self.declare(p, TypeHint::Word, class_name, method.span);
+                    let ann = method.param_annotations.get(idx).and_then(|a| a.as_deref());
+                    let class_name = ann.and_then(|a| self.class_name_from_annotation(a));
+                    let phint = ann
+                        .and_then(type_hint_from_annotation)
+                        .unwrap_or(TypeHint::Word);
+                    self.declare(p, phint, class_name, method.span);
                 }
                 // Mark this body as "inside class c" so visibility
                 // checks can answer "where is this access from?".
@@ -1624,17 +1634,24 @@ impl Sema {
             // with a clear migration hint. Byte buffers (`%` on a VEC)
             // are unaffected.
             if let Expr::Binary {
-                op: BinaryOp::CharSubscript,
+                op: op @ (BinaryOp::CharSubscript | BinaryOp::Subscript | BinaryOp::FloatSubscript),
                 lhs,
                 span,
                 ..
             } = t
             {
                 if self.type_of(lhs) == TypeHint::String {
+                    let how = if matches!(op, BinaryOp::CharSubscript) {
+                        "`s % i`"
+                    } else {
+                        "`s ! i` / `s !# i`"
+                    };
                     self.error(
-                        "cannot assign to `s % i` on a String — NSStrings are \
-                         immutable; build a new string, or use a byte VEC for \
-                         mutable character storage",
+                        format!(
+                            "cannot assign to {how} on a String — NSStrings are \
+                             immutable; build a new string, or use a byte VEC for \
+                             mutable character storage"
+                        ),
                         *span,
                     );
                 }
@@ -1931,6 +1948,24 @@ impl Sema {
                 }
                 let lhs_hint = self.type_of(lhs);
                 let rhs_hint = self.type_of(rhs);
+                // A String is an immutable NSString object, not a
+                // word/float vector — reject `s ! i` / `s !# i` (read).
+                // `s % i` (the i-th byte) is the supported form. Without
+                // this the id would be dereferenced as a raw word vector
+                // (SIGSEGV on a tagged pointer, garbage on a heap string).
+                if matches!(op, BinaryOp::Subscript | BinaryOp::FloatSubscript)
+                    && lhs_hint == TypeHint::String
+                    && !self.errors.iter().any(|e| {
+                        e.span == *dot_span && e.message.starts_with("cannot use `!`")
+                    })
+                {
+                    self.error(
+                        "cannot use `!` / `!#` subscript on a String — a String is \
+                         an immutable NSString object, not a word/float vector; use \
+                         `s % i` for the i-th byte, or a VEC for indexable storage",
+                        *dot_span,
+                    );
+                }
                 self.binary_result(*op, lhs_hint, rhs_hint, lhs, rhs)
             }
             Expr::Conditional {
@@ -2779,6 +2814,32 @@ mod tests {
         assert!(
             out.errors.iter().any(|e| e.message.contains("NSStrings are")),
             "expected an immutable-string error on `s % i := c`; got {:?}",
+            out.errors
+        );
+    }
+
+    #[test]
+    fn string_word_subscript_read_is_rejected() {
+        // `s ! i` (read) on a String is a hard error — a String is an
+        // immutable NSString object, not a word vector.
+        let out = analyze_str("LET START() BE $( LET s = \"abc\"\n WRITEN(s ! 0) $)\n");
+        assert!(
+            out.errors.iter().any(|e| e.message.contains("`!` / `!#` subscript on a String")),
+            "expected a word-subscript error on `s ! i`; got {:?}",
+            out.errors
+        );
+    }
+
+    #[test]
+    fn string_param_annotation_gives_string_hint() {
+        // `AS STRING` on a parameter must propagate TypeHint::String so
+        // `%`/LEN dispatch reaches the NSString helpers (not a byte deref).
+        let out = analyze_str(
+            "LET f(s AS STRING) = LEN s\nLET START() BE $( WRITEN(f(\"hi there friend\")) $)\n",
+        );
+        assert!(
+            out.errors.is_empty(),
+            "AS STRING param should analyze cleanly; got {:?}",
             out.errors
         );
     }

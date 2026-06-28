@@ -123,3 +123,53 @@ fn loop_owned_strings_no_crash() {
         "done",
     );
 }
+
+// ─── Implementation-review regression probes (use >11-byte HEAP strings,
+// not short tagged pointers, so over-release/raw-deref bugs actually fire)
+
+/// REVIEW #1: a String-returning function that returns a BORROWED immortal
+/// literal, bound to several locals. Must not be treated as a +1 producer
+/// (that over-released the shared immortal → UAF/SIGSEGV). Heap-backed.
+#[test]
+fn string_returning_fn_borrow_no_crash() {
+    expect(
+        "str_fn_borrow",
+        "LET NM() = \"a long heap-backed literal over eleven bytes\"\nLET START() BE $(\n  LET a = NM()\n  LET b = NM()\n  LET c = NM()\n  WRITES(a)\n  WRITES(b)\n  WRITES(c)\n$)\n",
+        "a long heap-backed literal over eleven bytesa long heap-backed literal over eleven bytesa long heap-backed literal over eleven bytes",
+    );
+}
+
+/// REVIEW #2/#4: pass a string into a helper that scans `s % i` and `LEN s`
+/// via an `AS STRING` param (String hint propagates → char-fetch dispatch).
+/// Heap string → previously a raw byte/VEC deref crash.
+#[test]
+fn string_param_scan_via_annotation() {
+    expect(
+        "str_param_scan",
+        "LET upper(s AS STRING) = VALOF $(\n  LET n = 0\n  FOR i = 0 TO LEN(s) - 1 DO IF (s % i) >= 65 & (s % i) <= 90 THEN n := n + 1\n  RESULTIS n\n$)\nLET START() BE $(\n  WRITEN(upper(\"Hello Wonderful World\"))\n$)\n",
+        "3",
+    );
+}
+
+/// REVIEW #4: a string pulled from a list (HD → Word-hinted) then LEN'd.
+/// The tagged-pointer-safe `__newbcpl_len` returns the byte length instead
+/// of dereferencing the non-canonical id → SIGSEGV.
+#[test]
+fn string_from_list_len_no_crash() {
+    expect(
+        "str_hd_len",
+        "LET START() BE $(\n  LET xs = LIST(\"Hello\")\n  LET h = HD xs\n  WRITEN(LEN h)\n$)\n",
+        "5",
+    );
+}
+
+/// REVIEW #5: assigning a non-object word into an owned-String slot must
+/// not `retain`/`release` a bogus pointer. Heap-backed initial value.
+#[test]
+fn assign_int_to_owned_string_no_crash() {
+    expect(
+        "str_assign_int",
+        "LET START() BE $(\n  LET s = JOIN(LIST(\"long enough\", \" to be heap\"), \"\")\n  WRITES(s)\n  s := 42\n  WRITES(\" after\")\n$)\n",
+        "long enough to be heap after",
+    );
+}

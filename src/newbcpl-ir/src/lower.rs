@@ -2737,9 +2737,19 @@ impl<'a> Lowerer<'a> {
             self.b().emit(Instr::Call {
                 dst: Some(dst),
                 callee: Value::Function("bcpl_str_char".to_string()),
-                args: vec![s, idx],
+                args: vec![s.clone(), idx],
                 hint: TypeHint::Int,
             });
+            // Anonymous owned-string temp: `JOIN(...) % i` has no binding;
+            // the byte result is an Int, so release the operand after use.
+            if is_owned_alloc_producer(lhs) {
+                self.b().emit(Instr::Call {
+                    dst: None,
+                    callee: Value::Function("bcpl_str_release".to_string()),
+                    args: vec![s],
+                    hint: TypeHint::Word,
+                });
+            }
             return Value::Local(dst);
         }
         // Subscript family: `v ! i` / `v % i` / `v .% i` lower to
@@ -2885,9 +2895,21 @@ impl<'a> Lowerer<'a> {
             self.b().emit(Instr::Call {
                 dst,
                 callee: Value::Function(runtime_name.to_string()),
-                args: vec![arg],
+                args: vec![arg.clone()],
                 hint,
             });
+            // Anonymous owned-string temp: `LEN(JOIN(...))` produces a +1
+            // NSString with no binding to release it. The LEN result is an
+            // Int, so nothing downstream owns it — release the operand here,
+            // after the length read.
+            if matches!(op, UnaryOp::Len) && is_owned_alloc_producer(operand) {
+                self.b().emit(Instr::Call {
+                    dst: None,
+                    callee: Value::Function("bcpl_str_release".to_string()),
+                    args: vec![arg],
+                    hint: TypeHint::Word,
+                });
+            }
             return match dst {
                 Some(d) => Value::Local(d),
                 None => Value::Unit,
@@ -3530,9 +3552,30 @@ fn collect_field_initialisers(c: &ClassDecl) -> Vec<(String, &Expr)> {
 fn is_owned_alloc_producer(e: &Expr) -> bool {
     match e {
         Expr::New { .. } => true,
-        Expr::Call { .. } => matches!(e.hint(), TypeHint::String),
+        // Only a KNOWN +1 String builtin transfers a fresh reference.
+        // A user String-returning function may return a BORROW (a cached
+        // immortal literal, a parameter, a global), so treating every
+        // String-typed call as +1 would make the caller over-release the
+        // borrow -> dealloc -> use-after-free. Conservative: just JOIN.
+        // (A user factory that genuinely returns a +1 leaks instead — the
+        // same already-deferred call-return-ownership edge as for NEW.)
+        Expr::Call { callee, .. } => {
+            matches!(e.hint(), TypeHint::String)
+                && matches!(
+                    callee.as_ref(),
+                    Expr::Ident { name, .. } if is_plus_one_string_builtin(name)
+                )
+        }
         _ => false,
     }
+}
+
+/// Runtime builtins that return a freshly-allocated (+1) NSString id the
+/// caller owns (must release). User functions are NOT here — their result
+/// ownership is unknown, so they are treated as borrows (see
+/// `is_owned_alloc_producer`).
+fn is_plus_one_string_builtin(name: &str) -> bool {
+    matches!(name, "JOIN")
 }
 
 fn unary_runtime_helper(op: UnaryOp) -> Option<&'static str> {

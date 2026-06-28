@@ -357,10 +357,25 @@ pub unsafe extern "C-unwind" fn bcpl_objc_alloc_init(cls: *mut c_void) -> *mut c
     send0(obj, reg_sel(c"init".as_ptr()))
 }
 
+/// Could `p` be a real heap Obj-C object id? A heap object is at least
+/// 8-byte aligned and well above the zero page. This REJECTS: small
+/// integers (a BCPL Word mistakenly stored into a managed slot —
+/// `s := 42`), misaligned garbage, AND tagged-pointer NSStrings (whose
+/// `retain`/`release` are no-ops anyway). It is the guard that keeps the
+/// typeless BCPL ABI from turning a stray non-object word into an
+/// `objc_msgSend` on a bogus pointer (SIGSEGV). Conservative: a non-objc
+/// heap pointer (e.g. a raw VEC) still passes, but that only arises from
+/// genuine type confusion the language can't prevent.
+#[inline]
+fn is_objc_pointer(p: *mut c_void) -> bool {
+    let a = p as usize;
+    a >= 0x1000 && (a & 0x7) == 0
+}
+
 /// Send `release` to an object (BCPL `RELEASE` / end of `USING`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn bcpl_objc_release(obj: *mut c_void) {
-    if obj.is_null() {
+    if !is_objc_pointer(obj) {
         return;
     }
     let reg_sel = sym_or_null("sel_registerName");
@@ -377,8 +392,10 @@ pub unsafe extern "C-unwind" fn bcpl_objc_release(obj: *mut c_void) {
 /// Send `retain` to an object (BCPL `RETAIN`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn bcpl_objc_retain(obj: *mut c_void) -> *mut c_void {
-    if obj.is_null() {
-        return std::ptr::null_mut();
+    if !is_objc_pointer(obj) {
+        // Not a real object (small int / misaligned / tagged) — pass the
+        // word through unchanged; retaining it would crash or be a no-op.
+        return obj;
     }
     let reg_sel = sym_or_null("sel_registerName");
     let msg_send = sym_or_null("objc_msgSend");

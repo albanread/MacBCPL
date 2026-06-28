@@ -1022,6 +1022,21 @@ pub unsafe extern "C-unwind" fn __newbcpl_len(p: *const i64) -> i64 {
     if p.is_null() {
         return 0;
     }
+    // A VEC stores its length one word before the data pointer. But a
+    // String (NSString id) can reach LEN through an untyped (Word-hinted)
+    // slot — HD of a list, an object field, a VEC cell, an un-annotated
+    // parameter — where static dispatch can't pick `bcpl_str_len`. An
+    // arm64 tagged-pointer NSString (short ASCII) is NEVER a real VEC
+    // (VECs are aligned heap pointers with bit 63 clear), and reading
+    // `p[-1]` on its non-canonical bits would fault. So detect the tagged
+    // bit and route those to the UTF-8 byte length — turning a crash into
+    // the correct answer for the common short-string case.
+    #[cfg(not(windows))]
+    {
+        if (p as usize) & (1usize << 63) != 0 {
+            return unsafe { crate::objc::bcpl_str_len(p as *mut core::ffi::c_void) };
+        }
+    }
     unsafe { *p.offset(-1) }
 }
 
