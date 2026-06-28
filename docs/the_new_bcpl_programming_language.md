@@ -192,8 +192,10 @@ ground truth.
 
 ### 1.4 Strings and characters
 
-A string literal `"…"` is a pointer to a run of bytes. A character literal is
-in single quotes, and the `*`-escapes apply in both:
+A string literal `"…"` is a **Cocoa text object** — an `NSString`, not a raw
+array of bytes (Chapter 9 tells the full story; it matters because a "character"
+is a Unicode code point, not a byte). A character literal is in single quotes,
+and the `*`-escapes apply in both:
 
 ```bcpl
 LET START() BE $(
@@ -304,8 +306,9 @@ it that the compiler tracks as hints:
 |----------------|---------------------|
 | integer | a signed 64-bit value |
 | float | the bits of an IEEE double |
-| pointer / string | a memory address; `?` is the null word, 0 |
-| character | a small integer code |
+| pointer | a memory address; `?` is the null word, 0 |
+| string | a handle to a Cocoa `NSString` object (Chapter 9) |
+| character | a small integer — a Unicode code point |
 | boolean | `TRUE` (1) or `FALSE` (0) |
 
 A variable does not have a fixed type you declare; the value in it is just a
@@ -331,8 +334,9 @@ Floating constants have a decimal point or an exponent: `3.14`, `0.5`, `1e10`,
 `6.022e23`, `2E-3`. A point must have a digit after it, so `3.` is not a float —
 write `3.0`.
 
-Character constants are one byte in single quotes, escapes allowed: `'a'`,
-`'0'`, `'*N'`, `'*''`. String constants are in double quotes: `"abc*N"`. The
+Character constants are one code point in single quotes, escapes allowed: `'a'`,
+`'0'`, `'*N'`, `'*''`. String constants are in double quotes: `"abc*N"` — and
+each is a Cocoa `NSString` object, not a byte array (Chapter 9). The
 null/uninitialized value is `?`. The booleans are `TRUE` and `FALSE`.
 
 Names for constants are made with **MANIFEST**, whose values are substituted at
@@ -707,14 +711,18 @@ LET p = @x          // p points at x
 WRITEN(x)           // 20
 ```
 
-`%` is the *byte* indirection operator — `%p` is the byte at `p`, useful for
-walking strings, which are byte-addressed.
+`%` is the *byte* indirection operator — `%p` is the byte at address `p`, for
+stepping through raw memory and byte vectors. (On a string `%` means something
+else entirely: `s % i` is the i-th *character* — a Unicode code point — because
+strings are Cocoa objects, not byte arrays. See Chapter 9.)
 
 ### 5.2 Subscripting is indirection
 
 `v!i` is exactly `!(v + i)` — the word `i` words past `v`. It is an lvalue, so
 it works on both sides of `:=`. The byte subscript `v%i` reads or writes the
-`i`-th byte; `v.%i` indexes a float vector.
+`i`-th byte of a memory block; `v.%i` indexes a float vector. (When the left
+operand is a *string*, `s%i` is a character rather than a byte, and is read-only
+— Chapter 9.)
 
 ```bcpl
 LET v = VEC 100
@@ -1145,6 +1153,226 @@ collector and without a single `free`.
 
 ---
 
+# Part II — Cocoa
+
+*The chapters so far describe New BCPL as a language. This part describes it as a
+**macOS language** — one whose values are, where it counts, Cocoa objects, so
+that a BCPL program is a citizen of the Objective-C runtime and, in time, of the
+Apple frameworks.*
+
+The foundation was laid in Chapter 7: a `CLASS` instance is a real Objective-C
+object, allocated by the runtime, dispatched by `objc_msgSend`, freed by
+retain/release. This part takes up the Cocoa **types and facilities** that build
+on that foundation. It begins with the one every program already uses without
+thinking about it — the string — which is now an `NSString`. The graphical side
+(windows and drawing over Cocoa/AppKit) is being built on the same bridge and
+will be documented here as it lands.
+
+---
+
+## Chapter 9. Strings
+
+In old BCPL a string was a packed vector of bytes, and you walked it byte by
+byte. In New BCPL on macOS a string is a **Cocoa `NSString`** — a real
+Objective-C text object. You have been using them since Chapter 0; this chapter
+says what they are.
+
+The change buys three things: correct Unicode (a "character" is a code point, so
+accents and emoji are single characters, not byte fragments), automatic
+memory management on the same model as every other object, and a path to the
+Cocoa frameworks, which speak `NSString` everywhere.
+
+### 9.1 A string is an object
+
+The value of `"hello"` is an `NSString` pointer — the same kind of word that
+`NEW SomeClass()` yields. Everything Chapter 7 said about object identity and
+lifetime therefore applies to strings, with one simplification: strings are
+**immutable**. You never change a string in place; you build a new one.
+
+```bcpl
+LET s = "hello, world*N"
+WRITES(s)                  // the object's text, to standard output
+```
+
+`WRITES` writes a string; `WRITEF`'s `%s` splices one into formatted output:
+
+```bcpl
+WRITEF("name=%s  n=%d*N", "Ada", 42)      // name=Ada  n=42
+```
+
+### 9.2 Literals are immortal, and shared
+
+A string literal is created once and lives for the whole run — it is *immortal*.
+Equal literals share one object, so identity comparison does the obvious thing:
+
+```bcpl
+LET a = "hello"
+WRITES(a = "hello" -> "same*N", "diff*N")    // same
+WRITES(a = "world" -> "same*N", "diff*N")    // diff
+```
+
+Because a literal is immortal, binding it, copying it, and letting it fall out
+of scope cost nothing; there is no release to do.
+
+Note that `=` on strings compares *identity*, not contents. For literals that is
+the same thing (equal literals are one object), but two strings built
+independently at run time may hold the same text and still compare unequal.
+Content comparison is not yet a built-in.
+
+### 9.3 Characters are code points
+
+This is the substantive change from classic BCPL, so it deserves a clear
+statement: **`s % i` is the i-th Unicode code point of `s`, and `LEN(s)` is the
+number of code points** — not bytes, not UTF-16 units.
+
+```bcpl
+LET s = "café"
+WRITEN(LEN(s))             // 4   — four characters
+WRITEN(s % 3)              // 233 — U+00E9, the 'é'
+```
+
+`WRITEC` is the inverse: it takes a code point and writes its UTF-8 encoding, so
+the canonical loop reconstructs any string, accents and emoji included:
+
+```bcpl
+LET s = "★😀"
+WRITEN(LEN(s))             // 2 — two characters, though many bytes
+FOR i = 0 TO LEN(s) - 1 DO WRITEC(s % i)     // prints  ★😀
+NEWLINE()
+```
+
+Here `s % 1` is `128512` (U+1F600) — one integer for the whole emoji, not a
+broken pair of bytes. Indexing past the end, or indexing the empty string,
+yields 0.
+
+`s % i` is read-only. Strings are immutable, so an assignment to it is rejected
+at compile time:
+
+```bcpl
+s % 0 := 'H'
+// sema error: cannot assign to `s % i` on a String — NSStrings are
+// immutable; build a new string, or use a byte VEC for mutable storage
+```
+
+When you genuinely need mutable character storage, use a byte vector
+(`GETVEC` and `%`), and build a string from it when you are done.
+
+### 9.4 Building strings
+
+Since you cannot mutate a string, you assemble text by **building a new one**.
+The primitive is `JOIN`, which concatenates a list of strings with a separator
+between them:
+
+```bcpl
+LET parts = LIST("foo", "bar", "baz")
+LET path  = JOIN(parts, "-")
+WRITES(path)               // foo-bar-baz
+```
+
+Plain concatenation is `JOIN(LIST(a, b), "")`. There is, deliberately, no `+`
+operator on strings — `+` is integer addition, and overloading it on text
+objects would invite exactly the type confusion the typeless word already asks
+you to avoid.
+
+A string `JOIN` builds is a *fresh, owned* object — which brings us to lifetime.
+
+### 9.5 String lifetime
+
+Strings obey the Cocoa stack-scope rules of §7.6, specialized by whether the
+string is a literal or freshly built:
+
+- **Literals are immortal** — never owned, never released, free to pass around.
+- **A built string** (the result of `JOIN`) is **owned**, and is released
+  automatically when its binding goes out of scope, exactly like a scope-local
+  `NEW` object:
+
+  ```bcpl
+  LET report() BE $(
+      LET line = JOIN(LIST("x=", "y="), " ")
+      WRITES(line)
+  $)                         // `line` released here, automatically
+  ```
+
+- **USING** disposes a built string deterministically at block exit:
+
+  ```bcpl
+  USING msg = JOIN(parts, ", ") DO WRITES(msg)
+  ```
+
+- **Escape transfers ownership.** A built string returned with `RESULTIS`,
+  stored in an outer or global variable, consed into a list, or marked `RETAIN`
+  is not released in the scope that produced it — the receiver inherits it.
+
+- **Reassignment is safe.** Overwriting a binding that owns a built string
+  releases the old object and retains the new one, so a loop that rebuilds a
+  string each pass does not leak:
+
+  ```bcpl
+  LET acc = ""
+  FOR i = 1 TO n DO
+      acc := JOIN(LIST(acc, item(i)), ",")   // previous `acc` released each pass
+  ```
+
+As always the bias is toward never crashing: assigning a non-string word into a
+string-typed binding does not attempt to release it, and the runtime's
+retain/release calls are guarded so a stray integer can never be mistaken for an
+object and sent a message.
+
+One edge mirrors the object rule of §7.6: a string returned from an ordinary
+*call* (not a literal, not a direct `JOIN`) is treated as borrowed and not
+auto-released, since its ownership is unknown. If such a value is genuinely
+yours to free, bind it with `USING`.
+
+### 9.6 Passing strings through untyped places
+
+Because a string is just a word, it can travel through an un-annotated
+parameter, a list cell, or an object field, where the compiler has lost track of
+its type. Operations that must know it is a string — `LEN`, `%`, `WRITES` — stay
+safe at run time (the runtime recognizes a string handle and does the right
+thing), but you get sharper code, and earlier checking, by annotating with
+`AS STRING`:
+
+```bcpl
+LET initials(s AS STRING) = VALOF $(
+    LET n = 0
+    FOR i = 0 TO LEN(s) - 1 DO
+        IF (s % i) >= 'A' & (s % i) <= 'Z' THEN n := n + 1
+    RESULTIS n
+$)
+```
+
+### 9.7 What is not here yet
+
+A string *is* an `NSString`, but the bridge that lets you call arbitrary Cocoa
+methods on one is not yet wired: a BCPL method call mangles its selector (§7.7),
+so `s.length()` sends `bcpl_length`, which `NSString` does not answer, and the
+program raises an Objective-C *unrecognized selector* exception. Calling Cocoa's
+own methods on a string — `length`, `compare:`, `uppercaseString`, and the rest
+— waits on the raw-selector escape hatch noted in §7.7. Until then, use the
+BCPL built-ins (`LEN`, `%`, `WRITES`, `WRITEF`, `JOIN`) for text work; they are
+code-point-correct, which the raw Cocoa methods (UTF-16-based) are not.
+
+> **Under the hood.** A literal's bytes are cooked at compile time (escapes
+> resolved to UTF-8) and the `NSString` is built once, on first use, with
+> `[[NSString alloc] initWithUTF8String:]` and cached forever — that is what
+> "immortal" means. Short ASCII strings become *tagged pointers* (Apple encodes
+> the characters in the pointer bits); the runtime detects these and never
+> dereferences them. `LEN` and `s % i` decode UTF-8 to code points once and
+> memoize the result per string, so an indexing loop is O(n), not O(n²) of
+> repeated Objective-C calls; the memo is dropped when a string is released so a
+> recycled address can never serve stale text.
+
+> **Exercise 9-1.** Write `reverse(s AS STRING)` returning a new string with the
+> code points of `s` in reverse order. Build it with `WRITEC` into output first,
+> then (harder) return an actual reversed string. What gets awkward without
+> string mutation, and how does that push you toward `JOIN`?
+>
+> **Exercise 9-2.** Write `count(s, c)` returning how many times code point `c`
+> occurs in `s`. Test it on `"mississippi"` and on a string with an emoji, to
+> convince yourself the unit of counting is the character, not the byte.
+
+---
+
 ## Appendix A — Lexical Reference
 
 ### A.1 Keywords
@@ -1224,7 +1452,7 @@ float results are IEEE doubles.
 |------|--------|
 | `WRITES(s)` | write a string |
 | `WRITEN(n)` | write an integer in decimal |
-| `WRITEC(c)` | write one character (low byte of `c`) |
+| `WRITEC(c)` | write one character — `c` is a Unicode code point, encoded UTF-8 |
 | `FWRITE(x)` | write a float |
 | `NEWLINE()` | write a line break |
 | `WRITEF(fmt, …)` | formatted write; specifiers `%d %x %X %o %c %s %f %%` |
@@ -1279,7 +1507,6 @@ float results are IEEE doubles.
 | Call | Result |
 |------|--------|
 | `SUM(v1, v2)` | element-wise sum of two vectors → new vector |
-| `JOIN(list, sep)` | join list elements into a string |
 | `PAIRWISE_MIN/MAX/ADD(p)` | reduce a pack's lanes to a scalar |
 | `TIMER_START()` | a monotonic timestamp (ns) |
 | `TIMER_END(t)` | elapsed ns since `t` |
@@ -1287,6 +1514,25 @@ float results are IEEE doubles.
 | `SLEEP(ms)` | pause |
 | `HEAP_INFO()` | print allocator statistics |
 | `GC()` | request collection (no-op in the no-GC model) |
+
+### B.7 Strings (NSString)
+
+A string is a Cocoa `NSString` (Chapter 9). Characters are Unicode code points.
+
+| Call / form | Result |
+|------|--------|
+| `"…"` | an immortal `NSString` literal (escapes cooked at compile time) |
+| `s % i` | the i-th character of `s`, as a code point (read-only); 0 past the end |
+| `LEN(s)` | number of code points in `s` |
+| `WRITES(s)` | write `s`'s text |
+| `WRITEF("…%s…", s)` | splice `s` into formatted output |
+| `WRITEC(c)` | write code point `c` as UTF-8 |
+| `JOIN(list, sep)` | build a new (owned) string from a list of strings + separator |
+| `=` `~=` | compare string *identity* (equal literals share one object) |
+
+Built (`JOIN`ed) strings follow the same Cocoa ownership as objects: released at
+scope exit, or with `USING`; ownership transferred on escape. Literals are
+immortal. Strings are immutable — there is no in-place edit and no `+`.
 
 ---
 
