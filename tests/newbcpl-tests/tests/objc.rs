@@ -81,6 +81,22 @@ fn multi_keyword_send() {
     );
 }
 
+/// DB-backed synthesis: a selector on a class the bundled 40-class JSON does
+/// NOT cover (`NSProcessInfo.activeProcessorCount`) synthesizes to Int from
+/// the live cocoa.sqlite mirror — no annotation. Gated on `COCOA_SQLITE`
+/// (skips when the DB isn't configured; the env is inherited by the driver).
+#[test]
+fn db_synthesizes_non_json_selector() {
+    if std::env::var("COCOA_SQLITE").is_err() {
+        return; // DB not configured — covered by running the suite with COCOA_SQLITE set
+    }
+    expect(
+        "objc_db_nonjson",
+        "LET START() BE $(\n  WRITEN([[NSProcessInfo processInfo] activeProcessorCount] > 0)\n$)\n",
+        "1",
+    );
+}
+
 // ─── Tier B: struct returns materialized as vectors ─────────────────
 
 /// NSRange return (DB tag N) -> a 2-word VEC via the arm64 integer-pair

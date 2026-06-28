@@ -34,3 +34,21 @@ Run with:
   `cocoa-window.bcl` uses the default size and `center` (no struct arg).
 - The console demos run anywhere; the UI demos need a desktop session to
   display (headless, the event loop / `runModal` return immediately).
+
+## Whole-ecosystem type synthesis (`COCOA_SQLITE`)
+
+By default the compiler synthesizes return/argument types from a bundled
+selector table covering ~40 common classes. Point it at the shared
+[`cocoa_data`](../../cocoa_data) SQLite mirror to cover the **entire**
+Obj-C surface (26k classes, every method's encoding), class-aware:
+
+```sh
+COCOA_SQLITE=/path/to/cocoa_data/cocoa.sqlite ./newbcpl-driver run prog.bcl
+```
+
+With it set, selectors on any class — e.g. `[[NSProcessInfo processInfo]
+activeProcessorCount]` — get their types (Int/Float/struct) without an
+`AS Type` annotation. Without it, the bundled table is used and unknown
+selectors default to `id` (annotate with `AS Type` as needed). Signatures
+are derived on demand by parsing the runtime `@encode`, so it's a drop-in
+upgrade — no rebuild, just the env var.

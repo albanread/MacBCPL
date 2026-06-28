@@ -88,7 +88,7 @@ fn static_vec_count(e: &Expr) -> Option<usize> {
 /// (they stay scalar/Object until the Tier-C wrapper-class path lands) — so
 /// only the ABI-exact all-f64 / all-64-bit-int shapes take the vector path.
 fn objc_geometry_struct(selector: &str) -> Option<(u32, bool)> {
-    geometry_shape_of(cocoa_db().ret_of(selector).unwrap_or(""))
+    geometry_shape_of(&cocoa_db().ret_of(selector).unwrap_or_default())
 }
 
 /// Map a geometry kind token (`R`/`P`/`S`/`N`) to `(field_count, is_float)`.
@@ -111,7 +111,7 @@ fn objc_message_ret_hint(selector: &str, ret_annotation: Option<&str>) -> TypeHi
     if let Some(h) = ret_annotation.and_then(type_hint_from_annotation) {
         return h;
     }
-    match cocoa_db().ret_of(selector) {
+    match cocoa_db().ret_of(selector).as_deref() {
         Some("i") | Some("u") | Some("B") => TypeHint::Int,
         Some("d") => TypeHint::Float,
         Some("R") | Some("P") | Some("S") => TypeHint::FVec,
