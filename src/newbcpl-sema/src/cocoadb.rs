@@ -259,8 +259,24 @@ mod tests {
         assert_eq!(parse_method_encoding("d16@0:8"), ('d', String::new()));
         // an id getter
         assert_eq!(parse_method_encoding("@16@0:8"), ('@', String::new()));
-        // NSRange by shape (anonymous): {?=QQ}
-        assert_eq!(parse_method_encoding("{?=QQ}16@0:8"), ('N', String::new()));
+        // NSRange by NAME: {_NSRange=QQ} (real runtime form).
+        assert_eq!(parse_method_encoding("{_NSRange=QQ}16@0:8"), ('N', String::new()));
+        // An anonymous {?=...} is NOT inferred as geometry (avoids the
+        // cross-class clearColor mis-vote) -> complex struct kind.
+        assert_eq!(parse_method_encoding("{?=dddd}16@0:8"), ('{', String::new()));
+        // Obj-C block arg `@?` is ONE id arg, not id + phantom struct.
+        assert_eq!(
+            parse_method_encoding("v56@0:8@?16{CGRect={CGPoint=dd}{CGSize=dd}}24"),
+            ('v', "@R".to_string())
+        );
+        // Block return + trailing-block forms keep the cursor aligned.
+        assert_eq!(parse_method_encoding("v24@0:8@?16"), ('v', "@".to_string()));
+        assert_eq!(parse_method_encoding("@?16@0:8"), ('@', String::new()));
+        // Typed object arg `@"NSString"` is one id arg.
+        assert_eq!(
+            parse_method_encoding("v24@0:8@\"NSString\"16"),
+            ('v', "@".to_string())
+        );
         // NSPoint by name as an arg: setFrameOrigin: -> v, arg P
         assert_eq!(
             parse_method_encoding("v36@0:8{CGPoint=dd}16"),
@@ -407,6 +423,27 @@ impl<'a> EncParser<'a> {
                 self.skip_number();
                 Ty::Other // bitfield
             }
+            Some(b'@') => {
+                self.bump();
+                // An object type may carry a suffix that is PART of this one
+                // type and must be consumed so it isn't re-parsed as the next
+                // arg: `@?` (block), `@"NSString"` (typed), `@<NSCopying>`
+                // (protocol-qualified). ~9k selectors use `@?`.
+                match self.peek() {
+                    Some(b'?') => {
+                        self.bump();
+                    }
+                    Some(b'"') => self.skip_quoted(),
+                    Some(b'<') => {
+                        while !matches!(self.peek(), None | Some(b'>')) {
+                            self.i += 1;
+                        }
+                        self.bump();
+                    }
+                    _ => {}
+                }
+                Ty::Scalar('@')
+            }
             None => Ty::Other,
             Some(c) => {
                 self.bump();
@@ -455,28 +492,6 @@ impl<'a> EncParser<'a> {
     }
 }
 
-/// Flatten a struct's leaf scalar codes (recursing nested structs). Returns
-/// None if any leaf isn't a plain scalar/ptr (union/array/bitfield/unknown).
-fn flatten_leaves(ty: &Ty, out: &mut Vec<char>) -> Option<()> {
-    match ty {
-        Ty::Scalar(c) => {
-            out.push(*c);
-            Some(())
-        }
-        Ty::Ptr => {
-            out.push('@');
-            Some(())
-        }
-        Ty::Struct { fields, .. } => {
-            for f in fields {
-                flatten_leaves(f, out)?;
-            }
-            Some(())
-        }
-        Ty::Other => None,
-    }
-}
-
 /// Map a parsed top-level type to a kind char in the selector vocabulary.
 fn type_kind(ty: &Ty) -> char {
     match ty {
@@ -491,30 +506,21 @@ fn type_kind(ty: &Ty) -> char {
         Ty::Ptr => '@',
         Ty::Other => '{',
         Ty::Struct { name, .. } => {
-            // Geometry by NAME first (runtime encodings carry names).
-            if let Some(n) = name {
-                match n.as_str() {
-                    "CGRect" | "NSRect" => return 'R',
-                    "CGPoint" | "NSPoint" => return 'P',
-                    "CGSize" | "NSSize" => return 'S',
-                    "NSRange" | "_NSRange" | "CFRange" => return 'N',
-                    _ => {}
-                }
+            // Geometry by NAME only. Runtime encodings carry the real names
+            // (`{CGRect=…}`, `{_NSRange=QQ}`), so this catches the genuine
+            // cases. We deliberately do NOT infer geometry from an anonymous
+            // `{?=…}` SHAPE: across-class aggregation would then let an
+            // unrelated `{?=dddd}` outvote a real `@` id return (e.g.
+            // `clearColor`) and break the ABI. Resolving an anonymous shape
+            // to its named struct (via cocoa_data's structs.shape) is the
+            // receiver-class-exact follow-up.
+            match name.as_deref() {
+                Some("CGRect") | Some("NSRect") => 'R',
+                Some("CGPoint") | Some("NSPoint") => 'P',
+                Some("CGSize") | Some("NSSize") => 'S',
+                Some("NSRange") | Some("_NSRange") | Some("CFRange") => 'N',
+                _ => '{',
             }
-            // Else by SHAPE: a flat homogeneous all-double struct of 2 or 4
-            // leaves is Point/Size/Rect-shaped; 2 word leaves is Range-shaped.
-            let mut leaves = Vec::new();
-            if flatten_leaves(ty, &mut leaves).is_some() {
-                let all_d = leaves.iter().all(|&c| c == 'd');
-                let all_w = leaves.iter().all(|&c| matches!(c, 'q' | 'Q'));
-                match (leaves.len(), all_d, all_w) {
-                    (4, true, _) => return 'R',
-                    (2, true, _) => return 'P', // P/S both -> FVec(2)
-                    (2, _, true) => return 'N',
-                    _ => {}
-                }
-            }
-            '{'
         }
     }
 }
