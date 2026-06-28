@@ -367,6 +367,49 @@ pub unsafe extern "C-unwind" fn bcpl_objc_field_base(obj: *mut c_void) -> *mut c
     unsafe { (obj as *mut u8).offset(off) as *mut c_void }
 }
 
+/// Base pointer of the field block belonging to a SPECIFIC class in the
+/// receiver's inheritance chain, identified by that class's unique ivar
+/// name (e.g. "__bcpl_Base"). This is what makes per-class field
+/// composition correct: a method defined on `Base`, running on a `Sub`
+/// instance, must read `Base`'s fields from `Base`'s ivar — NOT the
+/// most-derived ivar that `bcpl_objc_field_base` would find.
+///
+/// `class_getInstanceVariable(object_getClass(obj), name)` searches up
+/// the superclass chain, and because each BCPL class's ivar name is
+/// unique, it resolves unambiguously to the intended class's block.
+/// Returns `obj` unchanged if the ivar isn't found.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_objc_field_base_for(
+    obj: *mut c_void,
+    ivar_name: *const u8,
+) -> *mut c_void {
+    if obj.is_null() {
+        return obj;
+    }
+    let Some(name) = (unsafe { cstr(ivar_name) }) else {
+        return obj;
+    };
+    let obj_get_class = sym_or_null("object_getClass");
+    let class_get_ivar = sym_or_null("class_getInstanceVariable");
+    let ivar_get_offset = sym_or_null("ivar_getOffset");
+    if obj_get_class.is_null() || class_get_ivar.is_null() || ivar_get_offset.is_null() {
+        return obj;
+    }
+    let obj_get_class: extern "C" fn(*mut c_void) -> *mut c_void =
+        unsafe { std::mem::transmute(obj_get_class) };
+    let class_get_ivar: extern "C" fn(*mut c_void, *const i8) -> *mut c_void =
+        unsafe { std::mem::transmute(class_get_ivar) };
+    let ivar_get_offset: extern "C" fn(*mut c_void) -> isize =
+        unsafe { std::mem::transmute(ivar_get_offset) };
+    let cls = obj_get_class(obj);
+    let ivar = class_get_ivar(cls, name.as_ptr());
+    if ivar.is_null() {
+        return obj;
+    }
+    let off = ivar_get_offset(ivar);
+    unsafe { (obj as *mut u8).offset(off) as *mut c_void }
+}
+
 /// `[obj isKindOfClass: objc_getClass(name)]` — runtime type test.
 /// Returns 1 (true) / 0 (false).
 #[unsafe(no_mangle)]
@@ -569,6 +612,84 @@ mod tests {
         );
         unsafe { bcpl_objc_release(obj) };
     }
+
+    // THE LINCHPIN: per-class unique-named ivar composition. Base and
+    // Sub (EXTENDS Base) each add their OWN field block under a unique
+    // ivar name; the Obj-C runtime must compose them so a Sub instance
+    // has BOTH blocks at distinct, non-overlapping, writable offsets,
+    // and bcpl_objc_field_base_for must resolve each by name. If this
+    // fails the whole per-class-ivar retarget scheme must change.
+    #[test]
+    fn per_class_ivar_composition() {
+        let nsobject = unsafe { bcpl_objc_get_class(c"NSObject".as_ptr() as *const u8) };
+        assert!(!nsobject.is_null());
+
+        // Base: own field block of 16 bytes under "__bcpl_LBase".
+        let base = unsafe { bcpl_objc_allocate_class(nsobject, c"BCPL_LBase".as_ptr() as *const u8) };
+        assert!(!base.is_null(), "allocate BCPL_LBase");
+        assert_eq!(
+            unsafe {
+                bcpl_objc_add_ivar(
+                    base,
+                    c"__bcpl_LBase".as_ptr() as *const u8,
+                    16,
+                    3,
+                    c"[16c]".as_ptr() as *const u8,
+                )
+            },
+            1,
+            "addIvar __bcpl_LBase"
+        );
+        unsafe { bcpl_objc_register_class(base) };
+
+        // Sub EXTENDS Base: own field block of 16 bytes under "__bcpl_LSub".
+        let sub = unsafe { bcpl_objc_allocate_class(base, c"BCPL_LSub".as_ptr() as *const u8) };
+        assert!(!sub.is_null(), "allocate BCPL_LSub (super=BCPL_LBase)");
+        assert_eq!(
+            unsafe {
+                bcpl_objc_add_ivar(
+                    sub,
+                    c"__bcpl_LSub".as_ptr() as *const u8,
+                    16,
+                    3,
+                    c"[16c]".as_ptr() as *const u8,
+                )
+            },
+            1,
+            "addIvar __bcpl_LSub"
+        );
+        unsafe { bcpl_objc_register_class(sub) };
+
+        // Instantiate Sub; resolve both blocks by their unique names.
+        let obj = unsafe { bcpl_objc_alloc_init(sub) };
+        assert!(!obj.is_null(), "[[Sub alloc] init]");
+        let base_blk =
+            unsafe { bcpl_objc_field_base_for(obj, c"__bcpl_LBase".as_ptr() as *const u8) } as *mut u8;
+        let sub_blk =
+            unsafe { bcpl_objc_field_base_for(obj, c"__bcpl_LSub".as_ptr() as *const u8) } as *mut u8;
+        let obj_u8 = obj as *mut u8;
+        assert!(base_blk != obj_u8, "Base block must resolve to its ivar, not obj");
+        assert!(sub_blk != obj_u8, "Sub block must resolve to its ivar, not obj");
+        assert_ne!(base_blk, sub_blk, "Base and Sub blocks must be DISTINCT");
+
+        // Non-overlapping: the two 16-byte blocks must not overlap.
+        let (lo, hi) = if base_blk < sub_blk { (base_blk, sub_blk) } else { (sub_blk, base_blk) };
+        let gap = (hi as usize) - (lo as usize);
+        assert!(gap >= 16, "blocks overlap: gap {gap} < 16 bytes");
+
+        // Both writable and independent.
+        unsafe {
+            *(base_blk as *mut i64) = 0x1111;
+            *(base_blk.add(8) as *mut i64) = 0x2222;
+            *(sub_blk as *mut i64) = 0x3333;
+            *(sub_blk.add(8) as *mut i64) = 0x4444;
+            assert_eq!(*(base_blk as *mut i64), 0x1111);
+            assert_eq!(*(base_blk.add(8) as *mut i64), 0x2222);
+            assert_eq!(*(sub_blk as *mut i64), 0x3333, "Sub write must not clobber Base");
+            assert_eq!(*(sub_blk.add(8) as *mut i64), 0x4444);
+        }
+        unsafe { bcpl_objc_release(obj) };
+    }
 }
 
 /// Table of `(symbol_name, address)` for every bridge entry point, so
@@ -603,6 +724,10 @@ pub fn builtin_addresses() -> Vec<(&'static str, usize)> {
             bcpl_objc_register_class as *const () as usize,
         ),
         ("bcpl_objc_field_base", bcpl_objc_field_base as *const () as usize),
+        (
+            "bcpl_objc_field_base_for",
+            bcpl_objc_field_base_for as *const () as usize,
+        ),
         ("bcpl_objc_is_kind_of", bcpl_objc_is_kind_of as *const () as usize),
         ("bcpl_objc_make_block", bcpl_objc_make_block as *const () as usize),
         (
