@@ -211,6 +211,21 @@ pub enum Instr {
         args: Vec<Value>,
         hint: TypeHint,
     },
+    /// `[receiver selector: arg ...]` — a RAW Objective-C message send.
+    /// Unlike (Indirect)MethodCall this uses the UN-mangled Cocoa
+    /// `selector` verbatim and a per-arg ABI: each arg's `arg_hints`
+    /// entry picks its register class (Float -> d-reg/f64, else
+    /// word/ptr). `receiver` is already resolved by the lowerer (an
+    /// instance value, or a Class object from `bcpl_objc_get_class`).
+    /// `hint` is the return type (Object id by default).
+    ObjcRawSend {
+        dst: Option<ValueId>,
+        receiver: Value,
+        selector: String,
+        args: Vec<Value>,
+        arg_hints: Vec<TypeHint>,
+        hint: TypeHint,
+    },
     /// `!ptr` — load the value at an address. Used for both prefix
     /// `!ptr` and the result of subscript-family lowering
     /// (`v!i` / `v%i` / `v.%i`) after the GEP step. `byte_width`

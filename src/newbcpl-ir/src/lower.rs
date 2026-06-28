@@ -2354,7 +2354,85 @@ impl<'a> Lowerer<'a> {
                 kind, args, ..
             } => self.lower_typed_construct(*kind, args, e.hint(), AllocTarget::Heap),
             Expr::Valof { body, .. } => self.lower_valof(body, e.hint()),
+            Expr::ObjcMessage {
+                receiver,
+                selector,
+                args,
+                ..
+            } => self.lower_objc_message(receiver, selector, args, e.hint()),
         }
+    }
+
+    /// Lower a raw Objective-C `[receiver selector: arg ...]` send.
+    /// Resolves the receiver (SELF / a bare unbound Ident = Cocoa class
+    /// via `bcpl_objc_get_class` / an instance expression), collects the
+    /// per-arg type hints so codegen can pick the right register class,
+    /// and emits an `Instr::ObjcRawSend` with the UN-mangled selector.
+    fn lower_objc_message(
+        &mut self,
+        receiver: &Expr,
+        selector: &str,
+        args: &[Expr],
+        hint: TypeHint,
+    ) -> Value {
+        let recv_val = self.lower_objc_receiver(receiver);
+        let arg_values: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
+        let arg_hints: Vec<TypeHint> = args.iter().map(|a| a.hint()).collect();
+        let dst = self.b().alloc_value();
+        self.b().emit(Instr::ObjcRawSend {
+            dst: Some(dst),
+            receiver: recv_val,
+            selector: selector.to_string(),
+            args: arg_values,
+            arg_hints,
+            hint,
+        });
+        Value::Local(dst)
+    }
+
+    /// Resolve a bracket-send receiver to a runtime Value. SELF -> the
+    /// current instance; a bare Ident that resolves to NO binding -> a
+    /// Cocoa Class object via `bcpl_objc_get_class` (so `[NSString ...]`
+    /// works); anything else -> the lowered expression (an instance id).
+    fn lower_objc_receiver(&mut self, receiver: &Expr) -> Value {
+        if let Expr::Ident { name, .. } = receiver {
+            if name == "SELF" {
+                return self.load_self();
+            }
+            // A bare name with no local/global/manifest/SELF-field binding
+            // is taken as an Objective-C class name (Cocoa or a registered
+            // BCPL class). `[SUPER ...]` is rejected in sema, so it never
+            // reaches here.
+            if !self.is_bound_ident(name) {
+                let dst = self.b().alloc_value();
+                self.b().emit(Instr::Call {
+                    dst: Some(dst),
+                    callee: Value::Function("bcpl_objc_get_class".to_string()),
+                    args: vec![Value::Const(Const::CStr(name.clone()))],
+                    hint: TypeHint::Object,
+                });
+                return Value::Local(dst);
+            }
+        }
+        self.lower_expr(receiver)
+    }
+
+    /// Does `name` resolve to a binding (local / manifest / global /
+    /// SELF-field)? Mirrors `lower_ident`'s cascade. If not, a bracket
+    /// receiver Ident is treated as an Objective-C class name.
+    fn is_bound_ident(&mut self, name: &str) -> bool {
+        if self.b().lookup_local_slot(name).is_some() {
+            return true;
+        }
+        if self.manifests.contains_key(name) || self.globals.contains_key(name) {
+            return true;
+        }
+        if let Some(c) = self.current_class.clone() {
+            if self.lookup_field_loc(&c, name).is_some() {
+                return true;
+            }
+        }
+        false
     }
 
     fn lower_typed_construct(
@@ -3797,6 +3875,15 @@ fn esc_value(e: &Expr, esc: &mut HashSet<String>) {
         // Construction stores each arg into the new aggregate, so a bare
         // local arg escapes into it. Lists are always heap anyway.
         Expr::TypedConstruct { args, .. } | Expr::New { args, .. } => {
+            for a in args {
+                esc_value(a, esc);
+            }
+        }
+        // A raw Obj-C send may capture its receiver and args (e.g.
+        // `[arr addObject: x]`), so conservatively treat them all as
+        // escaping.
+        Expr::ObjcMessage { receiver, args, .. } => {
+            esc_value(receiver, esc);
             for a in args {
                 esc_value(a, esc);
             }

@@ -564,6 +564,21 @@ pub enum Expr {
         span: Span,
         hint: Cell<TypeHint>,
     },
+    /// `[receiver selector: arg ...]` — a RAW Objective-C message send
+    /// (Cocoa bracket sugar). `selector` is the prebuilt, UN-mangled
+    /// Cocoa selector ("setObject:forKey:" / "doThing"); `args` line up
+    /// one-per-colon. `ret_annotation` is an optional trailing `AS Type`
+    /// that fixes the return type (default = an `id`/Object). Distinct
+    /// from `obj.method()` dot dispatch, which uses mangled `bcpl_`
+    /// selectors against BCPL-declared methods.
+    ObjcMessage {
+        receiver: Box<Expr>,
+        selector: String,
+        args: Vec<Expr>,
+        ret_annotation: Option<String>,
+        span: Span,
+        hint: Cell<TypeHint>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -719,7 +734,8 @@ impl Expr {
             | Expr::Conditional { span, .. }
             | Expr::Valof { span, .. }
             | Expr::TypedConstruct { span, .. }
-            | Expr::New { span, .. } => *span,
+            | Expr::New { span, .. }
+            | Expr::ObjcMessage { span, .. } => *span,
         }
     }
 
@@ -740,7 +756,8 @@ impl Expr {
             | Expr::Conditional { hint, .. }
             | Expr::Valof { hint, .. }
             | Expr::TypedConstruct { hint, .. }
-            | Expr::New { hint, .. } => hint.get(),
+            | Expr::New { hint, .. }
+            | Expr::ObjcMessage { hint, .. } => hint.get(),
         }
     }
 
@@ -763,7 +780,8 @@ impl Expr {
             | Expr::Conditional { hint, .. }
             | Expr::Valof { hint, .. }
             | Expr::TypedConstruct { hint, .. }
-            | Expr::New { hint, .. } => hint.set(h),
+            | Expr::New { hint, .. }
+            | Expr::ObjcMessage { hint, .. } => hint.set(h),
         }
     }
 }

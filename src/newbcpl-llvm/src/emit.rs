@@ -1240,6 +1240,100 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                     *hint,
                 );
             }
+            Instr::ObjcRawSend {
+                dst,
+                receiver,
+                selector,
+                args,
+                arg_hints,
+                hint,
+            } => {
+                self.emit_objc_raw_dispatch(*dst, receiver, selector, args, arg_hints, *hint);
+            }
+        }
+    }
+
+    /// Lower `Instr::ObjcRawSend` — a raw Objective-C bracket message
+    /// send. Like `emit_objc_dispatch` but (1) the selector is the REAL
+    /// Cocoa selector, interned verbatim (NOT mangled through
+    /// `objc_selector`), and (2) each arg's register class is chosen from
+    /// its TypeHint: a Float arg becomes an `f64` param so the arm64
+    /// backend places it in a d-register; everything else is an `i64`
+    /// word in an x-register (an `id`/ptr is ABI-identical to i64 there).
+    /// The receiver is already resolved (an instance, or a Class object).
+    fn emit_objc_raw_dispatch(
+        &mut self,
+        dst: Option<ValueId>,
+        receiver: &Value,
+        selector: &str,
+        args: &[Value],
+        arg_hints: &[TypeHint],
+        hint: TypeHint,
+    ) {
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let i64_t = self.context.i64_type();
+        let f64_t = self.context.f64_type();
+
+        let recv_v = self.lower_value(receiver);
+        let recv_ptr = self.as_pointer(recv_v);
+
+        // sel = bcpl_objc_sel("<raw selector>") — un-mangled. The global
+        // symbol name must avoid ':' (illegal in an LLVM symbol), but the
+        // C-string CONTENTS keep the real colons for sel_registerName.
+        let sel_sym = format!("objc.rawsel.{}", selector.replace(':', "_"));
+        let sel_name = self.cstr_global(&sel_sym, selector);
+        let sel_fn = self.runtime_ptr_fn("bcpl_objc_sel", 1);
+        let sel_call = self
+            .builder
+            .build_call(sel_fn, &[sel_name.into()], "rawsel")
+            .expect("call bcpl_objc_sel");
+        let sel = self.call_result_ptr(sel_call, "bcpl_objc_sel");
+
+        let msgsend_fn = self.runtime_ptr_fn("bcpl_objc_msgsend_ptr", 0);
+        let msgsend_call = self
+            .builder
+            .build_call(msgsend_fn, &[], "msgsendp")
+            .expect("call bcpl_objc_msgsend_ptr");
+        let fnptr = self.call_result_ptr(msgsend_call, "bcpl_objc_msgsend_ptr");
+
+        // Build the call-site-specific objc_msgSend signature + args.
+        let mut param_types: Vec<BasicMetadataTypeEnum> = Vec::with_capacity(args.len() + 2);
+        param_types.push(ptr_t.into()); // self
+        param_types.push(ptr_t.into()); // _cmd (SEL)
+        let mut call_args: Vec<BasicMetadataValueEnum> = Vec::with_capacity(args.len() + 2);
+        call_args.push(recv_ptr.into());
+        call_args.push(sel.into());
+        for (i, a) in args.iter().enumerate() {
+            let v = self.lower_value(a);
+            if matches!(arg_hints.get(i), Some(TypeHint::Float)) {
+                param_types.push(f64_t.into());
+                call_args.push(self.as_float_value(v).into());
+            } else {
+                param_types.push(i64_t.into());
+                call_args.push(self.as_int_word(v).into());
+            }
+        }
+
+        let return_type = self.return_type_for(hint);
+        let fn_type = match return_type {
+            Some(t) => t.fn_type(&param_types, false),
+            None => self.context.void_type().fn_type(&param_types, false),
+        };
+        let call_site = self
+            .builder
+            .build_indirect_call(fn_type, fnptr, &call_args, "objc_send")
+            .expect("raw objc_msgSend indirect call");
+        if let Some(d) = dst {
+            use inkwell::values::ValueKind;
+            match call_site.try_as_basic_value() {
+                ValueKind::Basic(rv) => {
+                    self.value_map.insert(d, rv);
+                }
+                ValueKind::Instruction(_) => {
+                    let z = self.zero(hint);
+                    self.value_map.insert(d, z);
+                }
+            }
         }
     }
 

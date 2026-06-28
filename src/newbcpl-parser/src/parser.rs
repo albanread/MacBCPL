@@ -2445,6 +2445,72 @@ impl Parser {
         Ok(expr)
     }
 
+    /// `[receiver selector: arg ...]` — parse a raw Objective-C message
+    /// send. The receiver is a postfix-level expression (so `[[..] ..]`
+    /// nests and `[a.b foo]`, `[(x) foo]` work); the selector is either a
+    /// single bareword (zero-arg) or one-or-more `keyword: arg` groups.
+    /// An optional trailing `AS Type` fixes the return type. The selector
+    /// string is built here, un-mangled, and stored on the node.
+    fn parse_objc_message(&mut self) -> Result<Expr, ParseError> {
+        let open = self.eat(); // "["
+        let start = open.span.start;
+        let receiver = self.parse_unary()?;
+        // No selector after the receiver is an error, not a silent misparse.
+        if self.check_sym("]") {
+            let end = self.peek().span.end;
+            return Err(ParseError::new(
+                "Objective-C message has a receiver but no selector".to_string(),
+                SourceSpan { start, end },
+            ));
+        }
+        let next_is_colon = |p: &Self| {
+            p.peek().kind == TokenKind::Identifier
+                && p.tokens
+                    .get(p.pos + 1)
+                    .map(|t| t.kind == TokenKind::Symbol && t.lexeme == ":")
+                    .unwrap_or(false)
+        };
+        let mut selector = String::new();
+        let mut args: Vec<Expr> = Vec::new();
+        if next_is_colon(self) {
+            // Keyword form: ( IDENT ":" arg )+  -> "kw1:kw2:..."
+            loop {
+                let kw = self.eat(); // IDENT
+                self.expect_sym(":")?;
+                let arg = self.parse_expr()?;
+                selector.push_str(&kw.lexeme);
+                selector.push(':');
+                args.push(arg);
+                if !next_is_colon(self) {
+                    break;
+                }
+            }
+        } else if self.peek().kind == TokenKind::Identifier {
+            // Unary (zero-arg) form: a single bareword selector.
+            let kw = self.eat();
+            selector.push_str(&kw.lexeme);
+        } else {
+            let sp = self.peek().span;
+            return Err(ParseError::new(
+                "expected an Objective-C selector keyword or `]`".to_string(),
+                sp,
+            ));
+        }
+        let close = self.expect_sym("]")?;
+        let ret_annotation = self.parse_optional_as_annotation();
+        Ok(Expr::ObjcMessage {
+            receiver: Box::new(receiver),
+            selector,
+            args,
+            ret_annotation,
+            span: SourceSpan {
+                start,
+                end: close.span.end,
+            },
+            hint: unknown_hint(),
+        })
+    }
+
     fn parse_atom(&mut self) -> Result<Expr, ParseError> {
         let tok = self.peek().clone();
         match tok.kind {
@@ -2494,6 +2560,12 @@ impl Parser {
                     hint: unknown_hint(),
                 })
             }
+            // `[receiver selector: arg ...]` — Objective-C message send.
+            // A primary-leading `[` is unambiguous: `VEC[...]` is gated
+            // behind the VEC/FVEC keyword, and this dialect has no
+            // `arr[i]` subscript (`!`/`%` are used), so `[` never starts
+            // anything else.
+            TokenKind::Symbol if tok.lexeme == "[" => self.parse_objc_message(),
             TokenKind::Keyword if tok.lexeme == "TRUE" => {
                 self.pos += 1;
                 Ok(Expr::BoolLit {

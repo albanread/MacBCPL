@@ -516,6 +516,20 @@ fn pretty_print_expr(expr: &Expr, level: usize, out: &mut String) {
                 pretty_print_expr(arg, level + 1, out);
             }
         }
+        Expr::ObjcMessage {
+            receiver,
+            selector,
+            args,
+            ..
+        } => {
+            writeln!(out, "objc-message [{selector}] ({} args)", args.len()).unwrap();
+            indent(level + 1, out);
+            writeln!(out, "receiver:").unwrap();
+            pretty_print_expr(receiver, level + 2, out);
+            for arg in args {
+                pretty_print_expr(arg, level + 1, out);
+            }
+        }
     }
 }
 

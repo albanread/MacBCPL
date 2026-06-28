@@ -2022,6 +2022,36 @@ impl Sema {
                 }
                 TypeHint::Object
             }
+            Expr::ObjcMessage {
+                receiver,
+                args,
+                ret_annotation,
+                span,
+                ..
+            } => {
+                // Type the receiver + args so their hints drive lowering
+                // (the per-arg ABI reads each arg's hint).
+                let _ = self.type_of(receiver);
+                for a in args {
+                    let _ = self.type_of(a);
+                }
+                // `[SUPER ...]` raw sends aren't supported in v1 — direct
+                // them to the dot form, which does static parent dispatch.
+                if matches!(receiver.as_ref(), Expr::Ident { name, .. } if name == "SUPER") {
+                    self.error(
+                        "`[SUPER ...]` is not supported yet — use `SUPER.method(args)` \
+                         for superclass sends",
+                        *span,
+                    );
+                }
+                // Return type: an `id`/Object by default; an explicit
+                // trailing `AS Type` overrides it (and gives the correct
+                // x0-vs-d0 return ABI for INT/FLOAT).
+                ret_annotation
+                    .as_deref()
+                    .and_then(type_hint_from_annotation)
+                    .unwrap_or(TypeHint::Object)
+            }
         }
     }
 
@@ -2816,6 +2846,26 @@ mod tests {
             "expected an immutable-string error on `s % i := c`; got {:?}",
             out.errors
         );
+    }
+
+    #[test]
+    fn objc_super_bracket_send_is_rejected() {
+        // `[SUPER ...]` is not supported; direct users to `SUPER.method()`.
+        let out = analyze_str("LET START() BE $( WRITES([SUPER foo]) $)\n");
+        assert!(
+            out.errors.iter().any(|e| e.message.contains("[SUPER ...]")),
+            "expected a `[SUPER ...]` rejection; got {:?}",
+            out.errors
+        );
+    }
+
+    #[test]
+    fn objc_message_default_result_is_object() {
+        // A bracket send with no `AS` annotation is an id/Object; with
+        // `AS INT` it is an Int.
+        let out = analyze_str("LET START() BE $( LET a = [\"x\" uppercaseString]\n LET b = [\"x\" length] AS INT $)\n");
+        assert_eq!(binding_hint(&out, "a"), TypeHint::Object);
+        assert_eq!(binding_hint(&out, "b"), TypeHint::Int);
     }
 
     #[test]
