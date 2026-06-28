@@ -80,6 +80,11 @@ pub struct BindingInfo {
     /// Manifesto §5 — these instances are linear, cannot be aliased
     /// or stored in containers; sema emits warnings on violations.
     pub is_managed: bool,
+    /// True when this binding was initialised directly with `NEW C()`,
+    /// i.e. it OWNS a freshly-allocated (+1) Cocoa object. Reassigning
+    /// such a binding leaks the object it held — sema warns, nudging
+    /// toward `USING` for deterministic disposal (the uniform rule).
+    pub owns_new: bool,
     pub span: Span,
 }
 
@@ -487,6 +492,7 @@ impl Sema {
             hint,
             class_name: class_name.clone(),
             is_managed,
+            owns_new: false,
             span,
         };
         self.binding_log.push(info.clone());
@@ -1124,6 +1130,18 @@ impl Sema {
                 }
             }
             self.declare(name, hint, class_name, l.span);
+            // Record direct `LET o = NEW C()` bindings as owning a +1
+            // object, so a later reassignment can be flagged as a leak.
+            if matches!(expr, Expr::New { .. }) {
+                if let Some(top) = self.scopes.last_mut() {
+                    if let Some(b) = top.get_mut(name) {
+                        b.owns_new = true;
+                    }
+                }
+                if let Some(b) = self.binding_log.last_mut() {
+                    b.owns_new = true;
+                }
+            }
         }
     }
 
@@ -1578,6 +1596,22 @@ impl Sema {
             let target_hint = self.type_of(t);
             let value_hint = self.type_of(v);
             self.check_coercion(target_hint, value_hint, v.span());
+            // Ownership: reassigning a binding that owns a +1 `NEW`
+            // object drops the old object on the floor (the automatic
+            // scope-release only frees the binding's final value). Warn
+            // and point at the uniform rule — own objects with `USING`.
+            if let Expr::Ident { name, span, .. } = t {
+                if self.lookup(name).map(|b| b.owns_new).unwrap_or(false) {
+                    self.warn(
+                        format!(
+                            "reassigning `{name}` leaks the object it owns — only the \
+                             last value is released at scope exit; own objects with \
+                             `USING name = NEW … DO …` for deterministic disposal"
+                        ),
+                        *span,
+                    );
+                }
+            }
             // Back-fill the receiver class's field-class identity for
             // assignments of the shape `SELF.field := <class-typed-expr>`.
             // Field types are declared as bag-of-bits Word; their class
@@ -2676,6 +2710,43 @@ mod tests {
             .expect("missing w binding");
         assert!(w.is_managed);
         assert_eq!(w.class_name.as_deref(), Some("Window"));
+    }
+
+    #[test]
+    fn reassigning_owned_object_warns() {
+        // `LET p = NEW C()` owns a +1 object; reassigning p leaks it.
+        let out = analyze_str(
+            "CLASS Pt $( DECL x\n LET CREATE(v) BE SELF.x := v $)\n\
+             LET START() BE $( LET p = NEW Pt(1)\n p := NEW Pt(2) $)\n",
+        );
+        assert!(
+            out.warnings.iter().any(|w| w.message.contains("leaks the object it owns")),
+            "expected a leak warning on reassigning an owned binding; got {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn no_warning_without_reassignment() {
+        let out = analyze_str(
+            "CLASS Pt $( DECL x\n LET CREATE(v) BE SELF.x := v $)\n\
+             LET START() BE $( LET p = NEW Pt(1) $)\n",
+        );
+        assert!(
+            !out.warnings.iter().any(|w| w.message.contains("leaks the object it owns")),
+            "did not expect a leak warning; got {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn owns_new_flag_set_for_direct_new() {
+        let out = analyze_str(
+            "CLASS Pt $( DECL x\n LET CREATE(v) BE SELF.x := v $)\n\
+             LET START() BE $( LET p = NEW Pt(1) $)\n",
+        );
+        let p = out.bindings.iter().find(|b| b.name == "p").expect("p");
+        assert!(p.owns_new, "p should own a +1 NEW object");
     }
 
     #[test]
