@@ -73,11 +73,21 @@ pub unsafe extern "C-unwind" fn WRITEN(n: i64) -> i64 {
     0
 }
 
-/// `WRITEC(c)` — print a single character (low byte of `c`).
+/// `WRITEC(c)` — print a single character. A character is now a Unicode
+/// **code point** (matching `s % i`), so encode it as UTF-8 — that way
+/// `FOR i = 0 TO LEN(s)-1 DO WRITEC(s % i)` round-trips ANY string, not
+/// just ASCII. ASCII (`c < 128`) still emits exactly one byte. Values that
+/// aren't valid scalars (lone surrogates, > U+10FFFF) fall back to the raw
+/// low byte.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn WRITEC(c: i64) -> i64 {
-    let byte = (c & 0xff) as u8;
-    write_bytes(&[byte]);
+    match char::from_u32(c as u32) {
+        Some(ch) => {
+            let mut buf = [0u8; 4];
+            write_bytes(ch.encode_utf8(&mut buf).as_bytes());
+        }
+        None => write_bytes(&[(c & 0xff) as u8]),
+    }
     0
 }
 

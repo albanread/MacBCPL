@@ -435,12 +435,13 @@ fn retain_declares_binding_and_survives_gc() {
 // model without us noticing.
 
 #[test]
-fn utf8_multibyte_glyph_reads_as_two_bytes() {
-    // λ = 0xCE 0xBB; bytes 2 and 3 are the start of the next glyph
-    // (we follow with 'a' to give bytes 2 a known value).
+fn utf8_multibyte_glyph_reads_as_one_code_point() {
+    // A String is a Cocoa NSString, so `s % i` returns the i-th Unicode
+    // CODE POINT, not a UTF-8 byte. "λa" is two code points: λ = U+03BB =
+    // 955, a = 97; index 2 is out of range (0).
     expect(
-        "utf8_multibyte_glyph_reads_as_two_bytes",
+        "utf8_multibyte_glyph_reads_as_one_code_point",
         "LET START() BE $(\n  LET s = \"λa\"\n  WRITEN(s % 0) WRITES(\"*S\")\n  WRITEN(s % 1) WRITES(\"*S\")\n  WRITEN(s % 2)\n$)\n",
-        "206 187 97",
+        "955 97 0",
     );
 }

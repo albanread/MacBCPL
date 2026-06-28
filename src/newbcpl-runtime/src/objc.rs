@@ -254,19 +254,22 @@ pub(crate) unsafe fn nsstring_utf8_bytes(nsstr: *mut c_void) -> Option<Vec<u8>> 
 }
 
 thread_local! {
-    // One-entry UTF-8 memo so `FOR i ... s % i` is O(n) per string, not
-    // O(n^2) of selector dispatches. Keyed by the id value. Tagged-pointer
-    // NSStrings encode their content in the pointer bits, so identical
-    // keys ALWAYS mean identical content (no bleed). Heap NSStrings can be
+    // One-entry memo of the string's Unicode SCALAR VALUES (code points),
+    // so `FOR i ... s % i` is O(n) per string, not O(n^2) of selector
+    // dispatches. `s % i` returns the i-th CODE POINT and LEN(s) the
+    // code-point count (NOT UTF-8 bytes or UTF-16 units), since a BCPL
+    // String is now a Cocoa NSString. Keyed by the id value. Tagged-pointer
+    // NSStrings encode their content in the pointer bits, so identical keys
+    // ALWAYS mean identical content (no bleed). Heap NSStrings can be
     // reissued at a freed address — `bcpl_str_release` evicts this memo on
     // every owned-string release so a reused address never serves stale
-    // bytes.
-    static STR_MEMO: std::cell::RefCell<(usize, Vec<u8>)> =
+    // data.
+    static STR_MEMO: std::cell::RefCell<(usize, Vec<u32>)> =
         const { std::cell::RefCell::new((0usize, Vec::new())) };
 }
 
 #[inline]
-fn str_memo_with<R>(nsstr: *mut c_void, f: impl FnOnce(&[u8]) -> R, dflt: R) -> R {
+fn str_memo_with<R>(nsstr: *mut c_void, f: impl FnOnce(&[u32]) -> R, dflt: R) -> R {
     if nsstr.is_null() {
         return dflt;
     }
@@ -275,7 +278,16 @@ fn str_memo_with<R>(nsstr: *mut c_void, f: impl FnOnce(&[u8]) -> R, dflt: R) -> 
         let mut m = m.borrow_mut();
         if m.0 != key {
             match unsafe { nsstring_utf8_bytes(nsstr) } {
-                Some(b) => *m = (key, b),
+                Some(b) => {
+                    // Decode UTF-8 to Unicode scalar values (Rust `char`
+                    // IS a code point). `-UTF8String` is well-formed, so
+                    // from_utf8_lossy is a no-op fast path here.
+                    let cps: Vec<u32> = String::from_utf8_lossy(&b)
+                        .chars()
+                        .map(|c| c as u32)
+                        .collect();
+                    *m = (key, cps);
+                }
                 None => return dflt,
             }
         }
@@ -283,27 +295,27 @@ fn str_memo_with<R>(nsstr: *mut c_void, f: impl FnOnce(&[u8]) -> R, dflt: R) -> 
     })
 }
 
-/// `LEN(s)` for a String: the UTF-8 **byte** count (so the index domain
+/// `LEN(s)` for a String: the **code-point** count (so the index domain
 /// agrees with `s % i`). nil => 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn bcpl_str_len(nsstr: *mut c_void) -> i64 {
-    str_memo_with(nsstr, |b| b.len() as i64, 0)
+    str_memo_with(nsstr, |c| c.len() as i64, 0)
 }
 
-/// `s % i` for a String: the i-th UTF-8 byte, zero-extended (0..255).
+/// `s % i` for a String: the i-th Unicode **code point** (scalar value).
 /// Returns 0 for nil / out-of-range / negative index (BCPL's tolerant
-/// byte-read convention).
+/// read convention).
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn bcpl_str_char(nsstr: *mut c_void, idx: i64) -> i64 {
     if idx < 0 {
         return 0;
     }
     let i = idx as usize;
-    str_memo_with(nsstr, |b| b.get(i).map(|&c| c as i64).unwrap_or(0), 0)
+    str_memo_with(nsstr, |c| c.get(i).map(|&cp| cp as i64).unwrap_or(0), 0)
 }
 
-/// Release an owned String: EVICT the UTF-8 memo for this id first (so a
-/// later string reissued at the same address can't read stale bytes),
+/// Release an owned String: EVICT the code-point memo for this id first
+/// (so a later string reissued at the same address can't read stale data),
 /// then send `release`. Used by the owned-string epilogue / USING / strong
 /// store paths. Safe (and harmless) on any object id.
 #[unsafe(no_mangle)]

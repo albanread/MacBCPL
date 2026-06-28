@@ -34,13 +34,37 @@ fn len_and_char_fetch() {
     );
 }
 
-/// `s % i` out of range / negative returns 0 (tolerant byte read).
+/// `s % i` out of range / negative returns 0 (tolerant read).
 #[test]
 fn char_fetch_out_of_range() {
     expect(
         "str_char_oob",
         "LET START() BE $(\n  LET s = \"hi\"\n  WRITEN(s % -1)\n  WRITEN(s % 2)\n  WRITEN(s % 0)\n$)\n",
         "00104",
+    );
+}
+
+/// `s % i` returns Unicode CODE POINTS (not UTF-8 bytes); LEN counts code
+/// points; WRITEC re-encodes a code point as UTF-8. "café" = 4 code points
+/// (not 5 UTF-8 bytes); é = U+00E9 = 233.
+#[test]
+fn char_fetch_returns_code_points() {
+    expect(
+        "str_codepoints",
+        "LET START() BE $(\n  LET s = \"café\"\n  WRITEN(LEN s)\n  WRITEN(s % 3)\n  FOR i = 0 TO LEN(s) - 1 DO WRITEC(s % i)\n$)\n",
+        "4233café",
+    );
+}
+
+/// Astral characters (beyond the BMP) are ONE code point — UTF-16
+/// `characterAtIndex:` would split 😀 into a surrogate pair. "★😀" = 2 code
+/// points; 😀 = U+1F600 = 128512; the FOR echo round-trips it.
+#[test]
+fn char_fetch_astral_code_point() {
+    expect(
+        "str_codepoints_astral",
+        "LET START() BE $(\n  LET e = \"★😀\"\n  WRITEN(LEN e)\n  WRITEN(e % 1)\n  FOR i = 0 TO LEN(e) - 1 DO WRITEC(e % i)\n$)\n",
+        "2128512★😀",
     );
 }
 
