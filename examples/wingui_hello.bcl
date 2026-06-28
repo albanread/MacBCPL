@@ -1,0 +1,80 @@
+// wingui_hello.bcl — opens a real window with a button.
+//
+// W2 deliverable. Runs through:
+//   bedit / driver → JIT
+//   → BCPL classes → bcpl_wingui_* FFI shims
+//   → wingui-rs (super_terminal_run_hosted_app)
+//   → wingui.dll
+//   → Win32 + D3D rendering
+//
+// `app.run()` blocks until the user clicks the Quit button or
+// closes the window via the title bar. Polls the event queue
+// (E1 loop from the design doc; E2 blocking lands later) and
+// breaks when the Quit button (id 20) fires.
+//
+// Run:
+//   newbcpl-driver run examples/wingui_hello.bcl
+
+CLASS App $(
+    PRIVATE:
+    DECL title
+
+    PUBLIC:
+    ROUTINE CREATE(t) BE SELF.title := t
+
+    FUNCTION version() = bcpl_wingui_version_packed()
+    FUNCTION is_available() = bcpl_wingui_is_available()
+
+    ROUTINE define_window(id, t) BE bcpl_wingui_window_define(id, t)
+    ROUTINE add_button(id, label) BE bcpl_wingui_window_button(id, label)
+    ROUTINE add_label(id, text) BE bcpl_wingui_window_label(id, text)
+
+    // Register a button id that should close the window when
+    // clicked. Without this, a Quit button only queues an event
+    // and the user has to dismiss the window via the title bar.
+    ROUTINE close_on(id) BE bcpl_wingui_close_on(id)
+
+    FUNCTION run() = bcpl_wingui_window_run()
+    ROUTINE close() BE bcpl_wingui_window_close()
+    FUNCTION poll() = bcpl_wingui_poll_event()
+$)
+
+LET START() BE $(
+    LET app = NEW App("Hello wingui")
+
+    WRITES("wingui available? ")
+    WRITEN(app.is_available())
+    NEWLINE()
+
+    UNLESS app.is_available() = 1 DO $(
+        WRITES("wingui DLL not available; aborting*N")
+        FINISH
+    $)
+
+    // Build the window spec.
+    app.define_window(1, "Hello wingui")
+    app.add_label(10, "Press Quit to close.")
+    app.add_button(20, "Quit")
+    app.close_on(20)
+
+    WRITES("Opening window — press Quit (button 20) or close the title bar.*N")
+
+    // app.run() blocks until the window closes. After it returns
+    // we drain the event queue and check whether the Quit button
+    // was the cause; either way the program ends here.
+    LET code = app.run()
+    WRITES("window exited with code ")
+    WRITEN(code)
+    NEWLINE()
+
+    LET seen_quit = 0
+    LET ev = app.poll()
+    WHILE ev ~= 0 DO $(
+        IF ev = 20 THEN seen_quit := 1
+        ev := app.poll()
+    $)
+    IF seen_quit = 1 THEN
+        WRITES("Quit button clicked.*N")
+    ELSE
+        WRITES("Window closed via title-bar.*N")
+$)

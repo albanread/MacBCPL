@@ -1,0 +1,83 @@
+[package]
+name = "newbcpl-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+newbcpl-lexer = { path = "../../src/newbcpl-lexer" }
+newbcpl-parser = { path = "../../src/newbcpl-parser" }
+newbcpl-sema = { path = "../../src/newbcpl-sema" }
+
+[[test]]
+name = "matrix_tier1_negatives"
+path = "tests/matrix_tier1_negatives.rs"
+
+[[test]]
+name = "matrix_tier2"
+path = "tests/matrix_tier2.rs"
+
+[[test]]
+name = "matrix_tier3"
+path = "tests/matrix_tier3.rs"
+
+[[test]]
+name = "matrix_tier4"
+path = "tests/matrix_tier4.rs"
+
+[[test]]
+name = "matrix_tier5"
+path = "tests/matrix_tier5.rs"
+
+[[test]]
+name = "matrix_tier6"
+path = "tests/matrix_tier6.rs"
+
+[[test]]
+name = "matrix_tier7"
+path = "tests/matrix_tier7.rs"
+
+[[test]]
+name = "matrix_extra"
+path = "tests/matrix_extra.rs"
+
+# Generated from `matrix/generated.matrix`. Edit the manifest and
+# regenerate with `cargo run -p newbcpl-test-matrix -- ...`.
+[[test]]
+name = "matrix_generated"
+path = "tests/matrix_generated.rs"
+
+[[test]]
+name = "lexer_smoke"
+path = "tests/lexer_smoke.rs"
+
+[[test]]
+name = "lexer_corpus"
+path = "tests/lexer_corpus.rs"
+
+[[test]]
+name = "parser_smoke"
+path = "tests/parser_smoke.rs"
+
+[[test]]
+name = "parser_corpus"
+path = "tests/parser_corpus.rs"
+
+[[test]]
+name = "sema_smoke"
+path = "tests/sema_smoke.rs"
+
+[[test]]
+name = "sema_corpus"
+path = "tests/sema_corpus.rs"
+
+[[test]]
+name = "user_guide"
+path = "tests/user_guide.rs"
+
+[[test]]
+name = "asm_probes"
+path = "tests/asm_probes.rs"

@@ -1,0 +1,243 @@
+// igui.bcl — BCPL convenience wrappers over the runtime's iGui surface.
+//
+// Loaded automatically by the driver when running in GUI mode. After
+// auto-prefix, the top-level routines become `igui_open`,
+// `igui_close`, `igui_clear`, `igui_fill_rect`, … — the names a BCPL
+// program calls.
+//
+// The wrappers hide three things from BCPL source:
+//   1. The `(ptr, len)` open-array string convention used by the
+//      underlying `iGui_*` builtins.
+//   2. The pass-by-VAR output pointer for `OpenChild`.
+//   3. The corner-radius / half-thickness arguments that the raw
+//      builtins carry for fidelity with the CP surface.
+//
+// Colours are floats in 0.0..=1.0; coordinates are floats in DIPs
+// (logical pixels). Pass float literals (`1.0`, not `1`) — the
+// builtin signatures use Win64's XMM-register float convention and
+// integer arguments would arrive in the wrong registers.
+
+// Open a new MDI child window with the given title; returns its
+// window id. Caller stores the id and passes it to subsequent draw
+// calls. Returns 0 on failure (rare — the GUI thread must be up).
+LET open(title) = VALOF $(
+    LET id = 0
+    iGui_OpenChild(title, @id)
+    RESULTIS id
+$)
+
+// Close a previously-opened window.
+LET close(id) BE iGui_CloseChild(id)
+
+// Update the title bar of an existing window.
+LET set_title(id, title) BE iGui_SetTitle(id, title)
+
+// Start a draw batch for `id`. Subsequent clear/fill/stroke/text
+// calls accumulate in this batch; call submit() to flush them.
+LET begin(id) BE iGui_BeginBatch(id)
+
+// Send the open batch to the GUI thread for execution against the
+// window's render target. Returns 1 on success.
+LET submit() = iGui_SubmitBatch()
+
+// Fill the entire window with `(r, g, b, a)`. Premultiplied alpha
+// is the renderer's convention but for opaque colours `a = 1.0` is
+// always right.
+LET clear(r, g, b, a) BE iGui_Clear(r, g, b, a)
+
+// Filled rectangle, axis-aligned corners (x0, y0) and (x1, y1).
+LET fill_rect(x0, y0, x1, y1, r, g, b, a)
+    BE iGui_FillRect(x0, y0, x1, y1, r, g, b, a)
+
+// Outlined rectangle of pen width `thickness`.
+LET stroke_rect(x0, y0, x1, y1, thickness, r, g, b, a)
+    BE iGui_StrokeRect(x0, y0, x1, y1, thickness, r, g, b, a)
+
+// Filled circle at `(cx, cy)` with the given radius.
+LET fill_circle(cx, cy, radius, r, g, b, a)
+    BE iGui_FillCircle(cx, cy, radius, r, g, b, a)
+
+// Straight line from (x0, y0) to (x1, y1) of pen width `thickness`.
+LET line(x0, y0, x1, y1, thickness, r, g, b, a)
+    BE iGui_DrawLine(x0, y0, x1, y1, thickness, r, g, b, a)
+
+// Draw `text` with a Segoe UI default font, baseline-anchored at
+// (x, y). `size` is the font size in DIPs.
+LET text(text_ptr, x, y, size, r, g, b, a)
+    BE iGui_DrawText(text_ptr, x, y, size, r, g, b, a)
+
+// Pull the next event from the iGui mailbox. The eight `@kind`,
+// `@child`, ... parameters receive the flattened event payload (see
+// the table in src/newbcpl-runtime/src/igui_builtins.rs for the
+// per-kind field semantics). `timeout_ms` < 0 blocks indefinitely.
+// Returns 1 if an event was delivered, 0 on timeout. After mangling
+// this is callable as `igui_next_event(...)`.
+LET next_event(out_kind, out_child, out_time,
+               out_p1, out_p2, out_p3, out_p4,
+               timeout_ms)
+    = iGui_NextEvent(out_kind, out_child, out_time,
+                     out_p1, out_p2, out_p3, out_p4,
+                     timeout_ms)
+
+// Programmatically close the iGui frame — posts WM_CLOSE on the GUI
+// thread. After this the JIT host's main thread will tear the
+// process down once it sees WM_QUIT, so the calling program should
+// return from START soon after.
+LET quit() BE iGui_Quit()
+
+// Pull the next event whose child_id matches `target_child` (or that
+// is a "global" event with no child — FrameClose, ThemeChange,
+// Menu). Events for other windows are *stashed*, not dropped, so
+// later consumers — including the plain `next_event` call — still
+// see them.
+LET next_event_for(target_child,
+                   out_kind, out_child, out_time,
+                   out_p1, out_p2, out_p3, out_p4,
+                   timeout_ms)
+    = iGui_NextEventFor(target_child,
+                        out_kind, out_child, out_time,
+                        out_p1, out_p2, out_p3, out_p4,
+                        timeout_ms)
+
+// Drop every event currently parked in the event stash. Use when
+// switching windows / modes and you don't want stale input from the
+// previous state to fire on the next `next_event_for`.
+LET discard_stashed_events() BE iGui_DiscardStashedEvents()
+
+// ─── Window filter (additive registry) ──────────────────────────────
+//
+// Register windows the program wants events for. Once the filter
+// is non-empty, `next_event(...)` returns only events targeting
+// registered windows (plus globals like FrameClose). Events for
+// any other window park in the stash so they survive a later
+// `clear_filter`. Typical pattern: call `filter_on_window(id)`
+// once after each `text_open` / `open`, then loop on plain
+// `next_event` without per-call filter arguments.
+
+// Add `child_id` to the persistent filter set.
+LET filter_on_window(child_id) BE iGui_FilterOnWindow(child_id)
+
+// Remove `child_id` from the filter (use when the window closes).
+LET unfilter_window(child_id) BE iGui_UnfilterWindow(child_id)
+
+// Empty the filter set — subsequent `next_event` calls return
+// every event again.
+LET clear_filter() BE iGui_ClearFilter()
+
+// ─── Text-pane wrappers ──────────────────────────────────────────────
+//
+// A text pane is a monospaced terminal-grid MDI child — distinct from
+// the graphics canvas opened by `igui_open` (which draws Direct2D
+// shapes) and from the log view (which is diagnostic scroll-back).
+// Programs use it for interactive console-style output: WriteStr at
+// the caret, SetCursor for cursor addressing, SetPen for colours,
+// Clear and ScrollUp for redraws.
+
+// Open a text pane; returns the window id.
+LET text_open(title) = VALOF $(
+    LET id = 0
+    iGui_OpenText(title, @id)
+    RESULTIS id
+$)
+
+// Append `text` (NUL-terminated) at the caret.
+LET text_writes(id, text_ptr) BE iGui_TextWriteStr(id, text_ptr)
+
+// Append one Unicode codepoint at the caret.
+LET text_writec(id, codepoint) BE iGui_TextWriteChar(id, codepoint)
+
+// Carriage-return + line-feed at the caret.
+LET text_newline(id) BE iGui_TextNewline(id)
+
+// Move the caret to (row, col), 0-based.
+LET text_set_cursor(id, row, col) BE iGui_TextSetCursor(id, row, col)
+
+// Clear the entire grid, reset caret to (0, 0).
+LET text_clear(id) BE iGui_TextClear(id)
+
+// Clear from caret to end of line / end of screen.
+LET text_clear_eol(id) BE iGui_TextClearEol(id)
+LET text_clear_eos(id) BE iGui_TextClearEos(id)
+
+// Scroll the grid up by `n` rows, blank rows fill the bottom.
+LET text_scroll_up(id, n) BE iGui_TextScrollUp(id, n)
+
+// Set / restore foreground + background pen colours. Each colour
+// is a packed 0xAARRGGBB u32 — e.g. 0xFFFFFFFF for opaque white,
+// 0xFF000000 for opaque black, 0xFF202840 for slate.
+LET text_set_pen(id, fg, bg) BE iGui_TextSetPen(id, fg, bg)
+LET text_reset_pen(id) BE iGui_TextResetPen(id)
+
+// Show or hide the blinking caret block.
+LET text_show_caret(id, visible) BE iGui_TextShowCaret(id, visible)
+
+// Read one line of input from text pane `pane_id`. Drains the iGui
+// event channel, echoing every printable Char event from the pane
+// into the grid and storing its codepoint at `buf!len`. Stops on
+// Enter (codepoint 10 or 13) or FrameClose. Returns the number of
+// characters captured (excluding the terminating zero).
+//
+// Each char is stored one-per-word — so `buf!0`, `buf!1`, …
+// `buf!(n-1)` hold the codepoints. Caller can read them back with
+// `text_writec(pane, buf!i)` to echo them somewhere else, or pack
+// into a byte string via `%` subscripts if a NUL-terminated C
+// string is needed.
+//
+// Char events whose `child_id` doesn't match the pane are silently
+// dropped — that lets the user click on other windows without those
+// keystrokes ending up in the buffer. Non-Char events (mouse,
+// resize, paint, etc.) are also dropped.
+//
+// The pane must have keyboard focus; clicking it on open is the
+// usual way. Programs that want to read input first should ensure
+// they've called `text_open` and the user has clicked the new
+// pane before calling this.
+LET text_read_line(pane_id, buf, max_len) = VALOF $(
+    LET kind = 0
+    LET child = 0
+    LET t = 0
+    LET p1 = 0
+    LET p2 = 0
+    LET p3 = 0
+    LET p4 = 0
+    LET len = 0
+    LET reading = 1
+    WHILE reading DO $(
+        // `next_event_for` waits for events targeting our pane (plus
+        // "global" events like FrameClose); other windows' events
+        // park in the stash and survive past this loop. That's the
+        // key behavioural difference from a plain `next_event`
+        // filter — concurrent mouse moves over bedit etc. aren't
+        // lost.
+        UNLESS next_event_for(pane_id,
+                              @kind, @child, @t,
+                              @p1, @p2, @p3, @p4, -1) DO LOOP
+        SWITCHON kind INTO $(
+            CASE 2:                              // CHAR (p1 = codepoint)
+                SWITCHON p1 INTO $(
+                    CASE 10:                     // LF
+                    CASE 13:                     // CR
+                        reading := 0
+                        ENDCASE
+                    CASE 8:                      // Backspace
+                        IF len > 0 DO len := len - 1
+                        ENDCASE
+                    DEFAULT:
+                        IF p1 >= 32 DO
+                            IF len < max_len DO $(
+                                buf!len := p1
+                                len := len + 1
+                                text_writec(pane_id, p1)
+                            $)
+                        ENDCASE
+                $)
+                ENDCASE
+            CASE 7:                              // CLOSE child
+            CASE 8:                              // FRAME_CLOSE
+                reading := 0
+                ENDCASE
+        $)
+    $)
+    buf!len := 0
+    RESULTIS len
+$)
