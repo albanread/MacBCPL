@@ -12,7 +12,7 @@
 //! IR stays free of phi nodes; LLVM mem2reg promotes the slots to
 //! registers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use newbcpl_parser::{
     AsmProcDecl, BinaryOp, Block, ClassDecl, ClassMemberKind, ClassMethod, ClassMethodBody, Decl,
@@ -88,6 +88,16 @@ struct Lowerer<'a> {
     /// without consulting this stack. BREAK / LOOP do not currently
     /// fire cleanups; this is a known v1 limitation.
     using_cleanups: Vec<UsingCleanup>,
+    /// Per-function escape set (Phase 2 arena routing): local names whose
+    /// allocation may outlive the function and must therefore go on the
+    /// manual heap, not the per-scope arena. A name absent from this set
+    /// is provably scope-local. Conservative — computed once per
+    /// function before lowering its body (see `escape_analyze`).
+    escaping_locals: HashSet<String>,
+    /// The slot (alloca) holding this function's arena handle, if the
+    /// function entered an arena. `emit_arena_free` loads it on every
+    /// true function-exit edge. `None` between functions.
+    function_arena_slot: Option<ValueId>,
 }
 
 #[derive(Debug, Clone)]
@@ -339,6 +349,8 @@ impl<'a> Lowerer<'a> {
             globals,
             current_class: None,
             using_cleanups: Vec::new(),
+            escaping_locals: HashSet::new(),
+            function_arena_slot: None,
         }
     }
 
@@ -353,11 +365,13 @@ impl<'a> Lowerer<'a> {
             &r.param_annotations,
             TypeHint::Word,
         );
+        self.escaping_locals = escape_analyze_stmt(&r.body);
+        self.enter_function_arena();
         self.lower_stmt(&r.body);
         // If the body fell through without an explicit RETURN, emit
         // one for routines (no return value).
         if self.b().current_open() {
-            self.b().terminate(Terminator::Return(None));
+            self.terminate_return(None);
         }
         self.finish_function();
     }
@@ -370,8 +384,12 @@ impl<'a> Lowerer<'a> {
             &f.param_annotations,
             return_hint,
         );
+        // The whole body expression is RETURNED, so it is in value
+        // position — any bare local it yields escapes.
+        self.escaping_locals = escape_analyze_expr(&f.body);
+        self.enter_function_arena();
         let value = self.lower_expr(&f.body);
-        self.b().terminate(Terminator::Return(Some(value)));
+        self.terminate_return(Some(value));
         self.finish_function();
     }
 
@@ -427,9 +445,13 @@ impl<'a> Lowerer<'a> {
             }
         }
         self.current_class = Some(class_name.to_string());
+        // No user locals here (just SELF.field stores), so the escape
+        // set is empty; still bracket an arena for uniformity.
+        self.escaping_locals.clear();
+        self.enter_function_arena();
         self.emit_field_initialisers(class_name, initialisers);
         if self.b().current_open() {
-            self.b().terminate(Terminator::Return(None));
+            self.terminate_return(None);
         }
         self.current_class = None;
         let _ = class_span;
@@ -508,6 +530,12 @@ impl<'a> Lowerer<'a> {
         }
         self.current_class = Some(class_name.to_string());
 
+        self.escaping_locals = match &m.body {
+            ClassMethodBody::Routine(stmt) => escape_analyze_stmt(stmt),
+            ClassMethodBody::Function(expr) => escape_analyze_expr(expr),
+        };
+        self.enter_function_arena();
+
         // Field initialisers run before the user's CREATE body so the
         // user can see initialised slots from CREATE. Only CREATE
         // receives this prepend — see `lower_class`.
@@ -519,12 +547,12 @@ impl<'a> Lowerer<'a> {
             ClassMethodBody::Routine(stmt) => {
                 self.lower_stmt(stmt);
                 if self.b().current_open() {
-                    self.b().terminate(Terminator::Return(None));
+                    self.terminate_return(None);
                 }
             }
             ClassMethodBody::Function(expr) => {
                 let v = self.lower_expr(expr);
-                self.b().terminate(Terminator::Return(Some(v)));
+                self.terminate_return(Some(v));
             }
         }
 
@@ -619,6 +647,60 @@ impl<'a> Lowerer<'a> {
         if let Some(b) = self.current.take() {
             self.functions.push(b.function);
         }
+        // Reset per-function arena state for the next function.
+        self.function_arena_slot = None;
+        self.escaping_locals.clear();
+    }
+
+    /// Enter this function's per-scope arena (Phase 2 stack-scope
+    /// allocation): emit `bcpl_arena_enter()` and stash the handle in a
+    /// fresh slot. Call at function entry, AFTER params are set up.
+    /// Paired with `emit_arena_free` on every true function-exit edge.
+    fn enter_function_arena(&mut self) {
+        let handle = self.b().alloc_value();
+        self.b().emit(Instr::Call {
+            dst: Some(handle),
+            callee: Value::Function("bcpl_arena_enter".to_string()),
+            args: Vec::new(),
+            hint: TypeHint::Word,
+        });
+        let slot = self.b().alloca("__arena", TypeHint::Word);
+        self.b().emit(Instr::Store {
+            slot,
+            value: Value::Local(handle),
+        });
+        self.function_arena_slot = Some(slot);
+    }
+
+    /// Free this function's arena (wholesale scope-exit reclamation of
+    /// every stack-scope-lived heap object). No-op if no arena was
+    /// entered. Emitted ONLY before `Terminator::Return`, so the
+    /// intra-function branches (BREAK/LOOP/ENDCASE/GOTO and
+    /// RESULTIS-inside-VALOF, which all emit `Branch`) never free it —
+    /// that would dangle values still live after the loop / switch.
+    fn emit_arena_free(&mut self) {
+        if let Some(slot) = self.function_arena_slot {
+            let handle = self.b().alloc_value();
+            self.b().emit(Instr::Load {
+                dst: handle,
+                slot,
+                hint: TypeHint::Word,
+            });
+            self.b().emit(Instr::Call {
+                dst: None,
+                callee: Value::Function("bcpl_arena_free".to_string()),
+                args: vec![Value::Local(handle)],
+                hint: TypeHint::Word,
+            });
+        }
+    }
+
+    /// The single funnel for leaving a function: free the arena, then
+    /// emit the `Return`. Using this everywhere a function returns means
+    /// arena cleanup can't be forgotten on an exit path.
+    fn terminate_return(&mut self, value: Option<Value>) {
+        self.emit_arena_free();
+        self.b().terminate(Terminator::Return(value));
     }
 
     // ─── statements ─────────────────────────────────────────────
@@ -656,9 +738,10 @@ impl<'a> Lowerer<'a> {
                     // value. Treat as null/zero.
                     Some(Value::Const(Const::Int(0)))
                 };
-                // RELEASE every active USING binding before exiting.
+                // RELEASE every active USING binding before exiting,
+                // then free the function arena (terminate_return).
                 self.emit_using_cleanups_to_function_exit();
-                self.b().terminate(Terminator::Return(ret_value));
+                self.terminate_return(ret_value);
                 let dead = self.b().alloc_block("after.return");
                 self.b().switch_to(dead);
             }
@@ -682,16 +765,17 @@ impl<'a> Lowerer<'a> {
                         .terminate(Terminator::Branch(frame.exit_block));
                 } else {
                     // Fallback: outside any VALOF, treat RESULTIS
-                    // like a function-return — release everything.
+                    // like a function-return — release everything, then
+                    // free the function arena.
                     self.emit_using_cleanups_to_function_exit();
-                    self.b().terminate(Terminator::Return(Some(value)));
+                    self.terminate_return(Some(value));
                 }
                 let dead = self.b().alloc_block("after.resultis");
                 self.b().switch_to(dead);
             }
             Stmt::Finish(_) => {
                 self.emit_using_cleanups_to_function_exit();
-                self.b().terminate(Terminator::Return(None));
+                self.terminate_return(None);
                 let dead = self.b().alloc_block("after.finish");
                 self.b().switch_to(dead);
             }
@@ -1730,7 +1814,26 @@ impl<'a> Lowerer<'a> {
                     }
                 }
             }
-            let value = self.lower_expr(init);
+            // Arena routing (Phase 2): a direct `LET name = VEC/FVEC/
+            // TABLE …` whose name the escape pre-pass proved scope-local
+            // allocates in the per-scope arena (stack-scope lifetime).
+            // Everything else stays on the manual heap (the safe
+            // default). Only this direct-LET-of-construct shape is
+            // routed — anonymous / nested constructs stay heap.
+            let value = match init {
+                Expr::TypedConstruct { kind, args, .. }
+                    if is_vector_kind(typed_kind(*kind))
+                        && !self.escaping_locals.contains(name) =>
+                {
+                    self.lower_typed_construct(
+                        *kind,
+                        args,
+                        init.hint(),
+                        AllocTarget::Arena,
+                    )
+                }
+                _ => self.lower_expr(init),
+            };
             // FLET overrides the slot's hint to Float when the
             // initialiser is a neutral integer scalar. Emit's
             // Store path will sitofp the value to match.
@@ -2140,7 +2243,7 @@ impl<'a> Lowerer<'a> {
             } => self.lower_new(class_name, args),
             Expr::TypedConstruct {
                 kind, args, ..
-            } => self.lower_typed_construct(*kind, args, e.hint()),
+            } => self.lower_typed_construct(*kind, args, e.hint(), AllocTarget::Heap),
             Expr::Valof { body, .. } => self.lower_valof(body, e.hint()),
         }
     }
@@ -2150,6 +2253,7 @@ impl<'a> Lowerer<'a> {
         kind: TypeConstructorKind,
         args: &[Expr],
         hint: TypeHint,
+        alloc_target: AllocTarget,
     ) -> Value {
         let arg_values: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
         let dst = self.b().alloc_value();
@@ -2158,9 +2262,7 @@ impl<'a> Lowerer<'a> {
             kind: typed_kind(kind),
             args: arg_values,
             hint,
-            // Conservative default: the manual heap. The escape pre-pass
-            // flips proven-scope-local VEC/FVEC/TABLE sites to Arena.
-            alloc_target: AllocTarget::Heap,
+            alloc_target,
         });
         Value::Local(dst)
     }
@@ -3250,6 +3352,268 @@ fn typed_kind(k: TypeConstructorKind) -> crate::ir::TypedKind {
         TypeConstructorKind::FOct => TypedKind::FOct,
         TypeConstructorKind::List => TypedKind::List,
         TypeConstructorKind::ManifestList => TypedKind::ManifestList,
+    }
+}
+
+/// Vector-shaped constructors are the only kinds eligible for arena
+/// routing (Phase 2). SIMD packs live in registers; lists alias their
+/// atom nodes across headers (TL/REST) so they can never be arena-freed.
+fn is_vector_kind(k: crate::ir::TypedKind) -> bool {
+    use crate::ir::TypedKind;
+    matches!(
+        k,
+        TypedKind::Vec | TypedKind::FVec | TypedKind::Table | TypedKind::FTable
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Escape analysis for arena routing (Phase 2). CONSERVATIVE & SAFE: a
+// local is "escaping" (→ manual heap) unless its bare pointer provably
+// never leaves the function. The bare identifier of a scope-local vector
+// may appear ONLY as a subscript / deref base (`v!i`, `!v`, `LEN v`,
+// `FREEVEC v`). ANY other use of the bare pointer — returned via
+// RESULTIS, stored indirectly (`p!i := v`, `g := v`), passed to a call,
+// aliased (`LET y = v`), address-taken (`@v`), RETAINed, or consed into
+// a vector/list — marks it escaping. This over-approximates (only ever
+// routes MORE to the heap); it never lets an escaping value reach the
+// arena, so it cannot cause a use-after-free.
+// ─────────────────────────────────────────────────────────────────────
+
+fn escape_analyze_stmt(body: &Stmt) -> HashSet<String> {
+    let mut esc = HashSet::new();
+    esc_stmt(body, &mut esc);
+    esc
+}
+
+/// A function whose body is an expression returns that expression, so it
+/// is in value position — any bare local it yields escapes.
+fn escape_analyze_expr(body: &Expr) -> HashSet<String> {
+    let mut esc = HashSet::new();
+    esc_value(body, &mut esc);
+    esc
+}
+
+fn esc_is_subscript(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Subscript
+            | BinaryOp::Bitfield
+            | BinaryOp::CharSubscript
+            | BinaryOp::FloatSubscript
+    )
+}
+
+/// A vector/pointer *base* position: a bare local here is used THROUGH
+/// (subscripted / dereferenced), not escaped. Anything more complex is a
+/// value.
+fn esc_base(e: &Expr, esc: &mut HashSet<String>) {
+    if matches!(e, Expr::Ident { .. }) {
+        return;
+    }
+    esc_value(e, esc);
+}
+
+/// The destination of an assignment. A bare local destination is not an
+/// escape (it's written, not read out). Indirect/subscript destinations:
+/// the base is use-through, the index is a value.
+fn esc_target(t: &Expr, esc: &mut HashSet<String>) {
+    match t {
+        Expr::Ident { .. } => {}
+        Expr::Binary { op, lhs, rhs, .. } if esc_is_subscript(*op) => {
+            esc_base(lhs, esc);
+            esc_value(rhs, esc);
+        }
+        Expr::Unary {
+            op: UnaryOp::Indirection | UnaryOp::CharIndirection,
+            operand,
+            ..
+        } => esc_base(operand, esc),
+        _ => esc_value(t, esc),
+    }
+}
+
+/// `e` is used as a value (its pointer may flow out): any bare local here
+/// escapes. Subscript / deref bases recurse via `esc_base` (exempt when
+/// bare).
+fn esc_value(e: &Expr, esc: &mut HashSet<String>) {
+    match e {
+        Expr::Ident { name, .. } => {
+            esc.insert(name.clone());
+        }
+        Expr::IntLit { .. }
+        | Expr::FloatLit { .. }
+        | Expr::CharLit { .. }
+        | Expr::StringLit { .. }
+        | Expr::BoolLit { .. }
+        | Expr::Null { .. } => {}
+        Expr::Binary { op, lhs, rhs, .. } => {
+            if esc_is_subscript(*op) {
+                esc_base(lhs, esc);
+                esc_value(rhs, esc);
+            } else {
+                esc_value(lhs, esc);
+                esc_value(rhs, esc);
+            }
+        }
+        Expr::Unary { op, operand, .. } => match op {
+            // Read-through ops: the operand pointer is dereferenced /
+            // measured / freed, not stored — does not escape.
+            UnaryOp::Indirection
+            | UnaryOp::CharIndirection
+            | UnaryOp::Hd
+            | UnaryOp::Tl
+            | UnaryOp::Rest
+            | UnaryOp::Len
+            | UnaryOp::FreeVec
+            | UnaryOp::FreeList => esc_base(operand, esc),
+            // `@x` takes x's address — x escapes.
+            UnaryOp::AddressOf => esc_value(operand, esc),
+            UnaryOp::Neg | UnaryOp::Not | UnaryOp::LogNot => esc_value(operand, esc),
+        },
+        Expr::Call { callee, args, .. } => {
+            // No allowlist in v1: any value passed to any callee may be
+            // captured, so it escapes. (Conservative; the common
+            // scratch-vector pattern never passes the bare pointer.)
+            if !matches!(callee.as_ref(), Expr::Ident { .. }) {
+                esc_value(callee, esc);
+            }
+            for a in args {
+                esc_value(a, esc);
+            }
+        }
+        Expr::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            esc_value(cond, esc);
+            esc_value(then_expr, esc);
+            esc_value(else_expr, esc);
+        }
+        Expr::Valof { body, .. } => esc_stmt(body, esc),
+        // Construction stores each arg into the new aggregate, so a bare
+        // local arg escapes into it. Lists are always heap anyway.
+        Expr::TypedConstruct { args, .. } | Expr::New { args, .. } => {
+            for a in args {
+                esc_value(a, esc);
+            }
+        }
+    }
+}
+
+fn esc_stmt(s: &Stmt, esc: &mut HashSet<String>) {
+    match s {
+        Stmt::Block(b) => {
+            for st in &b.stmts {
+                esc_stmt(st, esc);
+            }
+        }
+        Stmt::Decl(Decl::Let(l)) => {
+            for (_, init) in &l.bindings {
+                esc_value(init, esc);
+            }
+        }
+        Stmt::Decl(_) => {}
+        Stmt::Expr(e) => esc_value(e, esc),
+        Stmt::Assign { targets, values, .. } => {
+            for t in targets {
+                esc_target(t, esc);
+            }
+            for v in values {
+                esc_value(v, esc);
+            }
+        }
+        Stmt::If {
+            cond,
+            then_stmt,
+            else_stmt,
+            ..
+        } => {
+            esc_value(cond, esc);
+            esc_stmt(then_stmt, esc);
+            if let Some(e) = else_stmt {
+                esc_stmt(e, esc);
+            }
+        }
+        Stmt::Unless {
+            cond, then_stmt, ..
+        } => {
+            esc_value(cond, esc);
+            esc_stmt(then_stmt, esc);
+        }
+        Stmt::While { cond, body, .. } | Stmt::Until { cond, body, .. } => {
+            esc_value(cond, esc);
+            esc_stmt(body, esc);
+        }
+        Stmt::Repeat { body, .. } => esc_stmt(body, esc),
+        Stmt::RepeatWhile { body, cond, .. } | Stmt::RepeatUntil { body, cond, .. } => {
+            esc_stmt(body, esc);
+            esc_value(cond, esc);
+        }
+        Stmt::For {
+            start,
+            end,
+            step,
+            body,
+            ..
+        } => {
+            esc_value(start, esc);
+            esc_value(end, esc);
+            if let Some(st) = step {
+                esc_value(st, esc);
+            }
+            esc_stmt(body, esc);
+        }
+        Stmt::ForEach { iter, body, .. } => {
+            // Conservative: the iterated collection escapes into the
+            // iteration. (Safe; just heaps a scratch collection.)
+            esc_value(iter, esc);
+            esc_stmt(body, esc);
+        }
+        Stmt::Switchon {
+            scrutinee,
+            cases,
+            default,
+            ..
+        } => {
+            esc_value(scrutinee, esc);
+            for c in cases {
+                for v in &c.values {
+                    esc_value(v, esc);
+                }
+                for st in &c.body {
+                    esc_stmt(st, esc);
+                }
+            }
+            if let Some(d) = default {
+                for st in d {
+                    esc_stmt(st, esc);
+                }
+            }
+        }
+        Stmt::Resultis(e, _) => esc_value(e, esc),
+        Stmt::Retain { name, value, .. } => {
+            // RETAIN pins the binding past its scope → heap.
+            esc.insert(name.clone());
+            if let Some(v) = value {
+                esc_value(v, esc);
+            }
+        }
+        Stmt::Using { value, body, .. } => {
+            esc_value(value, esc);
+            esc_stmt(body, esc);
+        }
+        // Pure control flow — no sub-expression carries a local pointer
+        // out of the function.
+        Stmt::Return(_)
+        | Stmt::Finish(_)
+        | Stmt::Break(_)
+        | Stmt::Loop(_)
+        | Stmt::Endcase(_)
+        | Stmt::Brk(_)
+        | Stmt::Goto { .. }
+        | Stmt::Label { .. } => {}
     }
 }
 

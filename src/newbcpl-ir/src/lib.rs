@@ -212,12 +212,14 @@ mod tests {
         assert_eq!(s.params.len(), 2);
         let entry = &s.blocks[0];
         // Two allocas + two stores from the in_value to the slot.
+        // Two param allocas, plus the per-function arena handle slot
+        // (`__arena`) emitted by the Phase-2 arena prologue.
         let alloca_count = entry
             .instrs
             .iter()
             .filter(|i| matches!(i, Instr::Alloca { .. }))
             .count();
-        assert_eq!(alloca_count, 2);
+        assert_eq!(alloca_count, 3);
     }
 
     #[test]
@@ -244,8 +246,9 @@ mod tests {
             .iter()
             .filter(|i| matches!(i, Instr::Store { .. }))
             .count();
-        // Two stores: the LET initialisation and the := assignment.
-        assert_eq!(store_count, 2);
+        // The LET initialisation and the := assignment, plus the
+        // arena-handle store from the Phase-2 arena prologue.
+        assert_eq!(store_count, 3);
     }
 
     #[test]
@@ -552,14 +555,15 @@ mod tests {
         let s = function(&m, "S");
         // No new instruction for @x — it just passes the slot
         // ValueId. Verify by counting Stores: x's init + p's init
-        // (which stores the slot ValueId of x).
+        // (which stores the slot ValueId of x), plus the arena-handle
+        // store from the Phase-2 arena prologue.
         let entry = &s.blocks[0];
         let store_count = entry
             .instrs
             .iter()
             .filter(|i| matches!(i, Instr::Store { .. }))
             .count();
-        assert_eq!(store_count, 2);
+        assert_eq!(store_count, 3);
     }
 
     #[test]
