@@ -82,13 +82,11 @@ fn static_vec_count(e: &Expr) -> Option<usize> {
     None
 }
 
-/// A struct-returning send's shape for Tier-B geometry tags only:
-/// `(field_count, is_float)`. R(NSRect)=4 doubles, P(NSPoint)/S(NSSize)=2
-/// doubles, N(NSRange)=2 words. Complex `{…}` descriptors return None here
-/// (they stay scalar/Object until the Tier-C wrapper-class path lands) — so
-/// only the ABI-exact all-f64 / all-64-bit-int shapes take the vector path.
-fn objc_geometry_struct(selector: &str) -> Option<(u32, bool)> {
-    geometry_shape_of(&cocoa_db().ret_of(selector).unwrap_or_default())
+/// Selectors that return `instancetype` — the result is an instance of the
+/// receiver's class. Lets `[[NSWindow alloc] init]` carry `NSWindow`.
+fn is_instancetype_selector(sel: &str) -> bool {
+    matches!(sel, "alloc" | "new" | "self" | "copy" | "mutableCopy" | "retain" | "autorelease")
+        || sel.starts_with("init")
 }
 
 /// Map a geometry kind token (`R`/`P`/`S`/`N`) to `(field_count, is_float)`.
@@ -103,23 +101,25 @@ fn geometry_shape_of(kind: &str) -> Option<(u32, bool)> {
     }
 }
 
-/// Synthesize a bracket-send's return `TypeHint` from (priority order): an
-/// explicit `AS Type`; the selector DB's return kind; a curated
-/// NSString-returning selector; else `id`/Object. Geometry struct returns
-/// (R/P/S→FVec, N→Vec) are materialized as vectors (see objc_geometry_struct).
-fn objc_message_ret_hint(selector: &str, ret_annotation: Option<&str>) -> TypeHint {
+/// Map a (class-aware) resolved return KIND to a `TypeHint`: an explicit
+/// `AS Type` wins; else the DB kind (i/u/B→Int, d→Float, R/P/S→FVec [vector],
+/// N→Vec, @→String for a curated NSString selector else Object); else a
+/// curated String, else Object.
+fn objc_ret_hint_from_kind(
+    ret_kind: Option<&str>,
+    ret_annotation: Option<&str>,
+    selector: &str,
+) -> TypeHint {
     if let Some(h) = ret_annotation.and_then(type_hint_from_annotation) {
         return h;
     }
-    match cocoa_db().ret_of(selector).as_deref() {
+    match ret_kind {
         Some("i") | Some("u") | Some("B") => TypeHint::Int,
         Some("d") => TypeHint::Float,
         Some("R") | Some("P") | Some("S") => TypeHint::FVec,
         Some("N") => TypeHint::Vec,
         Some("@") if objc_selector_returns_string(selector) => TypeHint::String,
         Some("@") => TypeHint::Object,
-        // void / SEL / complex struct / other, or absent from the DB: a
-        // String for curated string selectors, else an id/Object.
         _ if objc_selector_returns_string(selector) => TypeHint::String,
         _ => TypeHint::Object,
     }
@@ -1502,8 +1502,34 @@ impl Sema {
                     .and_then(|f| f.result_class_name.clone()),
                 _ => None,
             },
+            // instancetype sends (`[[NSWindow alloc] init]`) carry the
+            // receiver's class, so a `LET w = …` binds with that class and a
+            // later `[w setFrame:…]` gets an EXACT instance-method lookup.
+            Expr::ObjcMessage { receiver, selector, .. } if is_instancetype_selector(selector) => {
+                self.objc_receiver_class(receiver).map(|(c, _)| c)
+            }
             _ => None,
         }
+    }
+
+    /// The static class of a bracket-send receiver and whether the send is a
+    /// CLASS method: a bare unbound Ident is a Cocoa class name (class
+    /// method); `SELF` is the current class (instance); an expression with a
+    /// known class is an instance receiver; otherwise None (the lookup falls
+    /// back to dominant per-selector aggregation).
+    fn objc_receiver_class(&self, receiver: &Expr) -> Option<(String, bool)> {
+        if let Expr::Ident { name, .. } = receiver {
+            if name == "SELF" || name == "SUPER" {
+                return self.current_class.clone().map(|c| (c, false));
+            }
+            let bound = self.lookup(name).is_some()
+                || self.manifests.contains_key(name)
+                || self.globals.contains_key(name);
+            if !bound {
+                return Some((name.clone(), true)); // Cocoa class name -> class method
+            }
+        }
+        self.class_of_expr(receiver).map(|c| (c, false))
     }
 
     fn analyze_stmt(&mut self, stmt: &Stmt) {
@@ -2158,14 +2184,18 @@ impl Sema {
                         a.set_hint(h);
                     }
                 }
-                // Per-arg geometry struct shapes from the DB arg-kinds: a
-                // selector like `setFrame:` takes an NSRect by value, so the
-                // caller's FVEC/VEC is loaded as a struct argument. (NSString
-                // `args` is one kind-char per argument.)
-                let arg_kinds: Vec<u8> = cocoa_db()
-                    .lookup(selector)
-                    .map(|s| s.args.bytes().collect())
-                    .unwrap_or_default();
+                // Resolve the signature CLASS-AWARELY: a class-name receiver
+                // (`[NSColor clearColor]`) or an instancetype-tracked binding
+                // (`LET w = [[NSWindow alloc] init…]`) gets the EXACT
+                // (class, selector) row; otherwise the dominant per-selector
+                // aggregation. One lookup drives both arg + return synthesis.
+                let (rcls, ric) = self
+                    .objc_receiver_class(receiver)
+                    .map(|(c, ic)| (Some(c), ic))
+                    .unwrap_or((None, false));
+                let sig = cocoa_db().lookup_class(rcls.as_deref(), ric, selector);
+                let arg_kinds: Vec<u8> =
+                    sig.as_ref().map(|s| s.args.bytes().collect()).unwrap_or_default();
                 let shapes: Vec<Option<(u32, bool)>> = (0..args.len())
                     .map(|i| {
                         arg_kinds
@@ -2224,17 +2254,15 @@ impl Sema {
                         );
                     }
                 }
-                // A geometry struct return (no `AS` override) is
-                // materialized as a vector — record its shape for codegen.
+                // Return type + geometry-struct shape from the SAME resolved
+                // (class-aware) signature. An explicit `AS Type` overrides.
+                let ret_kind = sig.as_ref().map(|s| s.ret.as_str());
                 if ret_annotation.is_none() {
-                    ret_struct.set(objc_geometry_struct(selector));
+                    ret_struct.set(ret_kind.and_then(geometry_shape_of));
                 } else {
                     ret_struct.set(None);
                 }
-                // Return type synthesized from the selector DB (ints,
-                // floats, ids, geometry vectors) refined by the curated
-                // string set, with an explicit `AS Type` overriding everything.
-                objc_message_ret_hint(selector, ret_annotation.as_deref())
+                objc_ret_hint_from_kind(ret_kind, ret_annotation.as_deref(), selector)
             }
         }
     }
@@ -3070,6 +3098,21 @@ mod tests {
             "expected an immutable-string error on `s % i := c`; got {:?}",
             out.errors
         );
+    }
+
+    #[test]
+    fn instancetype_send_infers_receiver_class() {
+        // `[[NSWindow alloc] init]` is an instancetype chain, so the binding
+        // carries the receiver's class — enabling EXACT instance-method
+        // lookup on `w` later. Pure sema inference (no DB needed).
+        let out = analyze_str("LET START() BE $( LET w = [[NSWindow alloc] init] $)\n");
+        let w = out
+            .bindings
+            .iter()
+            .rev()
+            .find(|b| b.name == "w")
+            .expect("binding w");
+        assert_eq!(w.class_name.as_deref(), Some("NSWindow"));
     }
 
     #[test]

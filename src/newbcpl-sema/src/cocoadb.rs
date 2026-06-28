@@ -108,6 +108,36 @@ impl CocoaDb {
         }
     }
 
+    /// Class-aware EXACT signature: when the static receiver `class` (and
+    /// whether it's a class method) is known, look up that exact
+    /// `(class, selector, is_class)` row — no cross-class aggregation, so a
+    /// selector that varies by class (e.g. `frame` = CGRect on a view but an
+    /// id elsewhere; `clearColor` = id on NSColor) resolves to the RIGHT
+    /// signature. Falls back to the dominant per-selector `lookup` when the
+    /// class is unknown, there's no exact row, or under the JSON backend.
+    pub fn lookup_class(
+        &self,
+        class: Option<&str>,
+        is_class: bool,
+        selector: &str,
+    ) -> Option<SelSig> {
+        if let (Some(cls), Some(m)) = (class, &self.sqlite) {
+            let key = format!("{cls}\t{}\t{selector}", is_class as u8);
+            {
+                let mut st = m.lock().expect("cocoa sqlite mutex");
+                if let Some(hit) = st.cache.get(&key) {
+                    return hit.clone();
+                }
+                let sig = st.query_exact(cls, is_class, selector);
+                st.cache.insert(key, sig.clone());
+                if sig.is_some() {
+                    return sig; // lock dropped on return
+                }
+            } // lock dropped before the dominant fallback (no re-entrant lock)
+        }
+        self.lookup(selector)
+    }
+
     /// The return kind for a selector, if covered.
     pub fn ret_of(&self, selector: &str) -> Option<String> {
         self.lookup(selector).map(|s| s.ret)
@@ -231,10 +261,50 @@ impl SqliteState {
             return None;
         }
         // Dominant kind wins (consistent selectors resolve exactly; rare
-        // outliers lose). Receiver-class-exact lookup is the future refinement.
+        // outliers lose). lookup_class does the exact thing when the receiver
+        // class is known.
         let ret = rets.iter().max_by_key(|(_, n)| **n).map(|(c, _)| *c).unwrap();
         let args = argsets.into_iter().max_by_key(|(_, n)| *n).map(|(a, _)| a).unwrap_or_default();
         Some(SelSig { ret: ret.to_string(), args })
+    }
+
+    /// The exact `(class, selector, is_class)` signature — at most one row
+    /// (that triple is the primary key), parsed directly (no aggregation).
+    fn query_exact(&self, class: &str, is_class: bool, selector: &str) -> Option<SelSig> {
+        let sql = format!(
+            "SELECT encoding FROM rt_methods WHERE class=?1 AND selector=?2 AND is_class={} \
+             AND encoding IS NOT NULL",
+            is_class as u8
+        );
+        let csql = std::ffi::CString::new(sql).ok()?;
+        unsafe {
+            let mut stmt: *mut c_void = std::ptr::null_mut();
+            if (self.fns.prepare)(self.db, csql.as_ptr(), -1, &mut stmt, std::ptr::null_mut())
+                != SQLITE_OK
+                || stmt.is_null()
+            {
+                return None;
+            }
+            let (Ok(ccls), Ok(csel)) =
+                (std::ffi::CString::new(class), std::ffi::CString::new(selector))
+            else {
+                (self.fns.finalize)(stmt);
+                return None;
+            };
+            (self.fns.bind_text)(stmt, 1, ccls.as_ptr(), -1, SQLITE_TRANSIENT as *mut c_void);
+            (self.fns.bind_text)(stmt, 2, csel.as_ptr(), -1, SQLITE_TRANSIENT as *mut c_void);
+            let mut result = None;
+            if (self.fns.step)(stmt) == SQLITE_ROW {
+                let txt = (self.fns.column_text)(stmt, 0);
+                if !txt.is_null() {
+                    let enc = core::ffi::CStr::from_ptr(txt as *const c_char).to_string_lossy();
+                    let (ret, args) = parse_method_encoding(&enc);
+                    result = Some(SelSig { ret: ret.to_string(), args });
+                }
+            }
+            (self.fns.finalize)(stmt);
+            result
+        }
     }
 }
 
