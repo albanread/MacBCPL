@@ -1502,6 +1502,53 @@ pub fn builtin_addresses() -> &'static [Builtin] {
                 address: g::iGui_TextShowCaret as *const () as usize,
             });
         }
+        // macOS iGui surface — the same `iGui_*` symbols backed by the
+        // `igui_mac` module (no-op stubs for now; Phase 3 of the port
+        // makes them Cocoa-backed via the MacModula2 objc bridge). This
+        // mirrors the Windows block above so the `igui` standard module
+        // resolves identically on macOS.
+        #[cfg(not(windows))]
+        {
+            use crate::igui_mac as g;
+            let macigui: &[(&'static str, usize)] = &[
+                ("iGui_OpenChild", g::iGui_OpenChild as *const () as usize),
+                ("iGui_CloseChild", g::iGui_CloseChild as *const () as usize),
+                ("iGui_SetTitle", g::iGui_SetTitle as *const () as usize),
+                ("iGui_BeginBatch", g::iGui_BeginBatch as *const () as usize),
+                ("iGui_SubmitBatch", g::iGui_SubmitBatch as *const () as usize),
+                ("iGui_Clear", g::iGui_Clear as *const () as usize),
+                ("iGui_FillRect", g::iGui_FillRect as *const () as usize),
+                ("iGui_StrokeRect", g::iGui_StrokeRect as *const () as usize),
+                ("iGui_FillCircle", g::iGui_FillCircle as *const () as usize),
+                ("iGui_DrawLine", g::iGui_DrawLine as *const () as usize),
+                ("iGui_DrawText", g::iGui_DrawText as *const () as usize),
+                ("iGui_NextEvent", g::iGui_NextEvent as *const () as usize),
+                ("iGui_Quit", g::iGui_Quit as *const () as usize),
+                ("iGui_NextEventFor", g::iGui_NextEventFor as *const () as usize),
+                (
+                    "iGui_DiscardStashedEvents",
+                    g::iGui_DiscardStashedEvents as *const () as usize,
+                ),
+                ("iGui_FilterOnWindow", g::iGui_FilterOnWindow as *const () as usize),
+                ("iGui_UnfilterWindow", g::iGui_UnfilterWindow as *const () as usize),
+                ("iGui_ClearFilter", g::iGui_ClearFilter as *const () as usize),
+                ("iGui_OpenText", g::iGui_OpenText as *const () as usize),
+                ("iGui_TextWriteStr", g::iGui_TextWriteStr as *const () as usize),
+                ("iGui_TextWriteChar", g::iGui_TextWriteChar as *const () as usize),
+                ("iGui_TextNewline", g::iGui_TextNewline as *const () as usize),
+                ("iGui_TextSetCursor", g::iGui_TextSetCursor as *const () as usize),
+                ("iGui_TextClear", g::iGui_TextClear as *const () as usize),
+                ("iGui_TextClearEol", g::iGui_TextClearEol as *const () as usize),
+                ("iGui_TextClearEos", g::iGui_TextClearEos as *const () as usize),
+                ("iGui_TextScrollUp", g::iGui_TextScrollUp as *const () as usize),
+                ("iGui_TextSetPen", g::iGui_TextSetPen as *const () as usize),
+                ("iGui_TextResetPen", g::iGui_TextResetPen as *const () as usize),
+                ("iGui_TextShowCaret", g::iGui_TextShowCaret as *const () as usize),
+            ];
+            for &(name, address) in macigui {
+                v.push(Builtin { name, address });
+            }
+        }
         // NewAudio shims — slot bookkeeping and synthesis work
         // everywhere; live waveOut / midiOut output is Windows-only
         // and gated inside the shim. The names match

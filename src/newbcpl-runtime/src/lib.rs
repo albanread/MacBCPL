@@ -31,6 +31,12 @@ pub mod igui;
 #[cfg(windows)]
 pub mod igui_builtins;
 
+/// macOS iGui surface — the `iGui_*` C-ABI builtins backed by Cocoa
+/// (no-op stubs initially; Phase 3 wires them to the MacModula2 objc
+/// bridge). The macOS analogue of `igui_builtins`.
+#[cfg(not(windows))]
+pub mod igui_mac;
+
 /// BCPL `Sound_*` / `Music_*` runtime — game-focused SFX synth and
 /// ABC → MIDI playback, backed by NewAudio. Slot bookkeeping and
 /// synthesis work on every target; live waveOut / midiOut playback

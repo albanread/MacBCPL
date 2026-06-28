@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "src/bcpl-wingui",
+    "new-asm",
     "src/newbcpl-driver",
     "src/newbcpl-ir",
     "src/newbcpl-lexer",

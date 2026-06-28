@@ -49,9 +49,10 @@ pub fn dump_asm(path: &Path) -> String {
             let context = Context::create();
             let module = emit::emit(&context, &ir);
 
-            // Initialise the x86 target backend (the family we
-            // target — x86_64-pc-windows-msvc).
-            Target::initialize_x86(&InitializationConfig::default());
+            // Initialise the AArch64 target backend — the MacBCPL port
+            // targets aarch64-apple-darwin. `get_default_triple()` below
+            // resolves to the host arm64 triple.
+            Target::initialize_aarch64(&InitializationConfig::default());
 
             let triple = TargetMachine::get_default_triple();
             module.set_triple(&triple);
@@ -331,7 +332,17 @@ fn run_program_ir(ir: &IrModule, modules_dir: Option<&Path>) -> Result<i64, Stri
         );
     }
     opts.OptLevel = OptimizationLevel::Default as u32;
-    opts.MCJMM = unsafe { jit_mm::make_mm() };
+    // On Windows we install our custom MCJIT memory manager so JIT'd
+    // code's `.pdata`/`.xdata` get registered with the OS SEH unwinder
+    // (`RtlAddFunctionTable`). On macOS arm64 we leave `MCJMM` null so
+    // MCJIT uses its default memory manager, which registers DWARF
+    // `.eh_frame` for the JIT'd code — that's what lets a Rust panic in
+    // a runtime helper unwind cleanly back through the JIT frames.
+    // (Same split as MacModula2's newm2-llvm.)
+    #[cfg(windows)]
+    {
+        opts.MCJMM = unsafe { jit_mm::make_mm() };
+    }
 
     let mut engine: LLVMExecutionEngineRef = std::ptr::null_mut();
     let mut err_msg: *mut std::ffi::c_char = std::ptr::null_mut();
