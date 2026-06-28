@@ -29,6 +29,17 @@ fn typed_int_return() {
     );
 }
 
+/// Selector-DB return synthesis: NO annotation needed — `length`/`count`
+/// (`u`→Int) and `doubleValue` (`d`→Float) get their hints from the DB.
+#[test]
+fn db_synthesizes_scalar_returns() {
+    expect(
+        "objc_db_scalars",
+        "LET START() BE $(\n  WRITEN([\"Hello\" length])\n  FWRITE([[NSNumber numberWithDouble: 2.5] doubleValue])\n$)\n",
+        "52.5",
+    );
+}
+
 /// Class-name receiver -> a class method send (via bcpl_objc_get_class).
 #[test]
 fn class_receiver_send() {

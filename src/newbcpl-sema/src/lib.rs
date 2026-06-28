@@ -47,6 +47,39 @@ pub use newbcpl_parser::TypeHint;
 pub mod layout;
 pub use layout::{ClassLayout, FieldLayout, VtableEntry};
 
+mod cocoadb;
+use cocoadb::CocoaDb;
+
+/// The Cocoa selector→signature DB (return + arg kinds), parsed once.
+/// Drives return-type synthesis for bracket sends so `[arr count]`,
+/// `[n doubleValue]`, etc. need no `AS` annotation.
+fn cocoa_db() -> &'static CocoaDb {
+    static DB: std::sync::OnceLock<CocoaDb> = std::sync::OnceLock::new();
+    DB.get_or_init(CocoaDb::load)
+}
+
+/// Synthesize a bracket-send's return `TypeHint` from (in priority order):
+/// an explicit `AS Type`; the selector DB's return kind; a curated
+/// NSString-returning selector (the DB only says `@`/id, not the concrete
+/// class); else an `id`/Object. Struct returns (geometry tags R/P/S/N or a
+/// `{…}` descriptor) are left as Object for now — Tier B/C will materialize
+/// them into vectors / wrapper objects.
+fn objc_message_ret_hint(selector: &str, ret_annotation: Option<&str>) -> TypeHint {
+    if let Some(h) = ret_annotation.and_then(type_hint_from_annotation) {
+        return h;
+    }
+    match cocoa_db().ret_of(selector) {
+        Some("i") | Some("u") | Some("B") => TypeHint::Int,
+        Some("d") => TypeHint::Float,
+        Some("@") if objc_selector_returns_string(selector) => TypeHint::String,
+        Some("@") => TypeHint::Object,
+        // void / SEL / struct / other, or absent from the DB: fall back to
+        // a String for curated string selectors, else an id/Object.
+        _ if objc_selector_returns_string(selector) => TypeHint::String,
+        _ => TypeHint::Object,
+    }
+}
+
 /// Stable, comparable identifier for a binding. Codegen uses these
 /// rather than name-based string lookup so multiple references to the
 /// same variable land on a single storage slot.
@@ -2082,19 +2115,10 @@ impl Sema {
                         );
                     }
                 }
-                // Return type: an explicit trailing `AS Type` wins; else a
-                // known NSString-returning selector yields String (so the
-                // result flows into `%`/LEN/WRITES safely without the user
-                // annotating, and isn't dereferenced as raw bytes); else an
-                // `id`/Object. (A full selector signature DB will broaden
-                // this synthesis to ints/floats/structs later.)
-                if let Some(h) = ret_annotation.as_deref().and_then(type_hint_from_annotation) {
-                    h
-                } else if objc_selector_returns_string(selector) {
-                    TypeHint::String
-                } else {
-                    TypeHint::Object
-                }
+                // Return type synthesized from the selector DB (ints,
+                // floats, ids) refined by the curated string set, with an
+                // explicit `AS Type` overriding everything.
+                objc_message_ret_hint(selector, ret_annotation.as_deref())
             }
         }
     }
@@ -2950,11 +2974,13 @@ mod tests {
         // result is safe under %/LEN/WRITES without annotation).
         let out = analyze_str(
             "LET START() BE $( LET a = [[NSMutableArray alloc] init]\n \
-             LET b = [\"x\" length] AS INT\n LET c = [\"x\" uppercaseString] $)\n",
+             LET b = [\"x\" length]\n LET c = [\"x\" uppercaseString]\n \
+             LET d = [\"x\" doubleValue] $)\n",
         );
-        assert_eq!(binding_hint(&out, "a"), TypeHint::Object);
-        assert_eq!(binding_hint(&out, "b"), TypeHint::Int);
-        assert_eq!(binding_hint(&out, "c"), TypeHint::String);
+        assert_eq!(binding_hint(&out, "a"), TypeHint::Object); // init -> @
+        assert_eq!(binding_hint(&out, "b"), TypeHint::Int); // length -> u (DB, no AS)
+        assert_eq!(binding_hint(&out, "c"), TypeHint::String); // curated string
+        assert_eq!(binding_hint(&out, "d"), TypeHint::Float); // doubleValue -> d (DB)
     }
 
     #[test]
