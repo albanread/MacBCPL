@@ -1455,10 +1455,10 @@ The receiver before the selector may be:
 ### 10.3 Return types are synthesized
 
 A message's result type matters: an integer comes back in a different machine
-register than a double, and a string must be treated as an `NSString`, not a raw
-word. New BCPL **synthesizes the return type from a selector database** — the
-same `cocoa-selectors.json` (5,500-odd selectors) that records each method's
-Objective-C type encoding. So the common getters need no annotation at all:
+register than a double, a struct must be unpacked, and a string must be treated
+as an `NSString`, not a raw word. New BCPL **synthesizes the return type from a
+database of Objective-C method encodings**, so the common getters need no
+annotation at all:
 
 ```bcpl
 LET n   = [arr count]              // -> INT
@@ -1467,12 +1467,33 @@ LET up  = [s uppercaseString]      // -> a String (NSString)
 LET obj = [[NSObject alloc] init]  // -> Object
 ```
 
+The synthesis is **receiver-class-exact**: when the receiver's class is known,
+the compiler looks up *that class's* signature for the selector. This matters
+because one selector can mean different things on different classes — `frame` is
+a rectangle on a window or a view, but an object elsewhere. The class flows
+through allocation, since `alloc` / `init` / `new` / `copy` return the
+receiver's own class:
+
+```bcpl
+LET w = [[NSWindow alloc] init]    // w is known to be an NSWindow
+LET f = [w frame]                  // -> FVEC: exactly NSWindow's frame, an NSRect
+```
+
+so `f` is typed as the rectangle it is. A class-name receiver
+(`[NSColor clearColor]`) is resolved against that class the same way.
+
+> The bundled database covers a curated subset of the frameworks. To synthesize
+> against the *entire* Objective-C surface — tens of thousands of classes — set
+> the environment variable `COCOA_SQLITE` to the path of the shared
+> `cocoa.sqlite` mirror; the compiler reads it during type checking. Without it
+> the bundled data is used: deterministic, and enough for the common classes.
+
 When the database does not cover a selector, or you want to override it, append
 a trailing **`AS Type`**:
 
 ```bcpl
 LET clicked = [alert runModal] AS INT
-LET pi      = [thing somethingExotic] AS FLOAT
+LET val     = [thing somethingExotic] AS FLOAT
 ```
 
 The same `AS Type` works on an *argument* when a selector expects a particular
@@ -1482,7 +1503,8 @@ machine type — most often a `double`, which must travel in a floating register
 LET f = [NSFont systemFontOfSize: 14 AS FLOAT]
 ```
 
-The default, absent any annotation or database entry, is `Object`.
+The default — absent any annotation, known class, or database entry — is
+`Object`.
 
 ### 10.4 Strings and collections
 
@@ -1559,6 +1581,16 @@ LET w = [[NSWindow alloc] initWithContentRect: rect styleMask: 15
 ```
 
 That is, in full, how you open a native window from BCPL.
+
+The vector must match the struct exactly. Passing a scalar where a struct is
+expected, or a vector of the wrong field count, is caught at compile time rather
+than left to fault at run time:
+
+```bcpl
+[w setFrame: 0]                  // error: setFrame: expects a struct value
+                                 //        (an FVEC/VEC of 4 fields), not a scalar
+[w setFrame: (FVEC [1.0, 2.0])]  // error: setFrame: expects 4 fields, got 2
+```
 
 ### 10.7 Who owns the result — and a hazard
 

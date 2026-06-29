@@ -24,6 +24,16 @@ LLVM_SYS_221_PREFIX=/opt/homebrew/opt/llvm
 (If building outside this harness, export `LLVM_SYS_221_PREFIX` to the same
 prefix before `cargo build`.)
 
+Two optional environment variables tune the compiler/runtime at use time:
+
+- `COCOA_SQLITE=/path/to/cocoa.sqlite` — point the Cocoa type-synthesis layer
+  (Chapter 10 of the language manual) at the full shared `cocoa.sqlite` mirror
+  (the sister `cocoa_data` DB, tens of thousands of classes) instead of the
+  bundled curated subset. Read during type checking; unset is fine and
+  deterministic.
+- `NEWBCPL_MODULES_ACTIVE=/path/to/dir` — override the `./modules-active/`
+  location the loader scans for library modules.
+
 ```sh
 cargo build --workspace
 cargo test  --workspace      # suite is green on arm64; 6 inline-x86-ASM probes are #[ignore]d
