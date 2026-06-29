@@ -35,6 +35,7 @@ CLASS IdeController EXTENDS NSObject $(
     DECL tabbar          // NSView strip holding the tab buttons
     DECL paths           // NSMutableArray of open-file paths ("" = untitled)
     DECL texts           // NSMutableArray of each tab's text
+    DECL dirty           // NSMutableArray of per-tab unsaved flags (NSNumber 0/1)
     DECL curtab          // active tab index (-1 = none)
 
     ROUTINE setup(ed, ov, w, g, d, tb) BE $(
@@ -47,7 +48,13 @@ CLASS IdeController EXTENDS NSObject $(
         tabbar := tb
         paths  := [[NSMutableArray alloc] init]
         texts  := [[NSMutableArray alloc] init]
+        dirty  := [[NSMutableArray alloc] init]
         curtab := -1
+    $)
+
+    // Mark the active tab dirty / clean (parallel to paths/texts).
+    ROUTINE mark_dirty(flag) BE $(
+        IF curtab >= 0 DO [dirty replaceObjectAtIndex: curtab withObject: [NSNumber numberWithInt: flag]]
     $)
 
     // ─── Tabs (multi-file editing) ───────────────────────────────────
@@ -87,6 +94,7 @@ CLASS IdeController EXTENDS NSObject $(
             ELSE $(
                 [paths addObject: path]
                 [texts addObject: content]
+                [dirty addObject: [NSNumber numberWithInt: 0]]
                 SELF.show_tab([paths count] AS INT - 1)
             $)
     $)
@@ -133,9 +141,18 @@ CLASS IdeController EXTENDS NSObject $(
     ROUTINE close_at(idx) BE $(
         LET n = [paths count] AS INT
         IF (idx < 0) | (idx >= n) DO RETURN
+        // Confirm if the tab has unsaved edits.
+        IF ([[dirty objectAtIndex: idx] intValue] AS INT) ~= 0 DO $(
+            LET alert = [[NSAlert alloc] init]
+            [alert setMessageText: "Discard unsaved changes?"]
+            [alert addButtonWithTitle: "Discard"]
+            [alert addButtonWithTitle: "Cancel"]
+            IF ([alert runModal] AS INT) ~= 1000 DO RETURN   // 1000 = Discard; else cancel
+        $)
         UNLESS idx = curtab DO SELF.save_current()   // keep active edits if closing another
         [paths removeObjectAtIndex: idx]
         [texts removeObjectAtIndex: idx]
+        [dirty removeObjectAtIndex: idx]
         LET m = [paths count] AS INT
         TEST m = 0
             THEN $( curtab := -1 ; SELF.open_doc("", "") $)
@@ -196,6 +213,7 @@ CLASS IdeController EXTENDS NSObject $(
             [[editor string] writeToFile: path atomically: 1 encoding: 4 error: 0]
             // Bind the chosen path to the active tab + relabel it.
             IF curtab >= 0 DO [paths replaceObjectAtIndex: curtab withObject: path]
+            SELF.mark_dirty(0)
             [win setTitleWithRepresentedFilename: path]
             SELF.rebuild_tabs()
         $)
@@ -206,7 +224,10 @@ CLASS IdeController EXTENDS NSObject $(
         LET p = [paths objectAtIndex: curtab]
         TEST ([p length] AS INT) = 0
             THEN SELF.doSaveAs(s)
-            ELSE [[editor string] writeToFile: p atomically: 1 encoding: 4 error: 0]
+            ELSE $(
+                [[editor string] writeToFile: p atomically: 1 encoding: 4 error: 0]
+                SELF.mark_dirty(0)
+            $)
     $)
 
     ROUTINE doOpen(s) BE $(
@@ -315,7 +336,10 @@ CLASS IdeController EXTENDS NSObject $(
     // Fired by NSTextDidChangeNotification on every edit (the notification
     // centre dispatches to whatever selector we register — here the
     // `bcpl_`-mangled one for this very method).
-    ROUTINE onTextChanged(note) BE SELF.recolor()
+    ROUTINE onTextChanged(note) BE $(
+        SELF.mark_dirty(1)
+        SELF.recolor()
+    $)
 $)
 
 // ─── Menu construction ──────────────────────────────────────────────
