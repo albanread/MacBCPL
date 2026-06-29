@@ -19,8 +19,12 @@ stack — has been replaced with a native macOS stack:
   ([docs/crash_handling.md](docs/crash_handling.md)).
 
 The end-to-end pipeline runs: source → lex → parse → sema → IR → LLVM emit →
-MCJIT → execute. Console programs JIT and run today; the Cocoa GUI is in
-progress.
+MCJIT → execute. Console programs JIT and run today, and Cocoa is reachable now
+through Objective-C bracket message sends — far enough that **the bundled IDE
+([examples/bcpl-ide.bcl](examples/bcpl-ide.bcl)) is itself a native Cocoa app
+written in BCPL that edits and runs BCPL**: an editable source pane over an
+output pane, a native menu bar, file open/save, and `Cmd-R` to compile and run
+the buffer out of process.
 
 ## Quick start
 

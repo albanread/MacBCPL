@@ -25,7 +25,7 @@ big departures from upstream NewBCPL are:
 
 ## Index
 
-- **[the_new_bcpl_programming_language.md](the_new_bcpl_programming_language.md)** — the language manual: a K&R-style tutorial and reference for New BCPL (with Cocoa). Part I covers the lexis, types, control flow, functions, pointers/vectors, lists, classes, and the memory model; Part II ("Cocoa") covers strings as `NSString` objects and the `[receiver selector: arg]` bracket message send for driving Cocoa/AppKit. Grammar and standard-library appendices.
+- **[the_new_bcpl_programming_language.md](the_new_bcpl_programming_language.md)** — the language manual: a K&R-style tutorial and reference for New BCPL (with Cocoa). Part I covers the lexis, types, control flow, functions, pointers/vectors, lists, classes, and the memory model; Part II ("Cocoa") covers strings as `NSString` objects and the `[receiver selector: arg]` bracket message send for driving Cocoa/AppKit, closing with the bundled IDE — a native Cocoa app written in BCPL that runs BCPL — as a worked whole. Grammar and standard-library appendices.
 - **[macos_build.md](macos_build.md)** — toolchain, build env, and how to run the JIT on Apple Silicon.
 - **[memory_model.md](memory_model.md)** — the no-GC, three-tier "heap objects with stack scope" model.
 - **[cocoa_objects.md](cocoa_objects.md)** — `CLASS`/`EXTENDS`/`NEW`/`SUPER` lowered onto the Obj-C runtime; object ownership.

@@ -1171,8 +1171,9 @@ thinking about it — the string — which is now an `NSString` (Chapter 9). Cha
 selector: arg …]`, which lets a BCPL program call any Objective-C method on any
 object. With it the frameworks are reachable today — the worked examples drive
 `NSProcessInfo`, `NSMutableArray`, `NSFont` geometry, an `NSAlert` dialog, and a
-real `NSWindow` — and a higher-level, BCPL-flavored wrapping of AppKit will grow
-here on top of it.
+real `NSWindow`, and culminate in a complete native IDE written in BCPL that
+edits and runs BCPL (§10.9). A higher-level, BCPL-flavored wrapping of AppKit
+will grow here on top of the message send.
 
 ---
 
@@ -1628,6 +1629,62 @@ Use the dot for objects you defined with `CLASS`; use brackets to drive the
 frameworks. A single program mixes them freely — a BCPL object can be passed to
 AppKit, and a Cocoa object can be stored in a BCPL field.
 
+### 10.9 A worked whole: the BCPL IDE
+
+Everything in Part II comes together in `examples/bcpl-ide.bcl`: a native macOS
+IDE, **written in BCPL, that edits and runs BCPL**. In a couple of hundred lines
+it builds a real Cocoa application — an editable `NSTextView` source pane over a
+read-only output pane in an `NSSplitView`, a native menu bar, file open/save
+through `NSOpenPanel`/`NSSavePanel`, and `Cmd-R` to compile and run the buffer —
+with no Objective-C anywhere; it is bracket message sends and a BCPL class all
+the way down.
+
+The crux is how a BCPL object becomes a Cocoa **action target**. The IDE's
+controller is an ordinary BCPL class that subclasses `NSObject` (Chapter 7), so
+it is a real Objective-C object whose methods are installed as IMPs:
+
+```bcpl
+CLASS IdeController EXTENDS NSObject $(
+    DECL editor, outv, win, cur
+    ROUTINE doRun(s) BE $(
+        [[editor string] writeToFile: tmp atomically: 1 encoding: 4 error: 0]
+        [outv setString: bcpl_run_capture(cmd)]      // run the buffer, show output
+    $)
+    ...
+$)
+```
+
+A menu item then targets one of those methods. Because a BCPL method `m` lives
+under the Objective-C selector `bcpl_m` (§10.8), the IDE names that selector with
+the runtime primitive `bcpl_selector` and hands it to the menu item:
+
+```bcpl
+LET it = [[NSMenuItem alloc] initWithTitle: "Run"
+                             action: bcpl_selector("bcpl_doRun") keyEquivalent: "r"]
+[it setTarget: ctrl]                                 // ctrl is a NEW IdeController
+```
+
+Standard editor commands — Cut, Copy, Undo, Select All — need no controller:
+they are named the same way (`cut:`, `undo:`, …) with a *nil* target, so Cocoa's
+responder chain dispatches them to the focused `NSTextView`. The program then
+hands control to the ordinary Cocoa run loop, `[app run]`, which drives the key
+window, the editor, and every menu action — no hand-written event pump.
+
+Two small runtime primitives make this possible, both returning `NSString`s or
+`SEL`s the BCPL code treats as ordinary words:
+
+- `bcpl_selector(name)` — reify an Objective-C selector by name, so BCPL can
+  name an action (its own `bcpl_…` method, or a standard one like `cut:`).
+- `bcpl_run_capture(cmd)` — run a shell command and return its combined
+  stdout+stderr as a string. The IDE writes the buffer to a temp file and runs
+  `newbcpl-driver run` on it, **out of process** — so a crash in the program
+  under test kills the subprocess, not the IDE.
+
+The lesson of the example is the thesis of Part II: with classes that are Cocoa
+objects (Chapter 7), strings that are `NSString`s (Chapter 9), and the bracket
+send to reach the frameworks (this chapter), a complete native application — even
+the development environment itself — is an ordinary BCPL program.
+
 > **Exercise 10-1.** Using `NSProcessInfo`, print the process name, the active
 > processor count (`AS INT`), and the operating-system version string. Which
 > results needed an annotation, and why?
@@ -1639,6 +1696,12 @@ AppKit, and a Cocoa object can be stored in a BCPL field.
 > **Exercise 10-3.** Call a method that returns an `NSRect` (e.g. a font's
 > bounding rectangle) and print its width and height by field name. What kind of
 > vector did you get back, and which subscript reads it?
+>
+> **Exercise 10-4.** Read `examples/bcpl-ide.bcl` (§10.9). Add a "Clear output"
+> command: a method on `IdeController` that empties the output pane, a
+> `bcpl_selector` for it, and a menu item under Program targeting the
+> controller. Why does this need a controller method, where Cut and Copy did
+> not?
 
 ---
 
