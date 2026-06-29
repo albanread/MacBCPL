@@ -122,6 +122,19 @@ fn selector_interns_a_sel() {
     );
 }
 
+/// `bcpl_set_text_color` colours a character range of an NSTextStorage
+/// in place (the NSColor + NSRange are built in the runtime, so BCPL
+/// passes only ints/floats). The IDE's syntax colouriser uses it; here we
+/// just confirm it runs and leaves the text/length intact.
+#[test]
+fn set_text_color_applies_to_range() {
+    expect(
+        "objc_set_text_color",
+        "LET START() BE $(\n  LET ts = [[NSTextStorage alloc] initWithString: \"hello world\"]\n  bcpl_set_text_color(ts, 0, 5, 1.0, 0.2, 0.2)\n  WRITEN([ts length] AS INT)\n$)\n",
+        "11",
+    );
+}
+
 // ─── Tier B: struct returns materialized as vectors ─────────────────
 
 /// NSRange return (DB tag N) -> a 2-word VEC via the arm64 integer-pair

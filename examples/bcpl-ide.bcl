@@ -78,6 +78,7 @@ CLASS IdeController EXTENDS NSObject $(
                 [editor setString: content]
                 cur := bcpl_objc_retain(path)
                 [win setTitleWithRepresentedFilename: path]
+                SELF.recolor()
             $)
         $)
     $)
@@ -86,7 +87,42 @@ CLASS IdeController EXTENDS NSObject $(
         [editor setString: ""]
         cur := 0
         [win setTitle: "MacBCPL IDE — Untitled"]
+        SELF.recolor()
     $)
+
+    // Syntax colouriser: light default, comments green, strings orange.
+    // Char codes: 47='/'  34='"'  10=newline. Source is ASCII so code-point
+    // indices (LEN/%) line up with NSTextStorage's UTF-16 ranges.
+    ROUTINE recolor() BE $(
+        LET ts = [editor textStorage]
+        LET src = [editor string] AS STRING
+        LET n = LEN src
+        bcpl_set_text_color(ts, 0, n, 0.85, 0.86, 0.92)       // default (light)
+        LET i = 0
+        WHILE i < n DO $(
+            LET c = src % i
+            TEST (c = 47) & (i + 1 < n) & ((src % (i + 1)) = 47)
+            THEN $(                                            // // comment → EOL
+                LET s = i
+                WHILE (i < n) & ((src % i) ~= 10) DO i := i + 1
+                bcpl_set_text_color(ts, s, i - s, 0.45, 0.72, 0.45)
+            $)
+            ELSE TEST c = 34
+            THEN $(                                            // "string"
+                LET s = i
+                i := i + 1
+                WHILE (i < n) & ((src % i) ~= 34) DO i := i + 1
+                IF i < n DO i := i + 1                          // include closing quote
+                bcpl_set_text_color(ts, s, i - s, 0.95, 0.62, 0.35)
+            $)
+            ELSE i := i + 1
+        $)
+    $)
+
+    // Fired by NSTextDidChangeNotification on every edit (the notification
+    // centre dispatches to whatever selector we register — here the
+    // `bcpl_`-mangled one for this very method).
+    ROUTINE onTextChanged(note) BE SELF.recolor()
 $)
 
 // ─── Menu construction ──────────────────────────────────────────────
@@ -159,6 +195,10 @@ LET START() BE $(
     [editor setRichText: 0]
     [editor setAllowsUndo: 1]
     [editor setFont: [NSFont userFixedPitchFontOfSize: 13.0]]
+    // Dark editor theme so the syntax colours read well.
+    [editor setBackgroundColor: [NSColor colorWithRed: 0.12 green: 0.13 blue: 0.16 alpha: 1.0]]
+    [editor setTextColor: [NSColor colorWithRed: 0.85 green: 0.86 blue: 0.92 alpha: 1.0]]
+    [editor setInsertionPointColor: [NSColor whiteColor]]
     [edScroll setDocumentView: editor]
 
     LET outScroll = [[NSScrollView alloc] initWithFrame: (FVEC [0.0, 0.0, 920.0, 200.0])]
@@ -172,11 +212,25 @@ LET START() BE $(
     [split addSubview: outScroll]
     [w setContentView: split]
 
-    [editor setString: "// MacBCPL IDE — Cmd-R run, Cmd-O open, Cmd-S save, Cmd-Q quit.*N*NLET START() BE $(*N  WRITES(*"Hello from the BCPL IDE!*N*")*N  FOR i = 1 TO 5 DO WRITEF(*"i = %d*N*", i)*N$)*N"]
+    // NOTE on escaping: `*N` here is a REAL newline in the displayed text
+    // (structural line breaks of the starter program); `**N` is an escaped
+    // asterisk so the editor shows the two characters `*N` — the BCPL
+    // newline escape — INSIDE the inner string literals (a real newline
+    // inside a string is a lex error, so the starter program must show the
+    // escape, not a line break).
+    [editor setString: "// MacBCPL IDE — Cmd-R run, Cmd-O open, Cmd-S save, Cmd-Q quit.*N*NLET START() BE $(*N  WRITES(*"Hello from the BCPL IDE!**N*")*N  FOR i = 1 TO 5 DO WRITEF(*"i = %d**N*", i)*N$)*N"]
 
     LET ctrl = NEW IdeController
     ctrl.setup(editor, outv, w)
     build_menu(app, ctrl)
+
+    // Live syntax highlighting: recolor on every edit. The notification
+    // centre dispatches to the selector we name (the controller's
+    // `bcpl_onTextChanged`), so no Obj-C delegate subclass is needed.
+    LET nc = [NSNotificationCenter defaultCenter]
+    [nc addObserver: ctrl selector: bcpl_selector("bcpl_onTextChanged")
+        name: "NSTextDidChangeNotification" object: editor]
+    ctrl.recolor()                               // colour the starter program
 
     [w center]
     [app activateIgnoringOtherApps: 1]

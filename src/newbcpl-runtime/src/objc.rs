@@ -291,6 +291,62 @@ pub unsafe extern "C-unwind" fn bcpl_run_capture(cmd: *mut c_void) -> *mut c_voi
     unsafe { nsstring_from_rust(&text) }
 }
 
+/// Apply a foreground colour to a character range of an `NSTextStorage`
+/// (or any `NSMutableAttributedString`): `[ts addAttribute:
+/// NSForegroundColorAttributeName value:[NSColor colorWithRed:…] range:
+/// {loc,len}]`. The `NSColor` and the `NSRange` are built HERE so BCPL
+/// never has to pass a by-value struct arg — it just calls with plain
+/// ints + floats. Used by the IDE's syntax colouriser. No-op on null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_set_text_color(
+    ts: *mut c_void,
+    loc: i64,
+    len: i64,
+    r: f64,
+    g: f64,
+    b: f64,
+) {
+    if ts.is_null() {
+        return;
+    }
+    let msg = sym_or_null("objc_msgSend");
+    let getc = sym_or_null("objc_getClass");
+    let reg = sym_or_null("sel_registerName");
+    if msg.is_null() || getc.is_null() || reg.is_null() {
+        return;
+    }
+    let getc: extern "C" fn(*const i8) -> *mut c_void = unsafe { std::mem::transmute(getc) };
+    let reg: extern "C" fn(*const i8) -> *mut c_void = unsafe { std::mem::transmute(reg) };
+    let nscolor = getc(c"NSColor".as_ptr());
+    if nscolor.is_null() {
+        return;
+    }
+    // color = [NSColor colorWithRed:r green:g blue:b alpha:1.0]  (doubles → d0..d3)
+    let msg_color: extern "C" fn(*mut c_void, *mut c_void, f64, f64, f64, f64) -> *mut c_void =
+        unsafe { std::mem::transmute(msg) };
+    let color = msg_color(
+        nscolor,
+        reg(c"colorWithRed:green:blue:alpha:".as_ptr()),
+        r,
+        g,
+        b,
+        1.0,
+    );
+    let key = unsafe { nsstring_from_rust("NSColor") }; // = NSForegroundColorAttributeName
+    // [ts addAttribute:key value:color range:NSMakeRange(loc,len)]
+    // NSRange is two NSUInteger → two GP arg registers (x4,x5).
+    let msg_attr: extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, u64, u64) =
+        unsafe { std::mem::transmute(msg) };
+    msg_attr(
+        ts,
+        reg(c"addAttribute:value:range:".as_ptr()),
+        key,
+        color,
+        loc as u64,
+        len as u64,
+    );
+}
+
 /// Intern an Obj-C selector from an NSString name (a BCPL `String`) and
 /// return it as a `SEL`. Lets BCPL wire menu items / targets to STANDARD
 /// Cocoa actions (`terminate:`, `cut:`, `selectAll:`, …) whose selectors
@@ -956,6 +1012,7 @@ pub fn builtin_addresses() -> Vec<(&'static str, usize)> {
         ("bcpl_str_release", bcpl_str_release as *const () as usize),
         ("bcpl_run_capture", bcpl_run_capture as *const () as usize),
         ("bcpl_selector", bcpl_selector as *const () as usize),
+        ("bcpl_set_text_color", bcpl_set_text_color as *const () as usize),
         ("bcpl_objc_new", bcpl_objc_new as *const () as usize),
         ("bcpl_objc_alloc_init", bcpl_objc_alloc_init as *const () as usize),
         ("bcpl_objc_release", bcpl_objc_release as *const () as usize),
