@@ -552,6 +552,8 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             // IDE Run primitive: NSString command id -> NSString output id
             // (combined stdout+stderr of a shelled-out subprocess).
             "bcpl_run_capture" => ptr_t.fn_type(&[ptr_t.into()], false),
+            // Reify a SEL from an NSString name (for menu/target actions).
+            "bcpl_selector" => ptr_t.fn_type(&[ptr_t.into()], false),
             // The WRITEF family is fixed-arity per arity-suffix:
             // WRITEF takes only the format; WRITEF1..WRITEF7 take
             // the format plus N additional `i64` payload words.

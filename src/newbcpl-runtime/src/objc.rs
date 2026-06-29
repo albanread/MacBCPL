@@ -291,6 +291,27 @@ pub unsafe extern "C-unwind" fn bcpl_run_capture(cmd: *mut c_void) -> *mut c_voi
     unsafe { nsstring_from_rust(&text) }
 }
 
+/// Intern an Obj-C selector from an NSString name (a BCPL `String`) and
+/// return it as a `SEL`. Lets BCPL wire menu items / targets to STANDARD
+/// Cocoa actions (`terminate:`, `cut:`, `selectAll:`, …) whose selectors
+/// aren't otherwise nameable from source (a bare `[recv sel]` only
+/// produces a *send*, not a reified selector value). Null on failure.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_selector(name: *mut c_void) -> *mut c_void {
+    let Some(bytes) = (unsafe { nsstring_utf8_bytes(name) }) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(c) = std::ffi::CString::new(bytes) else {
+        return std::ptr::null_mut();
+    };
+    let reg = sym_or_null("sel_registerName");
+    if reg.is_null() {
+        return std::ptr::null_mut();
+    }
+    let reg: extern "C" fn(*const i8) -> *mut c_void = unsafe { std::mem::transmute(reg) };
+    reg(c.as_ptr())
+}
+
 /// Build an autoreleased `NSString` id from a Rust `&str` (NUL bytes
 /// stripped, since a C string can't carry them). Thin wrapper over
 /// `bcpl_objc_nsstring` (`+[NSString stringWithUTF8String:]`).
@@ -934,6 +955,7 @@ pub fn builtin_addresses() -> Vec<(&'static str, usize)> {
         ("bcpl_str_char", bcpl_str_char as *const () as usize),
         ("bcpl_str_release", bcpl_str_release as *const () as usize),
         ("bcpl_run_capture", bcpl_run_capture as *const () as usize),
+        ("bcpl_selector", bcpl_selector as *const () as usize),
         ("bcpl_objc_new", bcpl_objc_new as *const () as usize),
         ("bcpl_objc_alloc_init", bcpl_objc_alloc_init as *const () as usize),
         ("bcpl_objc_release", bcpl_objc_release as *const () as usize),

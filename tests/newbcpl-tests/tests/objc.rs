@@ -110,6 +110,18 @@ fn run_capture_shells_out_and_captures() {
     );
 }
 
+/// `bcpl_selector` reifies a `SEL` from an NSString name — used to wire
+/// menu items / targets to standard Cocoa actions (`terminate:`, `cut:`).
+/// A valid name interns to a non-null selector.
+#[test]
+fn selector_interns_a_sel() {
+    expect(
+        "objc_selector_intern",
+        "LET START() BE $(\n  LET s = bcpl_selector(\"terminate:\")\n  TEST s = 0 THEN WRITES(\"no\") ELSE WRITES(\"yes\")\n$)\n",
+        "yes",
+    );
+}
+
 // ─── Tier B: struct returns materialized as vectors ─────────────────
 
 /// NSRange return (DB tag N) -> a 2-word VEC via the arm64 integer-pair
