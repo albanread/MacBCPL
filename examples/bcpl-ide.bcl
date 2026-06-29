@@ -31,32 +31,97 @@ CLASS IdeController EXTENDS NSObject $(
     DECL win             // NSWindow
     DECL gutter          // NSTextView (line-number column)
     DECL dir             // sidebar's directory (NSString)
-    DECL cur             // current file path (NSString id, retained); 0 = untitled
     DECL job             // id of the in-flight async run (-1 = none)
+    DECL tabbar          // NSView strip holding the tab buttons
+    DECL paths           // NSMutableArray of open-file paths ("" = untitled)
+    DECL texts           // NSMutableArray of each tab's text
+    DECL curtab          // active tab index (-1 = none)
 
-    ROUTINE setup(ed, ov, w, g, d) BE $(
+    ROUTINE setup(ed, ov, w, g, d, tb) BE $(
         editor := ed
         outv   := ov
         win    := w
         gutter := g
         dir    := d
-        cur    := 0
         job    := -1
+        tabbar := tb
+        paths  := [[NSMutableArray alloc] init]
+        texts  := [[NSMutableArray alloc] init]
+        curtab := -1
     $)
 
-    // Sidebar file-button action: the sender's title is the file name;
-    // join it onto the sidebar directory and load it into the editor.
+    // ─── Tabs (multi-file editing) ───────────────────────────────────
+
+    // Sync the editor's current text back into the active tab's store.
+    // Store a COPY: [editor string] is the LIVE text-storage string, so
+    // keeping it raw would alias every tab to the current content and tab
+    // switching would appear to do nothing.
+    ROUTINE save_current() BE $(
+        IF curtab >= 0 DO [texts replaceObjectAtIndex: curtab withObject: [[editor string] copy]]
+    $)
+
+    // Make tab `idx` active: load its text, update title + tab bar.
+    ROUTINE show_tab(idx) BE $(
+        curtab := idx
+        [editor setString: [texts objectAtIndex: idx]]
+        LET p = [paths objectAtIndex: idx]
+        TEST ([p length] AS INT) = 0
+            THEN [win setTitle: "MacBCPL IDE — Untitled"]
+            ELSE [win setTitleWithRepresentedFilename: p]
+        SELF.recolor()
+        SELF.rebuild_tabs()
+    $)
+
+    // Open `path`/`content` in a tab: focus it if already open (named),
+    // else append a new tab. Always saves the outgoing tab first.
+    ROUTINE open_doc(path, content) BE $(
+        SELF.save_current()
+        LET found = -1
+        IF ([path length] AS INT) > 0 DO $(
+            LET n = [paths count] AS INT
+            FOR i = 0 TO n - 1 DO
+                IF ([[paths objectAtIndex: i] isEqualToString: path] AS INT) ~= 0 DO found := i
+        $)
+        TEST found >= 0
+            THEN SELF.show_tab(found)
+            ELSE $(
+                [paths addObject: path]
+                [texts addObject: content]
+                SELF.show_tab([paths count] AS INT - 1)
+            $)
+    $)
+
+    // Tab-button action: switch to the tab whose index is the sender's tag.
+    ROUTINE switchTab(sender) BE $(
+        SELF.save_current()
+        SELF.show_tab([sender tag] AS INT)
+    $)
+
+    // Rebuild the tab bar: one button per open doc (title = file name).
+    ROUTINE rebuild_tabs() BE $(
+        [tabbar setSubviews: [NSArray array]]
+        LET n = [paths count] AS INT
+        FOR i = 0 TO n - 1 DO $(
+            LET p = [paths objectAtIndex: i]
+            LET label = "Untitled"
+            IF ([p length] AS INT) > 0 DO label := [p lastPathComponent]
+            LET btn = [[NSButton alloc] initWithFrame: rect4(i * 122, 1, 118, 22)]
+            [btn setTitle: label]
+            [btn setBezelStyle: 6]
+            [btn setTag: i]
+            [btn setTarget: SELF]
+            [btn setAction: bcpl_selector("bcpl_switchTab")]
+            [tabbar addSubview: btn]
+        $)
+    $)
+
+    // Sidebar file-button action: load the named file into a tab.
     ROUTINE openNamed(sender) BE $(
         LET name = [sender title]
         LET path = [dir stringByAppendingString: "/"]
         path := [path stringByAppendingString: name]
         LET content = [NSString stringWithContentsOfFile: path encoding: 4 error: 0]
-        UNLESS content = 0 DO $(
-            [editor setString: content]
-            cur := bcpl_objc_retain(path)
-            [win setTitleWithRepresentedFilename: path]
-            SELF.recolor()
-        $)
+        UNLESS content = 0 DO SELF.open_doc(path, content)
     $)
 
     // Compile + run the buffer in a subprocess; show captured output.
@@ -95,15 +160,19 @@ CLASS IdeController EXTENDS NSObject $(
         IF ([panel runModal] AS INT) = 1 DO $(
             LET path = [[panel URL] path]
             [[editor string] writeToFile: path atomically: 1 encoding: 4 error: 0]
-            cur := bcpl_objc_retain(path)
+            // Bind the chosen path to the active tab + relabel it.
+            IF curtab >= 0 DO [paths replaceObjectAtIndex: curtab withObject: path]
             [win setTitleWithRepresentedFilename: path]
+            SELF.rebuild_tabs()
         $)
     $)
 
     ROUTINE doSave(s) BE $(
-        TEST cur = 0
+        SELF.save_current()
+        LET p = [paths objectAtIndex: curtab]
+        TEST ([p length] AS INT) = 0
             THEN SELF.doSaveAs(s)
-            ELSE [[editor string] writeToFile: cur atomically: 1 encoding: 4 error: 0]
+            ELSE [[editor string] writeToFile: p atomically: 1 encoding: 4 error: 0]
     $)
 
     ROUTINE doOpen(s) BE $(
@@ -114,21 +183,11 @@ CLASS IdeController EXTENDS NSObject $(
         IF ([panel runModal] AS INT) = 1 DO $(
             LET path = [[panel URL] path]
             LET content = [NSString stringWithContentsOfFile: path encoding: 4 error: 0]
-            UNLESS content = 0 DO $(
-                [editor setString: content]
-                cur := bcpl_objc_retain(path)
-                [win setTitleWithRepresentedFilename: path]
-                SELF.recolor()
-            $)
+            UNLESS content = 0 DO SELF.open_doc(path, content)
         $)
     $)
 
-    ROUTINE doNew(s) BE $(
-        [editor setString: ""]
-        cur := 0
-        [win setTitle: "MacBCPL IDE — Untitled"]
-        SELF.recolor()
-    $)
+    ROUTINE doNew(s) BE SELF.open_doc("", "")
 
     // Syntax colouriser: light default, comments green, strings orange.
     // Char codes: 47='/'  34='"'  10=newline. Source is ASCII so code-point
@@ -371,33 +430,40 @@ LET START() BE $(
     [split addSubview: editorRow]
     [split addSubview: outScroll]
 
-    // NOTE on escaping: `*N` here is a REAL newline in the displayed text
-    // (structural line breaks of the starter program); `**N` is an escaped
-    // asterisk so the editor shows the two characters `*N` — the BCPL
-    // newline escape — INSIDE the inner string literals (a real newline
-    // inside a string is a lex error, so the starter program must show the
-    // escape, not a line break).
-    [editor setString: "// MacBCPL IDE — Cmd-R run, Cmd-O open, Cmd-S save, Cmd-Q quit.*N*NLET START() BE $(*N  WRITES(*"Hello from the BCPL IDE!**N*")*N  FOR i = 1 TO 5 DO WRITEF(*"i = %d**N*", i)*N$)*N"]
+    // Starter buffer (opened as the first tab below). `**N` is an escaped
+    // asterisk so the editor shows the two-char BCPL newline escape inside
+    // the inner string literals (a real newline in a string is a lex error).
+    LET starter = "// MacBCPL IDE — Cmd-R run, Cmd-O open, Cmd-S save, Cmd-Q quit.*N*NLET START() BE $(*N  WRITES(*"Hello from the BCPL IDE!**N*")*N  FOR i = 1 TO 5 DO WRITEF(*"i = %d**N*", i)*N$)*N"
+
+    // Tab bar across the top of the editor area; the editor/output split
+    // sits below it in a right-hand container.
+    LET tabBar = [[NSView alloc] initWithFrame: rect4(0, 692, 900, 28)]
+    [tabBar setAutoresizingMask: 10]             // width-sizable, pinned to top
+    [split setFrame: rect4(0, 0, 900, 692)]
+    [split setAutoresizingMask: 18]              // width + height flexible
+    LET rightSide = [[NSView alloc] initWithFrame: rect4(0, 0, 900, 720)]
+    [rightSide addSubview: tabBar]
+    [rightSide addSubview: split]
 
     LET examplesDir = "/Users/oberon/claudeprojects/MacBCPL/examples"
     LET ctrl = NEW IdeController
-    ctrl.setup(editor, outv, w, gutter, examplesDir)
+    ctrl.setup(editor, outv, w, gutter, examplesDir, tabBar)
     build_menu(app, ctrl)
 
-    // Wrap the editor/output split and a file sidebar in a horizontal split.
+    // Horizontal split: file sidebar | (tab bar + editor/output).
     LET outer = [[NSSplitView alloc] initWithFrame: (FVEC [0.0, 0.0, 1120.0, 720.0])]
     [outer setVertical: 1]                       // vertical divider -> side by side
     [outer addSubview: build_sidebar(ctrl, examplesDir)]
-    [outer addSubview: split]
+    [outer addSubview: rightSide]
     [w setContentView: outer]
 
-    // Live syntax highlighting: recolor on every edit. The notification
-    // centre dispatches to the selector we name (the controller's
-    // `bcpl_onTextChanged`), so no Obj-C delegate subclass is needed.
+    // Live syntax highlighting via NSTextDidChangeNotification (dispatched
+    // to the controller's bcpl_onTextChanged — no Obj-C delegate subclass).
     LET nc = [NSNotificationCenter defaultCenter]
     [nc addObserver: ctrl selector: bcpl_selector("bcpl_onTextChanged")
         name: "NSTextDidChangeNotification" object: editor]
-    ctrl.recolor()                               // colour the starter program
+
+    ctrl.open_doc("", starter)                   // seed the first (untitled) tab
 
     [w center]
     [app activateIgnoringOtherApps: 1]
