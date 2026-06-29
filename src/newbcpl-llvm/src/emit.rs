@@ -558,6 +558,8 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             "bcpl_is_keyword" => i64_t.fn_type(&[ptr_t.into(), i64_t.into(), i64_t.into()], false),
             // (compiler-output NSString) -> diagnostic line number (0 = clean).
             "bcpl_error_line" => i64_t.fn_type(&[ptr_t.into()], false),
+            // (line count) -> NSString "1\n2\n…\ncount" for the gutter.
+            "bcpl_line_numbers" => ptr_t.fn_type(&[i64_t.into()], false),
             // Syntax colouriser: (textStorage, loc, len, r, g, b) -> void.
             // The colour floats must ride d-registers, so type them f64.
             "bcpl_set_text_color" => self.context.void_type().fn_type(

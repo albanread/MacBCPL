@@ -347,6 +347,21 @@ pub unsafe extern "C-unwind" fn bcpl_set_text_color(
     );
 }
 
+/// Build the gutter text `"1\n2\n…\ncount"` as an NSString — the IDE's
+/// line-number column. (Cheaper + simpler than assembling it from BCPL.)
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_line_numbers(count: i64) -> *mut c_void {
+    let count = count.clamp(0, 1_000_000);
+    let mut s = String::with_capacity(count as usize * 4);
+    for k in 1..=count {
+        if k > 1 {
+            s.push('\n');
+        }
+        s.push_str(&k.to_string());
+    }
+    unsafe { nsstring_from_rust(&s) }
+}
+
 /// Scan compiler output for the line number of the first/last diagnostic
 /// (`… at <line>:<col>`) and return it (1-based), or 0 if the program ran
 /// clean. The IDE uses it to red-mark the offending source line. Takes the
@@ -1077,6 +1092,7 @@ pub fn builtin_addresses() -> Vec<(&'static str, usize)> {
         ("bcpl_set_text_color", bcpl_set_text_color as *const () as usize),
         ("bcpl_is_keyword", bcpl_is_keyword as *const () as usize),
         ("bcpl_error_line", bcpl_error_line as *const () as usize),
+        ("bcpl_line_numbers", bcpl_line_numbers as *const () as usize),
         ("bcpl_objc_new", bcpl_objc_new as *const () as usize),
         ("bcpl_objc_alloc_init", bcpl_objc_alloc_init as *const () as usize),
         ("bcpl_objc_release", bcpl_objc_release as *const () as usize),

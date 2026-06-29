@@ -29,12 +29,14 @@ CLASS IdeController EXTENDS NSObject $(
     DECL editor          // NSTextView (source)
     DECL outv            // NSTextView (output)
     DECL win             // NSWindow
+    DECL gutter          // NSTextView (line-number column)
     DECL cur             // current file path (NSString id, retained); 0 = untitled
 
-    ROUTINE setup(ed, ov, w) BE $(
+    ROUTINE setup(ed, ov, w, g) BE $(
         editor := ed
         outv   := ov
         win    := w
+        gutter := g
         cur    := 0
     $)
 
@@ -148,6 +150,18 @@ CLASS IdeController EXTENDS NSObject $(
             $)
             ELSE i := i + 1
         $)
+        SELF.update_gutter()
+    $)
+
+    // Rebuild the line-number gutter to match the editor's line count.
+    // (Updated on every edit via recolor; scroll-naive — fine for the
+    // short programs this IDE edits.)
+    ROUTINE update_gutter() BE $(
+        LET src = [editor string] AS STRING
+        LET n = LEN src
+        LET lines = 1
+        FOR i = 0 TO n - 1 DO IF (src % i) = 10 DO lines := lines + 1
+        [gutter setString: bcpl_line_numbers(lines)]
     $)
 
     // Red-mark a 1-based source line (the compiler flagged an error there).
@@ -249,6 +263,22 @@ LET START() BE $(
     [editor setInsertionPointColor: [NSColor whiteColor]]
     [edScroll setDocumentView: editor]
 
+    // Line-number gutter, left of the editor, inside an editor-row container.
+    LET gutter = [[NSTextView alloc] initWithFrame: (FVEC [0.0, 0.0, 48.0, 480.0])]
+    [gutter setEditable: 0]
+    [gutter setSelectable: 0]
+    [gutter setFont: [NSFont userFixedPitchFontOfSize: 13.0]]
+    [gutter setBackgroundColor: [NSColor colorWithRed: 0.10 green: 0.11 blue: 0.14 alpha: 1.0]]
+    [gutter setTextColor: [NSColor colorWithRed: 0.45 green: 0.48 blue: 0.55 alpha: 1.0]]
+    [gutter setAlignment: 1]                     // right-align the numbers
+    [gutter setAutoresizingMask: 20]             // fixed width, left-pinned, height-flexible
+
+    LET editorRow = [[NSView alloc] initWithFrame: (FVEC [0.0, 0.0, 920.0, 480.0])]
+    [edScroll setFrame: (FVEC [48.0, 0.0, 872.0, 480.0])]
+    [edScroll setAutoresizingMask: 18]           // width + height flexible
+    [editorRow addSubview: gutter]
+    [editorRow addSubview: edScroll]
+
     LET outScroll = [[NSScrollView alloc] initWithFrame: (FVEC [0.0, 0.0, 920.0, 200.0])]
     [outScroll setHasVerticalScroller: 1]
     LET outv = [[NSTextView alloc] initWithFrame: (FVEC [0.0, 0.0, 920.0, 200.0])]
@@ -256,7 +286,7 @@ LET START() BE $(
     [outv setFont: [NSFont userFixedPitchFontOfSize: 12.0]]
     [outScroll setDocumentView: outv]
 
-    [split addSubview: edScroll]
+    [split addSubview: editorRow]
     [split addSubview: outScroll]
     [w setContentView: split]
 
@@ -269,7 +299,7 @@ LET START() BE $(
     [editor setString: "// MacBCPL IDE — Cmd-R run, Cmd-O open, Cmd-S save, Cmd-Q quit.*N*NLET START() BE $(*N  WRITES(*"Hello from the BCPL IDE!**N*")*N  FOR i = 1 TO 5 DO WRITEF(*"i = %d**N*", i)*N$)*N"]
 
     LET ctrl = NEW IdeController
-    ctrl.setup(editor, outv, w)
+    ctrl.setup(editor, outv, w, gutter)
     build_menu(app, ctrl)
 
     // Live syntax highlighting: recolor on every edit. The notification

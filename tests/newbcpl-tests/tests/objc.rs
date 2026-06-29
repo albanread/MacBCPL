@@ -158,6 +158,16 @@ fn error_line_parses_diagnostic() {
     );
 }
 
+/// `bcpl_line_numbers(n)` builds the IDE gutter's text — "1\n2\n…\nn".
+#[test]
+fn line_numbers_builds_gutter() {
+    expect(
+        "objc_line_numbers",
+        "LET START() BE WRITES(bcpl_line_numbers(3))\n",
+        "1\n2\n3",
+    );
+}
+
 // ─── Tier B: struct returns materialized as vectors ─────────────────
 
 /// NSRange return (DB tag N) -> a 2-word VEC via the arm64 integer-pair
