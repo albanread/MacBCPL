@@ -274,6 +274,11 @@ CLASS IdeController EXTENDS NSObject $(
                 $)
                 bcpl_set_text_color(ts, s, i - s, 0.55, 0.85, 0.78)       // number teal
             $)
+            ELSE TEST (c=43)|(c=45)|(c=42)|(c=47)|(c=61)|(c=60)|(c=62)|(c=33)|(c=126)|(c=124)|(c=38)|(c=58)
+            THEN $(                                            // operator  + - * / = < > ! ~ | & :
+                bcpl_set_text_color(ts, i, 1, 0.82, 0.56, 0.86)           // mauve
+                i := i + 1
+            $)
             ELSE i := i + 1
         $)
         SELF.update_gutter()
@@ -336,6 +341,16 @@ $)
 LET add_std(menu, title, selname, key) BE $(
     LET it = [[NSMenuItem alloc] initWithTitle: title
                                  action: bcpl_selector(selname) keyEquivalent: key]
+    [menu addItem: it]
+$)
+
+// A text-finder action (NSTextView's built-in find/replace bar). `tag` is
+// the NSTextFinderAction (1 = show find UI, 2 = next match). nil target →
+// the first-responder text view handles it.
+LET add_finder(menu, title, tag, key) BE $(
+    LET it = [[NSMenuItem alloc] initWithTitle: title
+                                 action: bcpl_selector("performTextFinderAction:") keyEquivalent: key]
+    [it setTag: tag]
     [menu addItem: it]
 $)
 
@@ -407,6 +422,8 @@ LET build_menu(app, ctrl) BE $(
     add_std(editMenu, "Copy", "copy:", "c")
     add_std(editMenu, "Paste", "paste:", "v")
     add_std(editMenu, "Select All", "selectAll:", "a")
+    add_finder(editMenu, "Find…", 1, "f")        // 1 = show find/replace bar
+    add_finder(editMenu, "Find Next", 2, "g")    // 2 = next match
 
     LET progMenu = add_submenu(bar, "Program")
     add_action(progMenu, "Run", ctrl, "bcpl_doRun", "r")
@@ -432,6 +449,7 @@ LET START() BE $(
     [editor setEditable: 1]
     [editor setRichText: 0]
     [editor setAllowsUndo: 1]
+    [editor setUsesFindBar: 1]                    // native ⌘F find/replace bar
     [editor setFont: [NSFont userFixedPitchFontOfSize: 13.0]]
     // Dark editor theme so the syntax colours read well.
     [editor setBackgroundColor: [NSColor colorWithRed: 0.12 green: 0.13 blue: 0.16 alpha: 1.0]]
