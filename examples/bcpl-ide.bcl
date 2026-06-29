@@ -97,22 +97,56 @@ CLASS IdeController EXTENDS NSObject $(
         SELF.show_tab([sender tag] AS INT)
     $)
 
-    // Rebuild the tab bar: one button per open doc (title = file name).
+    // Rebuild the tab bar: per doc a name button (▸ marks the active tab)
+    // and a ✕ close button, both tagged with the tab index.
     ROUTINE rebuild_tabs() BE $(
         [tabbar setSubviews: [NSArray array]]
         LET n = [paths count] AS INT
         FOR i = 0 TO n - 1 DO $(
             LET p = [paths objectAtIndex: i]
-            LET label = "Untitled"
-            IF ([p length] AS INT) > 0 DO label := [p lastPathComponent]
-            LET btn = [[NSButton alloc] initWithFrame: rect4(i * 122, 1, 118, 22)]
-            [btn setTitle: label]
-            [btn setBezelStyle: 6]
-            [btn setTag: i]
-            [btn setTarget: SELF]
-            [btn setAction: bcpl_selector("bcpl_switchTab")]
-            [tabbar addSubview: btn]
+            LET base = "Untitled"
+            IF ([p length] AS INT) > 0 DO base := [p lastPathComponent]
+            LET label = base
+            IF i = curtab DO label := ["▸ " stringByAppendingString: base]
+            LET x = i * 140
+            LET name = [[NSButton alloc] initWithFrame: rect4(x + 2, 1, 112, 22)]
+            [name setTitle: label]
+            [name setBezelStyle: 6]
+            [name setTag: i]
+            [name setTarget: SELF]
+            [name setAction: bcpl_selector("bcpl_switchTab")]
+            [tabbar addSubview: name]
+            LET close = [[NSButton alloc] initWithFrame: rect4(x + 114, 1, 22, 22)]
+            [close setTitle: "✕"]
+            [close setBezelStyle: 6]
+            [close setTag: i]
+            [close setTarget: SELF]
+            [close setAction: bcpl_selector("bcpl_closeTab")]
+            [tabbar addSubview: close]
         $)
+    $)
+
+    // Close a tab: ✕ button (its tag), or Cmd-W on the active one. Always
+    // leaves at least one (untitled) tab open.
+    ROUTINE closeTab(sender) BE SELF.close_at([sender tag] AS INT)
+    ROUTINE closeCurrent(s) BE IF curtab >= 0 DO SELF.close_at(curtab)
+    ROUTINE close_at(idx) BE $(
+        LET n = [paths count] AS INT
+        IF (idx < 0) | (idx >= n) DO RETURN
+        UNLESS idx = curtab DO SELF.save_current()   // keep active edits if closing another
+        [paths removeObjectAtIndex: idx]
+        [texts removeObjectAtIndex: idx]
+        LET m = [paths count] AS INT
+        TEST m = 0
+            THEN $( curtab := -1 ; SELF.open_doc("", "") $)
+            ELSE $(
+                LET nt = curtab
+                IF idx < curtab DO nt := curtab - 1
+                IF idx = curtab DO nt := idx
+                IF nt >= m DO nt := m - 1
+                IF nt < 0 DO nt := 0
+                SELF.show_tab(nt)
+            $)
     $)
 
     // Sidebar file-button action: load the named file into a tab.
@@ -364,6 +398,7 @@ LET build_menu(app, ctrl) BE $(
     add_action(fileMenu, "New",   ctrl, "bcpl_doNew",  "n")
     add_action(fileMenu, "Open…", ctrl, "bcpl_doOpen", "o")
     add_action(fileMenu, "Save",  ctrl, "bcpl_doSave", "s")
+    add_action(fileMenu, "Close Tab", ctrl, "bcpl_closeCurrent", "w")
 
     LET editMenu = add_submenu(bar, "Edit")
     add_std(editMenu, "Undo", "undo:", "z")
