@@ -32,6 +32,7 @@ CLASS IdeController EXTENDS NSObject $(
     DECL gutter          // NSTextView (line-number column)
     DECL dir             // sidebar's directory (NSString)
     DECL cur             // current file path (NSString id, retained); 0 = untitled
+    DECL job             // id of the in-flight async run (-1 = none)
 
     ROUTINE setup(ed, ov, w, g, d) BE $(
         editor := ed
@@ -40,6 +41,7 @@ CLASS IdeController EXTENDS NSObject $(
         gutter := g
         dir    := d
         cur    := 0
+        job    := -1
     $)
 
     // Sidebar file-button action: the sender's title is the file name;
@@ -58,6 +60,10 @@ CLASS IdeController EXTENDS NSObject $(
     $)
 
     // Compile + run the buffer in a subprocess; show captured output.
+    // Compile + run the buffer in a subprocess, ASYNCHRONOUSLY: start it on
+    // a background thread and poll on a timer, so the IDE stays responsive
+    // even if the program is a GUI app that runs its own event loop and
+    // never exits (a synchronous wait would freeze the IDE — the M2 bug).
     ROUTINE doRun(s) BE $(
         LET tmp = "/tmp/macbcpl_ide_buffer.bcl"
         LET drv = "/Users/oberon/claudeprojects/MacBCPL/target/debug/newbcpl-driver"
@@ -66,12 +72,22 @@ CLASS IdeController EXTENDS NSObject $(
         LET cmd = [drv stringByAppendingString: " run "]
         cmd := [cmd stringByAppendingString: tmp]
         cmd := [cmd stringByAppendingString: " 2>&1"]
-        LET out = bcpl_run_capture(cmd)
-        [outv setString: out]
-        // Clear stale marks (recolour), then red-mark the error line if any.
-        SELF.recolor()
-        LET el = bcpl_error_line(out)
-        IF el > 0 DO SELF.mark_line(el)
+        job := bcpl_run_start(cmd)
+        [NSTimer scheduledTimerWithTimeInterval: 0.15 target: SELF
+                 selector: bcpl_selector("bcpl_onPoll") userInfo: 0 repeats: 1]
+    $)
+
+    // Timer callback: when the async run has finished, show its output and
+    // stop polling. nil result = still running -> keep the IDE responsive.
+    ROUTINE onPoll(timer) BE $(
+        LET out = bcpl_run_poll(job)
+        UNLESS out = 0 DO $(
+            [timer invalidate]
+            [outv setString: out]
+            SELF.recolor()
+            LET el = bcpl_error_line(out)
+            IF el > 0 DO SELF.mark_line(el)
+        $)
     $)
 
     ROUTINE doSaveAs(s) BE $(

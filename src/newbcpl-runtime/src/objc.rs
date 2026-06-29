@@ -291,6 +291,91 @@ pub unsafe extern "C-unwind" fn bcpl_run_capture(cmd: *mut c_void) -> *mut c_voi
     unsafe { nsstring_from_rust(&text) }
 }
 
+// ─── async run (so the IDE doesn't freeze on a GUI program) ──────────
+//
+// `bcpl_run_capture` BLOCKS until the child exits — fatal in a GUI host:
+// a program that enters its own run loop never returns and the IDE's main
+// thread hangs. Instead `bcpl_run_start` spawns the child on a background
+// thread and returns a job id immediately; the IDE polls `bcpl_run_poll`
+// from an NSTimer (so [app run] keeps servicing events) and gets the
+// captured output once the child exits.
+
+struct RunJob {
+    done: std::sync::atomic::AtomicBool,
+    output: std::sync::Mutex<String>,
+}
+
+fn run_jobs() -> &'static std::sync::Mutex<Vec<std::sync::Arc<RunJob>>> {
+    static R: std::sync::OnceLock<std::sync::Mutex<Vec<std::sync::Arc<RunJob>>>> =
+        std::sync::OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Start `cmd` via `/bin/sh -c` on a BACKGROUND THREAD; return a job id
+/// (>=0) immediately, or -1 if the command couldn't be read. Never blocks.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_run_start(cmd: *mut c_void) -> i64 {
+    let cmd_str = match unsafe { nsstring_utf8_bytes(cmd) } {
+        Some(b) => String::from_utf8_lossy(&b).into_owned(),
+        None => return -1,
+    };
+    let job = std::sync::Arc::new(RunJob {
+        done: std::sync::atomic::AtomicBool::new(false),
+        output: std::sync::Mutex::new(String::new()),
+    });
+    let jc = job.clone();
+    std::thread::spawn(move || {
+        let text = match std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&cmd_str)
+            .output()
+        {
+            Ok(o) => {
+                let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+                if !o.stderr.is_empty() {
+                    s.push_str(&String::from_utf8_lossy(&o.stderr));
+                }
+                match o.status.code() {
+                    Some(0) => {}
+                    Some(c) => s.push_str(&format!("\n[exit {c}]")),
+                    None => s.push_str("\n[killed]"),
+                }
+                s
+            }
+            Err(e) => format!("[ide] run failed: {e}"),
+        };
+        if let Ok(mut out) = jc.output.lock() {
+            *out = text;
+        }
+        jc.done.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let mut reg = run_jobs().lock().expect("run_jobs");
+    reg.push(job);
+    (reg.len() - 1) as i64
+}
+
+/// Poll a job started by `bcpl_run_start`. Returns the captured
+/// stdout+stderr as an NSString once the child has exited, else nil (still
+/// running / bad id). Non-blocking.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_run_poll(id: i64) -> *mut c_void {
+    if id < 0 {
+        return std::ptr::null_mut();
+    }
+    let job = {
+        let reg = run_jobs().lock().expect("run_jobs");
+        match reg.get(id as usize) {
+            Some(j) => j.clone(),
+            None => return std::ptr::null_mut(),
+        }
+    };
+    if !job.done.load(std::sync::atomic::Ordering::SeqCst) {
+        return std::ptr::null_mut();
+    }
+    let out = job.output.lock().map(|s| s.clone()).unwrap_or_default();
+    unsafe { nsstring_from_rust(&out) }
+}
+
 /// Apply a foreground colour to a character range of an `NSTextStorage`
 /// (or any `NSMutableAttributedString`): `[ts addAttribute:
 /// NSForegroundColorAttributeName value:[NSColor colorWithRed:…] range:
@@ -1108,6 +1193,8 @@ pub fn builtin_addresses() -> Vec<(&'static str, usize)> {
         ("bcpl_str_char", bcpl_str_char as *const () as usize),
         ("bcpl_str_release", bcpl_str_release as *const () as usize),
         ("bcpl_run_capture", bcpl_run_capture as *const () as usize),
+        ("bcpl_run_start", bcpl_run_start as *const () as usize),
+        ("bcpl_run_poll", bcpl_run_poll as *const () as usize),
         ("bcpl_selector", bcpl_selector as *const () as usize),
         ("bcpl_set_text_color", bcpl_set_text_color as *const () as usize),
         ("bcpl_is_keyword", bcpl_is_keyword as *const () as usize),

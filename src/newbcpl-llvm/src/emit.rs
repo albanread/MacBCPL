@@ -552,6 +552,9 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             // IDE Run primitive: NSString command id -> NSString output id
             // (combined stdout+stderr of a shelled-out subprocess).
             "bcpl_run_capture" => ptr_t.fn_type(&[ptr_t.into()], false),
+            // Async run: start (NSString cmd -> job id), poll (id -> output|nil).
+            "bcpl_run_start" => i64_t.fn_type(&[ptr_t.into()], false),
+            "bcpl_run_poll" => ptr_t.fn_type(&[i64_t.into()], false),
             // Reify a SEL from an NSString name (for menu/target actions).
             "bcpl_selector" => ptr_t.fn_type(&[ptr_t.into()], false),
             // (source NSString, loc, len) -> 1/0 : is the word a BCPL keyword?
