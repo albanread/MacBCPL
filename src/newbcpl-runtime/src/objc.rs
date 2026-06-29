@@ -253,6 +253,59 @@ pub(crate) unsafe fn nsstring_utf8_bytes(nsstr: *mut c_void) -> Option<Vec<u8>> 
     Some(unsafe { CStr::from_ptr(utf8) }.to_bytes().to_vec())
 }
 
+/// Run a shell command via `/bin/sh -c` and return its combined
+/// stdout+stderr as an autoreleased `NSString` id (a BCPL `String`).
+///
+/// This is the BCPL IDE's Run primitive: the IDE shells out to
+/// `newbcpl-driver run <tempfile>` so a crash in the user's program
+/// kills the SUBPROCESS, not the IDE (matching the MacModula2 IDE's
+/// out-of-process build/run model). A non-zero exit or a kill is
+/// appended as a `[exit N]` / `[killed]` footer. `cmd` is an NSString
+/// id; the result is never null (errors come back as a diagnostic
+/// string), so the caller can drop it straight into `[view setString:]`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_run_capture(cmd: *mut c_void) -> *mut c_void {
+    let cmd_str = match unsafe { nsstring_utf8_bytes(cmd) } {
+        Some(b) => String::from_utf8_lossy(&b).into_owned(),
+        None => return unsafe { nsstring_from_rust("[ide] run: empty command") },
+    };
+    let text = match std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&cmd_str)
+        .output()
+    {
+        Ok(o) => {
+            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+            if !o.stderr.is_empty() {
+                s.push_str(&String::from_utf8_lossy(&o.stderr));
+            }
+            match o.status.code() {
+                Some(0) => {}
+                Some(c) => s.push_str(&format!("\n[exit {c}]")),
+                None => s.push_str("\n[killed]"),
+            }
+            s
+        }
+        Err(e) => format!("[ide] run failed: {e}"),
+    };
+    unsafe { nsstring_from_rust(&text) }
+}
+
+/// Build an autoreleased `NSString` id from a Rust `&str` (NUL bytes
+/// stripped, since a C string can't carry them). Thin wrapper over
+/// `bcpl_objc_nsstring` (`+[NSString stringWithUTF8String:]`).
+unsafe fn nsstring_from_rust(s: &str) -> *mut c_void {
+    let cleaned = if s.as_bytes().contains(&0) {
+        s.replace('\0', "")
+    } else {
+        s.to_owned()
+    };
+    match std::ffi::CString::new(cleaned) {
+        Ok(c) => unsafe { bcpl_objc_nsstring(c.as_ptr() as *const u8) },
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 thread_local! {
     // One-entry memo of the string's Unicode SCALAR VALUES (code points),
     // so `FOR i ... s % i` is O(n) per string, not O(n^2) of selector
@@ -880,6 +933,7 @@ pub fn builtin_addresses() -> Vec<(&'static str, usize)> {
         ("bcpl_str_len", bcpl_str_len as *const () as usize),
         ("bcpl_str_char", bcpl_str_char as *const () as usize),
         ("bcpl_str_release", bcpl_str_release as *const () as usize),
+        ("bcpl_run_capture", bcpl_run_capture as *const () as usize),
         ("bcpl_objc_new", bcpl_objc_new as *const () as usize),
         ("bcpl_objc_alloc_init", bcpl_objc_alloc_init as *const () as usize),
         ("bcpl_objc_release", bcpl_objc_release as *const () as usize),

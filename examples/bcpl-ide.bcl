@@ -1,0 +1,105 @@
+// bcpl-ide.bcl — a BCPL IDE, written in BCPL, for BCPL.
+//
+//   ./newbcpl-driver run examples/bcpl-ide.bcl
+//
+// A native Cocoa window (built entirely from Objective-C bracket sends
+// compiled from BCPL) with an editable source pane over a read-only
+// output pane. Press Cmd-R to compile + run the buffer; its combined
+// stdout/stderr appears below. Close the window to quit.
+//
+// Mirrors the MacModula2 IDE's out-of-process build/run model: the
+// buffer is written to a temp file and run in a SUBPROCESS
+// (`bcpl_run_capture`), so a crash in the program under test kills the
+// subprocess, not the IDE. The whole UI loop is a manual event pump, so
+// the Run trigger lives in BCPL — no Obj-C callback/target-action needed.
+//
+// v1 scope: edit + run + see output/errors. File open/save, a menu bar,
+// tabs, a file sidebar, and syntax highlighting are the next increments.
+
+// Compile + run the editor's buffer in a subprocess, show the captured
+// output in the output pane. Crash isolation comes for free: the JIT
+// runs in `newbcpl-driver`, a separate process.
+LET run_buffer(editor, outv, tmp, drv) BE $(
+    LET src = [editor string]
+    [src writeToFile: tmp atomically: 1 encoding: 4 error: 0]   // 4 = NSUTF8StringEncoding
+
+    LET cmd = [drv stringByAppendingString: " run "]
+    cmd := [cmd stringByAppendingString: tmp]
+    cmd := [cmd stringByAppendingString: " 2>&1"]
+
+    LET out = bcpl_run_capture(cmd)
+    [outv setString: out]
+$)
+
+LET START() BE $(
+    LET app = [NSApplication sharedApplication]
+    [app setActivationPolicy: 0]                 // Regular (shows in Dock + menu bar)
+
+    // ─── Window ──────────────────────────────────────────────────
+    // styleMask 15 = titled|closable|miniaturizable|resizable, backing 2.
+    LET w = [[NSWindow alloc] initWithContentRect: (FVEC [120.0, 120.0, 920.0, 700.0])
+                              styleMask: 15 backing: 2 defer: 0]
+    [w setTitle: "MacBCPL IDE"]
+    [w setReleasedWhenClosed: 0]                 // closing hides (safe to message isVisible)
+
+    // ─── Split: editor (top) over output (bottom) ────────────────
+    LET split = [[NSSplitView alloc] initWithFrame: (FVEC [0.0, 0.0, 920.0, 700.0])]
+    [split setVertical: 0]                        // horizontal divider -> stacked panes
+    [split setDividerStyle: 2]                    // thick divider
+
+    // Editor.
+    LET edScroll = [[NSScrollView alloc] initWithFrame: (FVEC [0.0, 0.0, 920.0, 480.0])]
+    [edScroll setHasVerticalScroller: 1]
+    LET editor = [[NSTextView alloc] initWithFrame: (FVEC [0.0, 0.0, 920.0, 480.0])]
+    [editor setEditable: 1]
+    [editor setRichText: 0]
+    [editor setFont: [NSFont userFixedPitchFontOfSize: 13.0]]
+    [edScroll setDocumentView: editor]
+
+    // Output.
+    LET outScroll = [[NSScrollView alloc] initWithFrame: (FVEC [0.0, 0.0, 920.0, 200.0])]
+    [outScroll setHasVerticalScroller: 1]
+    LET outv = [[NSTextView alloc] initWithFrame: (FVEC [0.0, 0.0, 920.0, 200.0])]
+    [outv setEditable: 0]
+    [outv setFont: [NSFont userFixedPitchFontOfSize: 12.0]]
+    [outScroll setDocumentView: outv]
+
+    [split addSubview: edScroll]
+    [split addSubview: outScroll]
+    [w setContentView: split]
+
+    // Starter program so Cmd-R does something on first launch.
+    [editor setString: "// MacBCPL IDE — press Cmd-R to run, close window to quit.*N*NLET START() BE $(*N  WRITES(*"Hello from the BCPL IDE!*N*")*N  FOR i = 1 TO 5 DO WRITEF(*"i = %d*N*", i)*N$)*N"]
+
+    [w center]
+    [w makeKeyAndOrderFront: 0]
+    [w makeFirstResponder: editor]
+    [app activateIgnoringOtherApps: 1]
+
+    // ─── Event pump ──────────────────────────────────────────────
+    // Short timeout so the loop wakes periodically to notice the window
+    // closing (isVisible -> 0). Cmd-R is intercepted here and routed to
+    // run_buffer; every other event is forwarded to the views.
+    LET tmp = "/tmp/macbcpl_ide_buffer.bcl"
+    LET drv = "/Users/oberon/claudeprojects/MacBCPL/target/debug/newbcpl-driver"
+
+    WHILE ([w isVisible] AS INT) ~= 0 DO $(
+        LET until = [NSDate dateWithTimeIntervalSinceNow: 0.1]
+        LET ev = [app nextEventMatchingMask: -1 untilDate: until
+                      inMode: "kCFRunLoopDefaultMode" dequeue: 1]
+        IF ev = 0 DO LOOP                          // timed out, no event
+
+        LET handled = 0
+        IF ([ev type] AS INT) = 10 DO $(           // 10 = NSEventTypeKeyDown
+            // NSEventModifierFlagCommand = 1<<20 = 1048576
+            IF (([ev modifierFlags] AS INT) BAND 1048576) ~= 0 DO $(
+                LET chs = [ev charactersIgnoringModifiers] AS STRING
+                IF (chs % 0) = 114 DO $(            // 'r'
+                    run_buffer(editor, outv, tmp, drv)
+                    handled := 1
+                $)
+            $)
+        $)
+        UNLESS handled DO [app sendEvent: ev]
+    $)
+$)

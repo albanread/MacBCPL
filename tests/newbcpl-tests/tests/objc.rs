@@ -97,6 +97,19 @@ fn db_synthesizes_non_json_selector() {
     );
 }
 
+/// `bcpl_run_capture` shells out via `/bin/sh -c` and returns the
+/// command's combined stdout/stderr as an NSString (a BCPL String). This
+/// is the BCPL IDE's out-of-process Run primitive (crash isolation). A
+/// zero-exit command gets no footer, so the output is verbatim.
+#[test]
+fn run_capture_shells_out_and_captures() {
+    expect(
+        "objc_run_capture",
+        "LET START() BE $(\n  WRITES(bcpl_run_capture(\"printf hello\"))\n$)\n",
+        "hello",
+    );
+}
+
 // ─── Tier B: struct returns materialized as vectors ─────────────────
 
 /// NSRange return (DB tag N) -> a 2-word VEC via the arm64 integer-pair
