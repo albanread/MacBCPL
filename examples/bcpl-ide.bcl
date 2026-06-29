@@ -2,88 +2,96 @@
 //
 //   ./newbcpl-driver run examples/bcpl-ide.bcl
 //
-// A native Cocoa window (built entirely from Objective-C bracket sends
-// compiled from BCPL) with an editable source pane over a read-only
-// output pane, a native menu bar, and file open/save.
+// A native Cocoa window built from Objective-C bracket sends compiled from
+// BCPL: an editable source pane over a read-only output pane, a native
+// menu bar, and file open/save.
 //
-//   Cmd-R   run the buffer (compile + run in a SUBPROCESS, output below)
-//   Cmd-O   open a .bcl file        Cmd-S  save     Cmd-N  new
-//   Cmd-Q   quit
-//   Cmd-Z/X/C/V/A  undo / cut / copy / paste / select-all (Edit menu)
+//   Cmd-R   run the buffer (compiles + runs in a SUBPROCESS, output below)
+//   Cmd-O open    Cmd-S save    Cmd-N new    Cmd-Q quit
+//   Cmd-Z/X/C/V/A  undo / cut / copy / paste / select-all
 //
-// Mirrors the MacModula2 IDE's out-of-process build/run model: a crash in
-// the program under test kills the subprocess, not the IDE. The whole UI
-// loop is a manual event pump, so the file/run commands live in BCPL —
-// the menu bar's App (Quit) and Edit menus use STANDARD Cocoa selectors
-// (dispatched to NSApp / the NSTextView first responder) and work
-// clickably; File/Program menu items mirror the keyboard commands.
+// Architecture: the menu/run commands are methods on a BCPL CLASS that
+// subclasses NSObject — i.e. a real Obj-C object whose methods are
+// installed as IMPs. Menu items target this controller, and the app runs
+// the STANDARD `[app run]` loop, so Cocoa drives the key window, the
+// editor, the Edit menu (responder chain), and action dispatch. Run is
+// OUT OF PROCESS (a crash in the program under test kills the subprocess,
+// not the IDE) — the MacModula2 IDE's model.
+//
+// A BCPL method `doRun` is registered under the Obj-C selector
+// `bcpl_doRun`; `bcpl_selector("bcpl_doRun")` reifies that SEL so a menu
+// item can target it. Standard actions (terminate:, cut:, …) are named the
+// same way and dispatch through NSApp / the first responder.
 
-// ─── File / run commands (driven from the event pump) ───────────────
+// ─── Controller: a real Obj-C object whose methods are the actions ───
 
-// Compile + run the editor buffer in a subprocess; show captured output.
-LET do_run(editor, outv) BE $(
-    LET tmp = "/tmp/macbcpl_ide_buffer.bcl"
-    LET drv = "/Users/oberon/claudeprojects/MacBCPL/target/debug/newbcpl-driver"
-    [[editor string] writeToFile: tmp atomically: 1 encoding: 4 error: 0]  // 4=UTF8
-    LET cmd = [drv stringByAppendingString: " run "]
-    cmd := [cmd stringByAppendingString: tmp]
-    cmd := [cmd stringByAppendingString: " 2>&1"]
-    [outv setString: bcpl_run_capture(cmd)]
-$)
+CLASS IdeController EXTENDS NSObject $(
+    DECL editor          // NSTextView (source)
+    DECL outv            // NSTextView (output)
+    DECL win             // NSWindow
+    DECL cur             // current file path (NSString id, retained); 0 = untitled
 
-// Save As: pick a path with NSSavePanel, write, remember it. pc is the
-// address of the current-path cell (an NSString id, retained).
-LET do_save_as(editor, w, pc) BE $(
-    LET panel = [NSSavePanel savePanel]
-    IF ([panel runModal] AS INT) = 1 DO $(
-        LET path = [[panel URL] path]
-        [[editor string] writeToFile: path atomically: 1 encoding: 4 error: 0]
-        !pc := bcpl_objc_retain(path)
-        [w setTitleWithRepresentedFilename: path]
+    ROUTINE setup(ed, ov, w) BE $(
+        editor := ed
+        outv   := ov
+        win    := w
+        cur    := 0
     $)
-$)
 
-// Save to the current path, or fall through to Save As if untitled.
-LET do_save(editor, w, pc) BE $(
-    LET path = !pc
-    TEST path = 0
-        THEN do_save_as(editor, w, pc)
-        ELSE [[editor string] writeToFile: path atomically: 1 encoding: 4 error: 0]
-$)
+    // Compile + run the buffer in a subprocess; show captured output.
+    ROUTINE doRun(s) BE $(
+        LET tmp = "/tmp/macbcpl_ide_buffer.bcl"
+        LET drv = "/Users/oberon/claudeprojects/MacBCPL/target/debug/newbcpl-driver"
+        [outv setString: "Running…*N"]
+        [[editor string] writeToFile: tmp atomically: 1 encoding: 4 error: 0]  // 4=UTF8
+        LET cmd = [drv stringByAppendingString: " run "]
+        cmd := [cmd stringByAppendingString: tmp]
+        cmd := [cmd stringByAppendingString: " 2>&1"]
+        [outv setString: bcpl_run_capture(cmd)]
+    $)
 
-// Open: NSOpenPanel, load the file into the editor, remember the path.
-LET do_open(editor, w, pc) BE $(
-    LET panel = [NSOpenPanel openPanel]
-    [panel setCanChooseFiles: 1]
-    [panel setCanChooseDirectories: 0]
-    [panel setAllowsMultipleSelection: 0]
-    IF ([panel runModal] AS INT) = 1 DO $(
-        LET path = [[panel URL] path]
-        LET content = [NSString stringWithContentsOfFile: path encoding: 4 error: 0]
-        UNLESS content = 0 DO $(
-            [editor setString: content]
-            !pc := bcpl_objc_retain(path)
-            [w setTitleWithRepresentedFilename: path]
+    ROUTINE doSaveAs(s) BE $(
+        LET panel = [NSSavePanel savePanel]
+        IF ([panel runModal] AS INT) = 1 DO $(
+            LET path = [[panel URL] path]
+            [[editor string] writeToFile: path atomically: 1 encoding: 4 error: 0]
+            cur := bcpl_objc_retain(path)
+            [win setTitleWithRepresentedFilename: path]
         $)
     $)
+
+    ROUTINE doSave(s) BE $(
+        TEST cur = 0
+            THEN SELF.doSaveAs(s)
+            ELSE [[editor string] writeToFile: cur atomically: 1 encoding: 4 error: 0]
+    $)
+
+    ROUTINE doOpen(s) BE $(
+        LET panel = [NSOpenPanel openPanel]
+        [panel setCanChooseFiles: 1]
+        [panel setCanChooseDirectories: 0]
+        [panel setAllowsMultipleSelection: 0]
+        IF ([panel runModal] AS INT) = 1 DO $(
+            LET path = [[panel URL] path]
+            LET content = [NSString stringWithContentsOfFile: path encoding: 4 error: 0]
+            UNLESS content = 0 DO $(
+                [editor setString: content]
+                cur := bcpl_objc_retain(path)
+                [win setTitleWithRepresentedFilename: path]
+            $)
+        $)
+    $)
+
+    ROUTINE doNew(s) BE $(
+        [editor setString: ""]
+        cur := 0
+        [win setTitle: "MacBCPL IDE — Untitled"]
+    $)
 $)
 
-LET do_new(editor, w, pc) BE $(
-    [editor setString: ""]
-    !pc := 0
-    [w setTitle: "MacBCPL IDE — Untitled"]
-$)
+// ─── Menu construction ──────────────────────────────────────────────
 
-// ─── Menu bar ───────────────────────────────────────────────────────
-
-LET add_item(menu, title, selname, key) BE $(
-    LET it = [[NSMenuItem alloc] initWithTitle: title
-                                 action: bcpl_selector(selname) keyEquivalent: key]
-    [menu addItem: it]
-$)
-
-// A top-level menu: a bar item whose submenu (titled `title`) holds the
-// commands. Returns the submenu so the caller can add items.
+// A top-level menu (a bar item whose titled submenu holds commands).
 LET add_submenu(bar, title) = VALOF $(
     LET item = [[NSMenuItem alloc] init]
     [bar addItem: item]
@@ -92,34 +100,42 @@ LET add_submenu(bar, title) = VALOF $(
     RESULTIS menu
 $)
 
-LET build_menu(app) BE $(
+// A command targeting our controller (its method selector is `bcpl_<name>`).
+LET add_action(menu, title, ctrl, selname, key) BE $(
+    LET it = [[NSMenuItem alloc] initWithTitle: title
+                                 action: bcpl_selector(selname) keyEquivalent: key]
+    [it setTarget: ctrl]
+    [menu addItem: it]
+$)
+
+// A standard responder/NSApp action (nil target → responder chain).
+LET add_std(menu, title, selname, key) BE $(
+    LET it = [[NSMenuItem alloc] initWithTitle: title
+                                 action: bcpl_selector(selname) keyEquivalent: key]
+    [menu addItem: it]
+$)
+
+LET build_menu(app, ctrl) BE $(
     LET bar = [[NSMenu alloc] init]
 
-    // App menu — Quit dispatches to NSApp's own terminate:.
     LET appMenu = add_submenu(bar, "MacBCPL")
-    add_item(appMenu, "Quit MacBCPL IDE", "terminate:", "q")
+    add_std(appMenu, "Quit MacBCPL IDE", "terminate:", "q")
 
-    // File menu — mirrors the keyboard commands (handled in the pump).
     LET fileMenu = add_submenu(bar, "File")
-    [fileMenu setAutoenablesItems: 0]
-    add_item(fileMenu, "New", "ideNoop:", "n")
-    add_item(fileMenu, "Open…", "ideNoop:", "o")
-    add_item(fileMenu, "Save", "ideNoop:", "s")
+    add_action(fileMenu, "New",   ctrl, "bcpl_doNew",  "n")
+    add_action(fileMenu, "Open…", ctrl, "bcpl_doOpen", "o")
+    add_action(fileMenu, "Save",  ctrl, "bcpl_doSave", "s")
 
-    // Edit menu — STANDARD responder actions; the NSTextView first
-    // responder implements them, so these work clickably + by shortcut.
     LET editMenu = add_submenu(bar, "Edit")
-    add_item(editMenu, "Undo", "undo:", "z")
-    add_item(editMenu, "Redo", "redo:", "Z")
-    add_item(editMenu, "Cut", "cut:", "x")
-    add_item(editMenu, "Copy", "copy:", "c")
-    add_item(editMenu, "Paste", "paste:", "v")
-    add_item(editMenu, "Select All", "selectAll:", "a")
+    add_std(editMenu, "Undo", "undo:", "z")
+    add_std(editMenu, "Redo", "redo:", "Z")
+    add_std(editMenu, "Cut", "cut:", "x")
+    add_std(editMenu, "Copy", "copy:", "c")
+    add_std(editMenu, "Paste", "paste:", "v")
+    add_std(editMenu, "Select All", "selectAll:", "a")
 
-    // Program menu — Run mirrors Cmd-R (handled in the pump).
     LET progMenu = add_submenu(bar, "Program")
-    [progMenu setAutoenablesItems: 0]
-    add_item(progMenu, "Run", "ideNoop:", "r")
+    add_action(progMenu, "Run", ctrl, "bcpl_doRun", "r")
 
     [app setMainMenu: bar]
 $)
@@ -131,9 +147,7 @@ LET START() BE $(
     LET w = [[NSWindow alloc] initWithContentRect: (FVEC [120.0, 120.0, 920.0, 700.0])
                               styleMask: 15 backing: 2 defer: 0]
     [w setTitle: "MacBCPL IDE — Untitled"]
-    [w setReleasedWhenClosed: 0]
 
-    // Split: editor (top) over output (bottom).
     LET split = [[NSSplitView alloc] initWithFrame: (FVEC [0.0, 0.0, 920.0, 700.0])]
     [split setVertical: 0]
     [split setDividerStyle: 2]
@@ -160,37 +174,13 @@ LET START() BE $(
 
     [editor setString: "// MacBCPL IDE — Cmd-R run, Cmd-O open, Cmd-S save, Cmd-Q quit.*N*NLET START() BE $(*N  WRITES(*"Hello from the BCPL IDE!*N*")*N  FOR i = 1 TO 5 DO WRITEF(*"i = %d*N*", i)*N$)*N"]
 
-    build_menu(app)
+    LET ctrl = NEW IdeController
+    ctrl.setup(editor, outv, w)
+    build_menu(app, ctrl)
+
     [w center]
+    [app activateIgnoringOtherApps: 1]
     [w makeKeyAndOrderFront: 0]
     [w makeFirstResponder: editor]
-    [app activateIgnoringOtherApps: 1]
-
-    // ─── Event pump ──────────────────────────────────────────────
-    // File/run commands are intercepted here (so they live in BCPL);
-    // every other event — including the Edit menu's Cmd-Z/X/C/V/A —
-    // forwards to Cocoa.
-    LET curpath = 0
-    WHILE ([w isVisible] AS INT) ~= 0 DO $(
-        LET until = [NSDate dateWithTimeIntervalSinceNow: 0.08]
-        LET ev = [app nextEventMatchingMask: -1 untilDate: until
-                      inMode: "kCFRunLoopDefaultMode" dequeue: 1]
-        IF ev = 0 DO LOOP
-
-        LET handled = 0
-        IF ([ev type] AS INT) = 10 DO $(           // NSEventTypeKeyDown
-            IF (([ev modifierFlags] AS INT) BAND 1048576) ~= 0 DO $(   // Cmd
-                LET ch = [ev charactersIgnoringModifiers] AS STRING
-                SWITCHON ch % 0 INTO $(
-                    CASE 'r': do_run(editor, outv);          handled := 1 ; ENDCASE
-                    CASE 'o': do_open(editor, w, @curpath);  handled := 1 ; ENDCASE
-                    CASE 's': do_save(editor, w, @curpath);  handled := 1 ; ENDCASE
-                    CASE 'n': do_new(editor, w, @curpath);   handled := 1 ; ENDCASE
-                    CASE 'q': [app terminate: 0];            handled := 1 ; ENDCASE
-                    DEFAULT:                                                ENDCASE
-                $)
-            $)
-        $)
-        UNLESS handled DO [app sendEvent: ev]
-    $)
+    [app run]                                    // standard loop — Cocoa drives everything
 $)
