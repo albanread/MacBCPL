@@ -22,3 +22,6 @@ Thumbs.db
 *-results.txt
 sweep-results*.txt
 /target
+
+# Compiled .app launcher stub (build with dist/build-app.sh)
+dist/MacBCPL IDE.app/Contents/MacOS/MacBCPL-IDE
