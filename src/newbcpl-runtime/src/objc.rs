@@ -471,8 +471,27 @@ thread_local! {
     // reissued at a freed address — `bcpl_str_release` evicts this memo on
     // every owned-string release so a reused address never serves stale
     // data.
-    static STR_MEMO: std::cell::RefCell<(usize, Vec<u32>)> =
-        const { std::cell::RefCell::new((0usize, Vec::new())) };
+    // (id, utf16-length, code-points). The length GUARDS against address
+    // reuse: a live NSString (e.g. an editor's `[textView string]`) is
+    // never released through `bcpl_str_release`, so when its content is
+    // swapped the memo's key can still match a reissued address — checking
+    // `[length]` (O(1)) catches the content change and forces a recompute.
+    static STR_MEMO: std::cell::RefCell<(usize, usize, Vec<u32>)> =
+        const { std::cell::RefCell::new((0usize, 0usize, Vec::new())) };
+}
+
+/// `[nsstr length]` — the UTF-16 unit count (O(1)); used only as a
+/// cheap memo-validity signal, not as the code-point count.
+#[inline]
+unsafe fn nsstring_utf16_len(nsstr: *mut c_void) -> usize {
+    let msg = sym_or_null("objc_msgSend");
+    let reg = sym_or_null("sel_registerName");
+    if msg.is_null() || reg.is_null() {
+        return 0;
+    }
+    let reg: extern "C" fn(*const i8) -> *mut c_void = unsafe { std::mem::transmute(reg) };
+    let send: extern "C" fn(*mut c_void, *mut c_void) -> usize = unsafe { std::mem::transmute(msg) };
+    send(nsstr, reg(c"length".as_ptr()))
 }
 
 #[inline]
@@ -481,9 +500,10 @@ fn str_memo_with<R>(nsstr: *mut c_void, f: impl FnOnce(&[u32]) -> R, dflt: R) ->
         return dflt;
     }
     let key = nsstr as usize;
+    let cur_len = unsafe { nsstring_utf16_len(nsstr) };
     STR_MEMO.with(|m| {
         let mut m = m.borrow_mut();
-        if m.0 != key {
+        if m.0 != key || m.1 != cur_len {
             match unsafe { nsstring_utf8_bytes(nsstr) } {
                 Some(b) => {
                     // Decode UTF-8 to Unicode scalar values (Rust `char`
@@ -493,12 +513,12 @@ fn str_memo_with<R>(nsstr: *mut c_void, f: impl FnOnce(&[u32]) -> R, dflt: R) ->
                         .chars()
                         .map(|c| c as u32)
                         .collect();
-                    *m = (key, cps);
+                    *m = (key, cur_len, cps);
                 }
                 None => return dflt,
             }
         }
-        f(&m.1)
+        f(&m.2)
     })
 }
 
@@ -534,7 +554,7 @@ pub unsafe extern "C-unwind" fn bcpl_str_release(obj: *mut c_void) {
     STR_MEMO.with(|m| {
         let mut m = m.borrow_mut();
         if m.0 == key {
-            *m = (0usize, Vec::new());
+            *m = (0usize, 0usize, Vec::new());
         }
     });
     unsafe { bcpl_objc_release(obj) };

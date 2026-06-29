@@ -30,14 +30,31 @@ CLASS IdeController EXTENDS NSObject $(
     DECL outv            // NSTextView (output)
     DECL win             // NSWindow
     DECL gutter          // NSTextView (line-number column)
+    DECL dir             // sidebar's directory (NSString)
     DECL cur             // current file path (NSString id, retained); 0 = untitled
 
-    ROUTINE setup(ed, ov, w, g) BE $(
+    ROUTINE setup(ed, ov, w, g, d) BE $(
         editor := ed
         outv   := ov
         win    := w
         gutter := g
+        dir    := d
         cur    := 0
+    $)
+
+    // Sidebar file-button action: the sender's title is the file name;
+    // join it onto the sidebar directory and load it into the editor.
+    ROUTINE openNamed(sender) BE $(
+        LET name = [sender title]
+        LET path = [dir stringByAppendingString: "/"]
+        path := [path stringByAppendingString: name]
+        LET content = [NSString stringWithContentsOfFile: path encoding: 4 error: 0]
+        UNLESS content = 0 DO $(
+            [editor setString: content]
+            cur := bcpl_objc_retain(path)
+            [win setTitleWithRepresentedFilename: path]
+            SELF.recolor()
+        $)
     $)
 
     // Compile + run the buffer in a subprocess; show captured output.
@@ -213,6 +230,55 @@ LET add_std(menu, title, selname, key) BE $(
     [menu addItem: it]
 $)
 
+// Build an NSRect FVEC from four integer coordinates (FLOAT needs parens;
+// `!` stores the 64-bit value into the slot).
+LET rect4(x, y, w, h) = VALOF $(
+    LET r = FVEC 4
+    r ! 0 := FLOAT(x)
+    r ! 1 := FLOAT(y)
+    r ! 2 := FLOAT(w)
+    r ! 3 := FLOAT(h)
+    RESULTIS r
+$)
+
+// A scrollable sidebar of buttons, one per .bcl file in `dir`, laid out
+// with explicit frames in a plain document view (NSStackView-in-scrollview
+// collapsed to zero size under Auto Layout). Each button targets the
+// controller's openNamed: — its title is the file name.
+LET build_sidebar(ctrl, dir) = VALOF $(
+    LET fm = [NSFileManager defaultManager]
+    LET files = [fm contentsOfDirectoryAtPath: dir error: 0]
+    LET total = [files count] AS INT
+    LET rowH = 26
+
+    LET nbcl = 0
+    FOR k = 0 TO total - 1 DO
+        IF ([[files objectAtIndex: k] hasSuffix: ".bcl"] AS INT) ~= 0 DO nbcl := nbcl + 1
+    LET docH = nbcl * rowH
+    IF docH < 700 DO docH := 700                 // fill the viewport (top-align buttons)
+
+    LET doc = [[NSView alloc] initWithFrame: rect4(0, 0, 198, docH)]
+    LET j = 0
+    FOR k = 0 TO total - 1 DO $(
+        LET name = [files objectAtIndex: k]
+        IF ([name hasSuffix: ".bcl"] AS INT) ~= 0 DO $(
+            LET y = docH - ((j + 1) * rowH)      // top-down (non-flipped view)
+            LET btn = [[NSButton alloc] initWithFrame: rect4(2, y, 194, rowH - 2)]
+            [btn setTitle: name]
+            [btn setBezelStyle: 6]
+            [btn setTarget: ctrl]
+            [btn setAction: bcpl_selector("bcpl_openNamed")]
+            [doc addSubview: btn]
+            j := j + 1
+        $)
+    $)
+
+    LET sb = [[NSScrollView alloc] initWithFrame: rect4(0, 0, 200, 700)]
+    [sb setHasVerticalScroller: 1]
+    [sb setDocumentView: doc]
+    RESULTIS sb
+$)
+
 LET build_menu(app, ctrl) BE $(
     LET bar = [[NSMenu alloc] init]
 
@@ -242,7 +308,7 @@ LET START() BE $(
     LET app = [NSApplication sharedApplication]
     [app setActivationPolicy: 0]                 // Regular
 
-    LET w = [[NSWindow alloc] initWithContentRect: (FVEC [120.0, 120.0, 920.0, 700.0])
+    LET w = [[NSWindow alloc] initWithContentRect: (FVEC [120.0, 120.0, 1120.0, 720.0])
                               styleMask: 15 backing: 2 defer: 0]
     [w setTitle: "MacBCPL IDE — Untitled"]
 
@@ -288,7 +354,6 @@ LET START() BE $(
 
     [split addSubview: editorRow]
     [split addSubview: outScroll]
-    [w setContentView: split]
 
     // NOTE on escaping: `*N` here is a REAL newline in the displayed text
     // (structural line breaks of the starter program); `**N` is an escaped
@@ -298,9 +363,17 @@ LET START() BE $(
     // escape, not a line break).
     [editor setString: "// MacBCPL IDE — Cmd-R run, Cmd-O open, Cmd-S save, Cmd-Q quit.*N*NLET START() BE $(*N  WRITES(*"Hello from the BCPL IDE!**N*")*N  FOR i = 1 TO 5 DO WRITEF(*"i = %d**N*", i)*N$)*N"]
 
+    LET examplesDir = "/Users/oberon/claudeprojects/MacBCPL/examples"
     LET ctrl = NEW IdeController
-    ctrl.setup(editor, outv, w, gutter)
+    ctrl.setup(editor, outv, w, gutter, examplesDir)
     build_menu(app, ctrl)
+
+    // Wrap the editor/output split and a file sidebar in a horizontal split.
+    LET outer = [[NSSplitView alloc] initWithFrame: (FVEC [0.0, 0.0, 1120.0, 720.0])]
+    [outer setVertical: 1]                       // vertical divider -> side by side
+    [outer addSubview: build_sidebar(ctrl, examplesDir)]
+    [outer addSubview: split]
+    [w setContentView: outer]
 
     // Live syntax highlighting: recolor on every edit. The notification
     // centre dispatches to the selector we name (the controller's
