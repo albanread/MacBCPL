@@ -47,7 +47,12 @@ CLASS IdeController EXTENDS NSObject $(
         LET cmd = [drv stringByAppendingString: " run "]
         cmd := [cmd stringByAppendingString: tmp]
         cmd := [cmd stringByAppendingString: " 2>&1"]
-        [outv setString: bcpl_run_capture(cmd)]
+        LET out = bcpl_run_capture(cmd)
+        [outv setString: out]
+        // Clear stale marks (recolour), then red-mark the error line if any.
+        SELF.recolor()
+        LET el = bcpl_error_line(out)
+        IF el > 0 DO SELF.mark_line(el)
     $)
 
     ROUTINE doSaveAs(s) BE $(
@@ -129,8 +134,37 @@ CLASS IdeController EXTENDS NSObject $(
                 IF (bcpl_is_keyword(src, s, i - s) ~= 0) DO
                     bcpl_set_text_color(ts, s, i - s, 0.45, 0.62, 0.95)   // keyword blue
             $)
+            ELSE TEST (c >= 48) & (c <= 57)
+            THEN $(                                            // number
+                LET s = i
+                LET more = 1
+                WHILE (i < n) & (more ~= 0) DO $(
+                    LET d = src % i
+                    TEST ((d >= 48) & (d <= 57)) | (d = 46) | (d = 88) | (d = 120)
+                        THEN i := i + 1                        // digit, '.', 'X'/'x' (hex)
+                        ELSE more := 0
+                $)
+                bcpl_set_text_color(ts, s, i - s, 0.55, 0.85, 0.78)       // number teal
+            $)
             ELSE i := i + 1
         $)
+    $)
+
+    // Red-mark a 1-based source line (the compiler flagged an error there).
+    // Persists until the next edit (which recolours) or the next run.
+    ROUTINE mark_line(line) BE $(
+        LET ts = [editor textStorage]
+        LET src = [editor string] AS STRING
+        LET n = LEN src
+        LET cur = 1
+        LET i = 0
+        WHILE (cur < line) & (i < n) DO $(
+            IF (src % i) = 10 DO cur := cur + 1
+            i := i + 1
+        $)
+        LET s = i
+        WHILE (i < n) & ((src % i) ~= 10) DO i := i + 1
+        IF i > s DO bcpl_set_text_color(ts, s, i - s, 1.0, 0.42, 0.42)    // error red
     $)
 
     // Fired by NSTextDidChangeNotification on every edit (the notification

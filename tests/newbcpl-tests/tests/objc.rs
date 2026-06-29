@@ -147,6 +147,17 @@ fn is_keyword_recognises_bcpl_keywords() {
     );
 }
 
+/// `bcpl_error_line` pulls the diagnostic line number out of compiler
+/// output (`… at L:C`) for the IDE's red error mark; 0 when clean.
+#[test]
+fn error_line_parses_diagnostic() {
+    expect(
+        "objc_error_line",
+        "LET START() BE $(\n  WRITEN(bcpl_error_line(\"run: parse: oops at 7:12\"))\n  WRITEN(bcpl_error_line(\"ran clean\"))\n$)\n",
+        "70",
+    );
+}
+
 // ─── Tier B: struct returns materialized as vectors ─────────────────
 
 /// NSRange return (DB tag N) -> a 2-word VEC via the arm64 integer-pair

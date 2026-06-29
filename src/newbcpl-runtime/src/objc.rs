@@ -347,6 +347,32 @@ pub unsafe extern "C-unwind" fn bcpl_set_text_color(
     );
 }
 
+/// Scan compiler output for the line number of the first/last diagnostic
+/// (`… at <line>:<col>`) and return it (1-based), or 0 if the program ran
+/// clean. The IDE uses it to red-mark the offending source line. Takes the
+/// LAST `at L:C` so the innermost (most specific) error wins.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_error_line(out: *mut c_void) -> i64 {
+    let Some(bytes) = (unsafe { nsstring_utf8_bytes(out) }) else {
+        return 0;
+    };
+    let s = String::from_utf8_lossy(&bytes);
+    let mut result = 0i64;
+    let mut rest = s.as_ref();
+    while let Some(pos) = rest.find(" at ") {
+        let after = &rest[pos + 4..];
+        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        // Require "<digits>:" so it's a line:col, not prose containing "at".
+        if !digits.is_empty() && after[digits.len()..].starts_with(':') {
+            if let Ok(n) = digits.parse::<i64>() {
+                result = n;
+            }
+        }
+        rest = &rest[pos + 4..];
+    }
+    result
+}
+
 /// Is the word `src[loc .. loc+len)` a BCPL keyword? (For the IDE's
 /// syntax colouriser — the keyword set mirrors the lexer.) `loc`/`len` are
 /// code-point indices; BCPL source is ASCII so they index UTF-8 bytes
@@ -1050,6 +1076,7 @@ pub fn builtin_addresses() -> Vec<(&'static str, usize)> {
         ("bcpl_selector", bcpl_selector as *const () as usize),
         ("bcpl_set_text_color", bcpl_set_text_color as *const () as usize),
         ("bcpl_is_keyword", bcpl_is_keyword as *const () as usize),
+        ("bcpl_error_line", bcpl_error_line as *const () as usize),
         ("bcpl_objc_new", bcpl_objc_new as *const () as usize),
         ("bcpl_objc_alloc_init", bcpl_objc_alloc_init as *const () as usize),
         ("bcpl_objc_release", bcpl_objc_release as *const () as usize),
