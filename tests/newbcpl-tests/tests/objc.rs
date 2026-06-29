@@ -135,6 +135,18 @@ fn set_text_color_applies_to_range() {
     );
 }
 
+/// `bcpl_is_keyword` recognises BCPL keywords by `(string, loc, len)` —
+/// the IDE colouriser uses it to paint keywords. "LET"→1, "foo"→0,
+/// "WHILE"→1.
+#[test]
+fn is_keyword_recognises_bcpl_keywords() {
+    expect(
+        "objc_is_keyword",
+        "LET START() BE $(\n  LET s = \"LET foo WHILE\"\n  WRITEN(bcpl_is_keyword(s, 0, 3))\n  WRITEN(bcpl_is_keyword(s, 4, 3))\n  WRITEN(bcpl_is_keyword(s, 8, 5))\n$)\n",
+        "101",
+    );
+}
+
 // ─── Tier B: struct returns materialized as vectors ─────────────────
 
 /// NSRange return (DB tag N) -> a 2-word VEC via the arm64 integer-pair

@@ -115,6 +115,20 @@ CLASS IdeController EXTENDS NSObject $(
                 IF i < n DO i := i + 1                          // include closing quote
                 bcpl_set_text_color(ts, s, i - s, 0.95, 0.62, 0.35)
             $)
+            ELSE TEST ((c >= 65) & (c <= 90)) | ((c >= 97) & (c <= 122)) | (c = 95)
+            THEN $(                                            // identifier / keyword
+                LET s = i
+                LET more = 1
+                WHILE (i < n) & (more ~= 0) DO $(
+                    LET d = src % i
+                    TEST ((d >= 65) & (d <= 90)) | ((d >= 97) & (d <= 122)) |
+                         ((d >= 48) & (d <= 57)) | (d = 95)
+                        THEN i := i + 1
+                        ELSE more := 0
+                $)
+                IF (bcpl_is_keyword(src, s, i - s) ~= 0) DO
+                    bcpl_set_text_color(ts, s, i - s, 0.45, 0.62, 0.95)   // keyword blue
+            $)
             ELSE i := i + 1
         $)
     $)

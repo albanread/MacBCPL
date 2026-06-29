@@ -347,6 +347,42 @@ pub unsafe extern "C-unwind" fn bcpl_set_text_color(
     );
 }
 
+/// Is the word `src[loc .. loc+len)` a BCPL keyword? (For the IDE's
+/// syntax colouriser — the keyword set mirrors the lexer.) `loc`/`len` are
+/// code-point indices; BCPL source is ASCII so they index UTF-8 bytes
+/// directly. Returns 1 / 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_is_keyword(src: *mut c_void, loc: i64, len: i64) -> i64 {
+    if src.is_null() || len <= 0 {
+        return 0;
+    }
+    let Some(bytes) = (unsafe { nsstring_utf8_bytes(src) }) else {
+        return 0;
+    };
+    let (loc, len) = (loc as usize, len as usize);
+    if loc.saturating_add(len) > bytes.len() {
+        return 0;
+    }
+    let word = &bytes[loc..loc + len];
+    const KW: &[&[u8]] = &[
+        b"AND", b"BAND", b"BE", b"BNOT", b"BOR", b"BREAK", b"BXOR", b"BY", b"CASE",
+        b"CLASS", b"DECL", b"DEFAULT", b"DO", b"ELSE", b"ENDCASE", b"ENTIER", b"EQV",
+        b"EXTENDS", b"FALSE", b"FINAL", b"FINISH", b"FIX", b"FLET", b"FLOAT", b"FOR",
+        b"FOREACH", b"FREELIST", b"FREEVEC", b"FSQRT", b"FSTATIC", b"FTABLE", b"FUNCTION",
+        b"FVALOF", b"FVEC", b"GET", b"GLOBAL", b"GLOBALS", b"GOTO", b"IF", b"IN", b"INTO",
+        b"LET", b"LIST", b"LOOP", b"MANAGED", b"MANIFEST", b"NEQV", b"NEW", b"NOT", b"OF",
+        b"OR", b"PRIVATE", b"PROTECTED", b"PUBLIC", b"REM", b"REPEAT", b"REPEATUNTIL",
+        b"REPEATWHILE", b"RESULTIS", b"RETAIN", b"RETURN", b"ROUTINE", b"SELF", b"STATIC",
+        b"SUPER", b"SWITCHON", b"TABLE", b"TEST", b"THEN", b"TO", b"TRUE", b"TRUNC",
+        b"UNLESS", b"UNTIL", b"USING", b"VALOF", b"VEC", b"VIRTUAL", b"WHILE", b"XOR",
+    ];
+    if KW.iter().any(|k| *k == word) {
+        1
+    } else {
+        0
+    }
+}
+
 /// Intern an Obj-C selector from an NSString name (a BCPL `String`) and
 /// return it as a `SEL`. Lets BCPL wire menu items / targets to STANDARD
 /// Cocoa actions (`terminate:`, `cut:`, `selectAll:`, …) whose selectors
@@ -1013,6 +1049,7 @@ pub fn builtin_addresses() -> Vec<(&'static str, usize)> {
         ("bcpl_run_capture", bcpl_run_capture as *const () as usize),
         ("bcpl_selector", bcpl_selector as *const () as usize),
         ("bcpl_set_text_color", bcpl_set_text_color as *const () as usize),
+        ("bcpl_is_keyword", bcpl_is_keyword as *const () as usize),
         ("bcpl_objc_new", bcpl_objc_new as *const () as usize),
         ("bcpl_objc_alloc_init", bcpl_objc_alloc_init as *const () as usize),
         ("bcpl_objc_release", bcpl_objc_release as *const () as usize),

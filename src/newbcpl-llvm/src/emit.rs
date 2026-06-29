@@ -554,6 +554,8 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             "bcpl_run_capture" => ptr_t.fn_type(&[ptr_t.into()], false),
             // Reify a SEL from an NSString name (for menu/target actions).
             "bcpl_selector" => ptr_t.fn_type(&[ptr_t.into()], false),
+            // (source NSString, loc, len) -> 1/0 : is the word a BCPL keyword?
+            "bcpl_is_keyword" => i64_t.fn_type(&[ptr_t.into(), i64_t.into(), i64_t.into()], false),
             // Syntax colouriser: (textStorage, loc, len, r, g, b) -> void.
             // The colour floats must ride d-registers, so type them f64.
             "bcpl_set_text_color" => self.context.void_type().fn_type(
