@@ -340,6 +340,10 @@ CLASS IdeController EXTENDS NSObject $(
         SELF.mark_dirty(1)
         SELF.recolor()
     $)
+
+    // Editor scrolled: mirror its offset onto the line-number gutter.
+    ROUTINE onScroll(note) BE
+        bcpl_sync_scroll([editor enclosingScrollView], [gutter enclosingScrollView])
 $)
 
 // ─── Menu construction ──────────────────────────────────────────────
@@ -489,12 +493,18 @@ LET START() BE $(
     [gutter setBackgroundColor: [NSColor colorWithRed: 0.10 green: 0.11 blue: 0.14 alpha: 1.0]]
     [gutter setTextColor: [NSColor colorWithRed: 0.45 green: 0.48 blue: 0.55 alpha: 1.0]]
     [gutter setAlignment: 1]                     // right-align the numbers
-    [gutter setAutoresizingMask: 20]             // fixed width, left-pinned, height-flexible
+    // Put the gutter in a (scroller-less) scroll view so it can scroll in
+    // lock-step with the editor on long files.
+    LET gutScroll = [[NSScrollView alloc] initWithFrame: (FVEC [0.0, 0.0, 48.0, 480.0])]
+    [gutScroll setHasVerticalScroller: 0]
+    [gutScroll setHasHorizontalScroller: 0]
+    [gutScroll setDocumentView: gutter]
+    [gutScroll setAutoresizingMask: 20]          // fixed width, left-pinned, height-flexible
 
     LET editorRow = [[NSView alloc] initWithFrame: (FVEC [0.0, 0.0, 920.0, 480.0])]
     [edScroll setFrame: (FVEC [48.0, 0.0, 872.0, 480.0])]
     [edScroll setAutoresizingMask: 18]           // width + height flexible
-    [editorRow addSubview: gutter]
+    [editorRow addSubview: gutScroll]
     [editorRow addSubview: edScroll]
 
     LET outScroll = [[NSScrollView alloc] initWithFrame: (FVEC [0.0, 0.0, 920.0, 200.0])]
@@ -539,6 +549,12 @@ LET START() BE $(
     LET nc = [NSNotificationCenter defaultCenter]
     [nc addObserver: ctrl selector: bcpl_selector("bcpl_onTextChanged")
         name: "NSTextDidChangeNotification" object: editor]
+
+    // Gutter scroll-sync: observe the editor clip view's bounds changes
+    // and mirror them onto the gutter (Apple's synchronized-scroll pattern).
+    [[edScroll contentView] setPostsBoundsChangedNotifications: 1]
+    [nc addObserver: ctrl selector: bcpl_selector("bcpl_onScroll")
+        name: "NSViewBoundsDidChangeNotification" object: [edScroll contentView]]
 
     ctrl.open_doc("", starter)                   // seed the first (untitled) tab
 

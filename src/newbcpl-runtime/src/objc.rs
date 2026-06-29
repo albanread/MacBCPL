@@ -473,6 +473,50 @@ pub unsafe extern "C-unwind" fn bcpl_error_line(out: *mut c_void) -> i64 {
     result
 }
 
+#[repr(C)]
+struct NsRect4 {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+/// Sync `dst`'s scroll offset to `src`'s (both NSScrollViews): scroll
+/// dst's clip view to src's clip-view bounds.origin.y. Keeps the IDE's
+/// line-number gutter aligned with the editor while scrolling. The NSRect
+/// (HFA, v0..v3) and NSPoint (d0,d1) ABIs are handled here so BCPL needn't
+/// touch by-value structs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn bcpl_sync_scroll(src: *mut c_void, dst: *mut c_void) {
+    if src.is_null() || dst.is_null() {
+        return;
+    }
+    let msg = sym_or_null("objc_msgSend");
+    let reg = sym_or_null("sel_registerName");
+    if msg.is_null() || reg.is_null() {
+        return;
+    }
+    let reg: extern "C" fn(*const i8) -> *mut c_void = unsafe { std::mem::transmute(reg) };
+    let send_id: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+        unsafe { std::mem::transmute(msg) };
+    let send_rect: extern "C" fn(*mut c_void, *mut c_void) -> NsRect4 =
+        unsafe { std::mem::transmute(msg) };
+    let send_pt: extern "C" fn(*mut c_void, *mut c_void, f64, f64) =
+        unsafe { std::mem::transmute(msg) };
+    let send_view: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) =
+        unsafe { std::mem::transmute(msg) };
+
+    let cv = reg(c"contentView".as_ptr());
+    let src_clip = send_id(src, cv);
+    let dst_clip = send_id(dst, cv);
+    if src_clip.is_null() || dst_clip.is_null() {
+        return;
+    }
+    let r = send_rect(src_clip, reg(c"bounds".as_ptr()));
+    send_pt(dst_clip, reg(c"scrollToPoint:".as_ptr()), 0.0, r.y);
+    send_view(dst, reg(c"reflectScrolledClipView:".as_ptr()), dst_clip);
+}
+
 /// Is the word `src[loc .. loc+len)` a BCPL keyword? (For the IDE's
 /// syntax colouriser — the keyword set mirrors the lexer.) `loc`/`len` are
 /// code-point indices; BCPL source is ASCII so they index UTF-8 bytes
@@ -1200,6 +1244,7 @@ pub fn builtin_addresses() -> Vec<(&'static str, usize)> {
         ("bcpl_is_keyword", bcpl_is_keyword as *const () as usize),
         ("bcpl_error_line", bcpl_error_line as *const () as usize),
         ("bcpl_line_numbers", bcpl_line_numbers as *const () as usize),
+        ("bcpl_sync_scroll", bcpl_sync_scroll as *const () as usize),
         ("bcpl_objc_new", bcpl_objc_new as *const () as usize),
         ("bcpl_objc_alloc_init", bcpl_objc_alloc_init as *const () as usize),
         ("bcpl_objc_release", bcpl_objc_release as *const () as usize),
