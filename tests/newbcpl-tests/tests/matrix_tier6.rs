@@ -225,6 +225,18 @@ fn heap_info_after_alloc_shows_block() {
     );
 }
 
+#[test]
+fn heap_info_reports_cocoa_objects() {
+    // HEAP_INFO now carries a Cocoa-tier section reporting the retain/release
+    // traffic the runtime drove — NEW instantiation, NSString interning,
+    // retain/release, autorelease pools. A `NEW` must surface there.
+    expect_stdout_contains(
+        "heap_info_cocoa_section",
+        "CLASS P $(\n  DECL x\n  ROUTINE CREATE(v) BE $( SELF.x := v $)\n$)\nLET START() BE $(\n  LET p = NEW P(7)\n  HEAP_INFO()\n$)\n",
+        "Cocoa objects",
+    );
+}
+
 // ─── Multi-allocation isolation ────────────────────────────────────
 
 #[test]

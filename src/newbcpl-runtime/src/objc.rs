@@ -83,6 +83,50 @@ unsafe fn cstr<'a>(ptr: *const u8) -> Option<&'a CStr> {
     }
 }
 
+// ─── Cocoa-tier activity counters ───────────────────────────────────
+
+/// Retain/release traffic the BCPL runtime itself drives, reported by
+/// `HEAP_INFO`'s Cocoa section. These count the operations the runtime
+/// **mediates** — `NEW` instantiation, `RETAIN`/`RELEASE`, NSString
+/// interning, autorelease-pool cycles — NOT raw `[[C alloc] init]` bracket
+/// sends (which call `objc_msgSend` directly from JIT code) nor
+/// framework-internal allocations. So they measure the work BCPL's own
+/// ownership machinery does, not the process-wide live Cocoa object count.
+pub struct CocoaCounters {
+    /// `NEW Class` instantiations (`bcpl_objc_new` / `alloc_init`).
+    pub objects_new: std::sync::atomic::AtomicU64,
+    /// NSStrings interned — literals (materialised once each), JOIN results,
+    /// and +0 builds.
+    pub strings_built: std::sync::atomic::AtomicU64,
+    /// `retain` messages sent (BCPL `RETAIN`, owned-slot strong store).
+    pub retains: std::sync::atomic::AtomicU64,
+    /// `release` messages sent (scope-exit release, `USING`, `RELEASE`).
+    pub releases: std::sync::atomic::AtomicU64,
+    /// Autorelease pools opened (one per top-level run when enabled).
+    pub autorelease_pools: std::sync::atomic::AtomicU64,
+}
+
+impl CocoaCounters {
+    const fn zeroed() -> Self {
+        use std::sync::atomic::AtomicU64;
+        Self {
+            objects_new: AtomicU64::new(0),
+            strings_built: AtomicU64::new(0),
+            retains: AtomicU64::new(0),
+            releases: AtomicU64::new(0),
+            autorelease_pools: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Process-wide Cocoa-tier counters. See [`CocoaCounters`].
+pub static COCOA_COUNTERS: CocoaCounters = CocoaCounters::zeroed();
+
+#[inline]
+fn bump(c: &std::sync::atomic::AtomicU64) {
+    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 // ─── autorelease pool ───────────────────────────────────────────────
 
 /// `objc_autoreleasePoolPush()` — open a new autorelease pool and return an
@@ -103,7 +147,11 @@ pub fn autorelease_pool_push() -> *mut c_void {
         return std::ptr::null_mut();
     }
     let f: extern "C" fn() -> *mut c_void = unsafe { std::mem::transmute(f) };
-    f()
+    let token = f();
+    if !token.is_null() {
+        bump(&COCOA_COUNTERS.autorelease_pools);
+    }
+    token
 }
 
 /// `objc_autoreleasePoolPop(token)` — drain and pop the pool opened by the
@@ -189,7 +237,11 @@ pub unsafe extern "C-unwind" fn bcpl_objc_nsstring(text: *const u8) -> *mut c_vo
     if cls.is_null() || sel.is_null() {
         return std::ptr::null_mut();
     }
-    send(cls, sel, c.as_ptr())
+    let s = send(cls, sel, c.as_ptr());
+    if !s.is_null() {
+        bump(&COCOA_COUNTERS.strings_built);
+    }
+    s
 }
 
 /// Extract an `NSString*`'s text into a BCPL UTF-8 buffer (NUL
@@ -258,7 +310,11 @@ pub unsafe extern "C-unwind" fn bcpl_objc_nsstring_immortal(text: *const u8) -> 
     if obj.is_null() {
         return std::ptr::null_mut();
     }
-    send1(obj, reg_sel(c"initWithUTF8String:".as_ptr()), c.as_ptr())
+    let s = send1(obj, reg_sel(c"initWithUTF8String:".as_ptr()), c.as_ptr());
+    if !s.is_null() {
+        bump(&COCOA_COUNTERS.strings_built);
+    }
+    s
 }
 
 // ─── NSString byte access (`s % i`, LEN, WRITES) ────────────────────
@@ -760,7 +816,11 @@ pub unsafe extern "C-unwind" fn bcpl_objc_alloc_init(cls: *mut c_void) -> *mut c
     if obj.is_null() {
         return std::ptr::null_mut();
     }
-    send0(obj, reg_sel(c"init".as_ptr()))
+    let inited = send0(obj, reg_sel(c"init".as_ptr()));
+    if !inited.is_null() {
+        bump(&COCOA_COUNTERS.objects_new);
+    }
+    inited
 }
 
 /// Could `p` be a real heap Obj-C object id? A heap object is at least
@@ -792,6 +852,7 @@ pub unsafe extern "C-unwind" fn bcpl_objc_release(obj: *mut c_void) {
     let reg_sel: extern "C" fn(*const i8) -> *mut c_void = unsafe { std::mem::transmute(reg_sel) };
     let send0: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
         unsafe { std::mem::transmute(msg_send) };
+    bump(&COCOA_COUNTERS.releases);
     send0(obj, reg_sel(c"release".as_ptr()));
 }
 
@@ -811,6 +872,7 @@ pub unsafe extern "C-unwind" fn bcpl_objc_retain(obj: *mut c_void) -> *mut c_voi
     let reg_sel: extern "C" fn(*const i8) -> *mut c_void = unsafe { std::mem::transmute(reg_sel) };
     let send0: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
         unsafe { std::mem::transmute(msg_send) };
+    bump(&COCOA_COUNTERS.retains);
     send0(obj, reg_sel(c"retain".as_ptr()))
 }
 
@@ -1139,6 +1201,36 @@ mod tests {
     fn autorelease_pool_pop_null_is_noop() {
         // A null token (pool disabled / symbol unresolved) is a safe no-op.
         autorelease_pool_pop(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn cocoa_counters_track_activity() {
+        use std::sync::atomic::Ordering;
+        // Monotonic counters — assert each operation moves its counter past a
+        // captured baseline (robust to other tests in the shared process).
+        let new0 = COCOA_COUNTERS.objects_new.load(Ordering::Relaxed);
+        let str0 = COCOA_COUNTERS.strings_built.load(Ordering::Relaxed);
+        let rel0 = COCOA_COUNTERS.releases.load(Ordering::Relaxed);
+
+        let s = unsafe { bcpl_objc_nsstring(c"counted".as_ptr() as *const u8) };
+        assert!(!s.is_null());
+        let cls = unsafe { bcpl_objc_get_class(c"NSObject".as_ptr() as *const u8) };
+        let obj = unsafe { bcpl_objc_alloc_init(cls) };
+        assert!(!obj.is_null());
+        unsafe { bcpl_objc_release(obj) };
+
+        assert!(
+            COCOA_COUNTERS.strings_built.load(Ordering::Relaxed) > str0,
+            "NSString build should be counted"
+        );
+        assert!(
+            COCOA_COUNTERS.objects_new.load(Ordering::Relaxed) > new0,
+            "alloc/init should be counted"
+        );
+        assert!(
+            COCOA_COUNTERS.releases.load(Ordering::Relaxed) > rel0,
+            "release should be counted"
+        );
     }
 
     #[test]

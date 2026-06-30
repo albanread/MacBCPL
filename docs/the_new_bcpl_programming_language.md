@@ -1167,6 +1167,14 @@ The result is a language with manual control available when you reach for it, bu
 with the everyday 90% — the scratch vector, the local object — handled without a
 collector and without a single `free`.
 
+To see what is happening, `HEAP_INFO()` prints a snapshot: the manual heap's
+allocations and live set, and a **Cocoa-tier section** — how many `NEW` instances
+and NSStrings the runtime built, and how many retains, releases, and autorelease
+pools it drove. (Those are the operations BCPL's ownership machinery mediates, a
+useful pulse on the object tier — not a process-wide census, since raw bracket
+`alloc/init` and the frameworks' own allocations go straight to the Objective-C
+runtime.)
+
 ---
 
 # Part II — Cocoa
@@ -1881,7 +1889,7 @@ float results are IEEE doubles.
 | `TIMER_END(t)` | elapsed ns since `t` |
 | `TIMER_DISPLAY(ns)` | print a duration |
 | `SLEEP(ms)` | pause |
-| `HEAP_INFO()` | print allocator statistics |
+| `HEAP_INFO()` | print allocator statistics, plus a Cocoa-tier section: `NEW` instances, NSStrings interned, retains/releases, and autorelease pools the runtime drove |
 | `GC()` | request collection (no-op in the no-GC model) |
 
 ### B.7 Strings (NSString)

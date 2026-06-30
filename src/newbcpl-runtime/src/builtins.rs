@@ -450,6 +450,29 @@ pub unsafe extern "C-unwind" fn HEAP_INFO() -> i64 {
         h,
         "  clusters: {clusters}  module roots: {modules}  registered threads: {threads}"
     );
+
+    // Cocoa tier: retain/release traffic the runtime mediated. These are
+    // operation counts (NEW, RETAIN/RELEASE, string interning, pools), not a
+    // live-object census — raw [[C alloc] init] bracket sends and
+    // framework-internal allocations go straight through objc_msgSend and are
+    // not seen here.
+    let cc = &crate::objc::COCOA_COUNTERS;
+    let objs = cc.objects_new.load(Ordering::Acquire);
+    let strs = cc.strings_built.load(Ordering::Acquire);
+    let retains = cc.retains.load(Ordering::Acquire);
+    let releases = cc.releases.load(Ordering::Acquire);
+    let pools = cc.autorelease_pools.load(Ordering::Acquire);
+    let _ = writeln!(h, "=== Cocoa objects (retain/release driven by the runtime) ===");
+    let _ = writeln!(
+        h,
+        "  NEW instances: {objs:>10}     NSStrings built: {strs:>10}"
+    );
+    let _ = writeln!(
+        h,
+        "  retains:       {retains:>10}     releases:        {releases:>10}"
+    );
+    let _ = writeln!(h, "  autorelease pools: {pools}");
+
     let _ = h.flush();
     0
 }
