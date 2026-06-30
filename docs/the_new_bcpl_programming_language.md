@@ -1037,6 +1037,12 @@ LET draw() BE $(
 $)                              // p released here, automatically
 ```
 
+This is not special pleading for objects. A scope-local `NEW` object is reclaimed
+by the **same** end-of-scope machinery that frees an owned string (§9.5) and that
+discards a function's arena scratch (Chapter 8): when `draw` returns, its arena,
+its owned strings, and its scope-local objects are released together — one
+uniform reclamation at the epilogue, no collector and no `free`.
+
 When an object must be disposed deterministically — a file, a window, anything
 with a cleanup step — bind it with **USING**. At every exit from the `USING`
 block (fall-through, `RETURN`, `BREAK`, an exception) it runs the object's
@@ -1122,7 +1128,13 @@ compiler chooses for you:
   `GETVEC`/`FREEVEC`, all lists, and anything that *escapes* its scope and so
   cannot live on an arena. You free `GETVEC` blocks and owned lists yourself;
   escaped vectors are promoted here automatically.
-- **Cocoa** — `NEW` objects, managed by retain/release as Chapter 7 describes.
+- **Cocoa** — `NEW Class` objects, managed by retain/release. A scope-local
+  `NEW` object is released at the function epilogue by the **same** reclamation
+  that frees the arena and owned strings (§7.6, §9.5): objects, owned strings,
+  and arena scratch all come back together at scope exit. One that escapes
+  transfers its ownership instead. (Objects obtained through a Cocoa *bracket
+  send* — `[[C alloc] init]` — are the exception: their ownership is unknowable,
+  so you manage those yourself; §10.7.)
 
 ### 8.2 Escape analysis chooses the tier
 
@@ -1142,8 +1154,9 @@ one outcome the design refuses**; leaks are merely discouraged.
 
 In practice:
 
-- Local scratch arrays and short-lived objects: write them naturally and forget
-  them — the arena and the auto-release handle it.
+- Local scratch arrays, owned strings, and short-lived `NEW` objects: write them
+  naturally and forget them — a single scope-exit reclamation (arena free plus
+  release) handles all three.
 - Long-lived buffers you size yourself: `GETVEC` / `FREEVEC`.
 - Resources needing deterministic cleanup: `USING`.
 - Lists: build them, and `FREELIST` them only if you own them outright and have
