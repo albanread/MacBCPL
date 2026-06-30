@@ -3661,8 +3661,43 @@ fn is_owned_alloc_producer(e: &Expr) -> bool {
                     Expr::Ident { name, .. } if is_plus_one_string_builtin(name)
                 )
         }
+        // A Cocoa bracket send whose selector is in the alloc/new/copy/
+        // mutableCopy/init family returns a +1-owned object (the Cocoa
+        // "Create Rule") — exactly the ownership `NEW` already carries
+        // (`NEW C()` IS `[[C alloc] init]`). Track it like `NEW` so a
+        // scope-local result is released at the epilogue. Other selectors
+        // return +0 (autoreleased/borrowed); releasing those would crash,
+        // so they are deliberately NOT owned producers. The hint guard keeps
+        // a forced `AS INT`/struct return from being treated as an object.
+        Expr::ObjcMessage { selector, .. } => {
+            objc_selector_returns_owned(selector)
+                && matches!(e.hint(), TypeHint::Object | TypeHint::String)
+        }
         _ => false,
     }
+}
+
+/// Cocoa's "Create Rule": a selector in the `alloc` / `new` / `copy` /
+/// `mutableCopy` / `init` method family returns a **+1 (owned)** object the
+/// caller must release; every other selector returns **+0** (autoreleased /
+/// borrowed) and must NOT be released. Mirrors clang's `objc_method_family`:
+/// after stripping leading underscores, the family is one of those prefixes
+/// followed by end-of-selector or a non-lowercase character — so `init`,
+/// `initWithFrame:`, `new`, `newDocument`, `copy`, `copyWithZone:`,
+/// `mutableCopy`, `alloc`, `allocWithZone:` match, while `initialize`,
+/// `description`, `copying`, `newer` do not.
+fn objc_selector_returns_owned(selector: &str) -> bool {
+    let s = selector.trim_start_matches('_');
+    for fam in ["alloc", "new", "copy", "mutableCopy", "init"] {
+        if let Some(rest) = s.strip_prefix(fam) {
+            match rest.chars().next() {
+                None => return true,
+                Some(c) if !c.is_ascii_lowercase() => return true,
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 /// Runtime builtins that return a freshly-allocated (+1) NSString id the
@@ -3896,11 +3931,14 @@ fn esc_value(e: &Expr, esc: &mut HashSet<String>) {
                 esc_value(a, esc);
             }
         }
-        // A raw Obj-C send may capture its receiver and args (e.g.
-        // `[arr addObject: x]`), so conservatively treat them all as
-        // escaping.
+        // A raw Obj-C send messages its receiver (a use, not a capture —
+        // like a `obj.method()` dot call), so the receiver goes through
+        // `esc_base`: a bare local receiver does NOT escape, and a
+        // scope-local owned object configured by further `[obj ...]` sends
+        // stays tracked for epilogue release. The ARGUMENTS, however, may be
+        // captured (`[arr addObject: x]` retains x), so they escape.
         Expr::ObjcMessage { receiver, args, .. } => {
-            esc_value(receiver, esc);
+            esc_base(receiver, esc);
             for a in args {
                 esc_value(a, esc);
             }

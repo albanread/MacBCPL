@@ -1132,9 +1132,10 @@ compiler chooses for you:
   `NEW` object is released at the function epilogue by the **same** reclamation
   that frees the arena and owned strings (§7.6, §9.5): objects, owned strings,
   and arena scratch all come back together at scope exit. One that escapes
-  transfers its ownership instead. (Objects obtained through a Cocoa *bracket
-  send* — `[[C alloc] init]` — are the exception: their ownership is unknowable,
-  so you manage those yourself; §10.7.)
+  transfers its ownership instead. An object from a Cocoa *bracket send* is
+  reclaimed the same way when its selector is in the +1 `alloc`/`init` family
+  (the Create Rule); a +0 borrowed result is left alone, since releasing it would
+  crash (§10.7).
 
 ### 8.2 Escape analysis chooses the tier
 
@@ -1606,28 +1607,46 @@ than left to fault at run time:
 [w setFrame: (FVEC [1.0, 2.0])]  // error: setFrame: expects 4 fields, got 2
 ```
 
-### 10.7 Who owns the result — and a hazard
+### 10.7 Who owns the result
 
-This is the part to get right. Unlike `NEW` and `JOIN`, **the result of a
-bracket send is not tracked for you.** The compiler does not know, in general,
-whether a message returns something you own or merely borrow, so it does
-nothing automatic — no release at scope exit. You manage these objects
-explicitly, with `[x retain]` / `[x release]` or by binding with `USING`.
+The compiler tracks bracket-send ownership by the rule Objective-C itself uses —
+the **Create Rule**. A message whose selector is in the
+`alloc` / `new` / `copy` / `mutableCopy` / `init` family returns a **+1 owned**
+object; every other selector returns a **+0 borrowed** one.
 
-There is a sharper edge behind this. The JIT runs with **no autorelease pool**.
-In normal Cocoa, the `+0` "convenience" constructors — `stringWithUTF8String:`,
-`[NSNumber numberWithDouble:]`, and friends — return an object registered with
-the current autorelease pool, which drains later. With no pool, such an object's
-lifetime is undefined: it may be valid now and gone an instant later. The rule
-that keeps you safe is the classic Objective-C one:
+A +1 result is handled exactly like a `NEW` object (§7.6) — fitting, since
+`NEW C()` *is* `[[C alloc] init]`. Bound to a scope-local that does not escape,
+it is released for you at the function epilogue, by the same machinery that frees
+`NEW` objects and owned strings (§8.1); returned, stored, or passed on, its
+ownership transfers and it is not released:
 
-> Prefer the **`alloc`/`init`** (`+1`-owned) form over the convenience
-> constructor, and `[x release]` it (or `USING` it) when done.
+```bcpl
+LET configure() BE $(
+    LET w = [[NSWindow alloc] init]      // +1 — owned, scope-local
+    [w setTitle: "Hi"]                    // messaging it is a use, not an escape
+$)                                        // w released here, automatically
+```
 
-So write `[[NSMutableArray alloc] init]`, not `[NSMutableArray array]`; build a
-string with `JOIN` or a kept `NSString`, not an untracked `stringWithFormat:`
-result you stash for later. Within a single expression a convenience result is
-fine; it is *keeping* one across time that is unsafe until a pool exists.
+A +0 result is **borrowed**: you do not own it, and the compiler does not release
+it — which is correct, because releasing a borrowed object would over-release it
+and crash. So `[arr objectAtIndex: 0]`, `[s uppercaseString]`, `[dict allValues]`
+hand you something you may read but must not release.
+
+There is a sharper edge to the +0 case. The JIT runs with **no autorelease
+pool**. In normal Cocoa a +0 "convenience" result — `[NSMutableArray array]`,
+`[NSNumber numberWithDouble:]`, `stringWithFormat:` — is registered with the
+current pool and lives until it drains; with no pool, such an object's lifetime
+is undefined past the statement that made it. The classic Objective-C discipline
+keeps you safe:
+
+> Prefer the **`alloc`/`init`** (+1) form over the convenience constructor: write
+> `[[NSMutableArray alloc] init]`, not `[NSMutableArray array]`. The +1 object is
+> tracked and released; the +0 one is on its own.
+
+To dispose a +1 object *early* — before its scope ends — bind it with `USING`
+(which disposes on every exit) or send `[x release]` yourself. To keep one
+*beyond* its scope, let it escape (return it, or store it where the analysis sees
+it leave) or `RETAIN` it.
 
 ### 10.8 Dot or bracket?
 

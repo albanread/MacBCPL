@@ -264,3 +264,31 @@ fn statement_form_send() {
         "0",
     );
 }
+
+/// Ownership (Cocoa Create Rule), consistent with `NEW`: a scope-local
+/// `[[C alloc] init]` is a +1-owned object the compiler releases at the
+/// epilogue, while a +0 borrowed result (`objectAtIndex:`) must NOT be
+/// released. A further `[a ...]` send is a receiver USE, not an escape, so
+/// `a` stays local and is released. This loop would crash (over-release /
+/// use-after-free) if any of those rules were wrong; it must just finish.
+#[test]
+fn bracket_alloc_init_owned_released() {
+    expect(
+        "objc_owned_release",
+        "LET START() BE $(\n  FOR i = 1 TO 300 DO $(\n    LET a = [[NSMutableArray alloc] init]\n    [a addObject: \"x\"]\n    LET first = [a objectAtIndex: 0]\n  $)\n  WRITES(\"ok\")\n$)\n",
+        "ok",
+    );
+}
+
+/// A +1 bracket object RETURNED from a function escapes its scope, so the
+/// callee must NOT release it — ownership transfers to the caller. If the
+/// escape analysis released it in the callee, the caller's read would be a
+/// use-after-free.
+#[test]
+fn bracket_owned_result_escapes() {
+    expect(
+        "objc_owned_escape",
+        "LET mk() = VALOF $(\n  LET a = [[NSMutableArray alloc] init]\n  [a addObject: \"kept\"]\n  RESULTIS a\n$)\nLET START() BE $(\n  LET a = mk()\n  WRITES([a objectAtIndex: 0])\n$)\n",
+        "kept",
+    );
+}
