@@ -32,7 +32,14 @@ const COMMANDS: &[(&str, &str)] = &[
 ];
 
 fn main() -> ExitCode {
-    let mut args = env::args().skip(1);
+    // Global flags may appear anywhere on the line; pull them out before the
+    // subcommand. `--no-autorelease-pool` turns off the Objective-C
+    // autorelease pool that otherwise wraps each `run` (default on), giving
+    // +0 / convenience-constructor Cocoa objects a defined lifetime.
+    let raw: Vec<String> = env::args().skip(1).collect();
+    let no_pool = raw.iter().any(|a| a == "--no-autorelease-pool");
+    newbcpl_llvm::set_autorelease_pool(!no_pool);
+    let mut args = raw.into_iter().filter(|a| a != "--no-autorelease-pool");
     let Some(command) = args.next() else {
         print_usage();
         return ExitCode::SUCCESS;
@@ -843,6 +850,13 @@ fn print_usage() {
     for (cmd, blurb) in COMMANDS {
         eprintln!("    {:width$}    {}", cmd, blurb, width = max);
     }
+    eprintln!();
+    eprintln!("GLOBAL OPTIONS:");
+    eprintln!(
+        "    --no-autorelease-pool    don't wrap each run in an Obj-C autorelease pool\n\
+         {:29}(pool is on by default; +0 Cocoa objects then leak instead)",
+        ""
+    );
     let _ = Path::new(""); // import touched for future use
 }
 

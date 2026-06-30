@@ -141,6 +141,25 @@ pub fn run(path: &Path) -> Result<i64, String> {
 /// A missing or empty `modules_dir` is fine — no modules are loaded.
 /// A single module's compile or link failure aborts the whole run
 /// with a clear error.
+/// Whether to wrap each top-level program run in an Objective-C autorelease
+/// pool (default ON). The pool gives +0 / convenience-constructor Cocoa
+/// objects a defined lifetime — valid for the run, drained at its end —
+/// instead of leaking (no pool) or dangling across run-loop turns. +1 owned
+/// objects (alloc/new/copy/init and BCPL `NEW`) are released
+/// deterministically at their scope and never touch the pool. Turned off by
+/// `newbcpl-driver --no-autorelease-pool`.
+static AUTORELEASE_POOL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Set whether top-level runs are wrapped in an autorelease pool (default
+/// `true`). Call before [`run_with_active_folder`] / [`run_program_ir`].
+pub fn set_autorelease_pool(on: bool) {
+    AUTORELEASE_POOL.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn autorelease_pool_enabled() -> bool {
+    AUTORELEASE_POOL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn run_with_active_folder(
     path: &Path,
     modules_dir: Option<&Path>,
@@ -694,9 +713,24 @@ fn run_program_ir(ir: &IrModule, modules_dir: Option<&Path>) -> Result<i64, Stri
     // line to stderr for an *expected* unwind. The original hook is
     // restored on the way out. Set NEWBCPL_LOG_JIT_PANICS=1 to keep
     // the default hook for debugging.
+    // Open an autorelease pool around the run (default on) so +0 /
+    // convenience-constructor Cocoa objects are released when it drains at
+    // the end of the run, rather than leaking with no pool in place. A GUI
+    // program's `[app run]` loop installs its own per-turn pools; this is the
+    // outer backstop. Disabled by `--no-autorelease-pool` (a null token from
+    // a disabled pool or unresolved symbol makes `pop` a no-op).
+    let pool = if autorelease_pool_enabled() {
+        newbcpl_runtime::objc::autorelease_pool_push()
+    } else {
+        std::ptr::null_mut()
+    };
     let outcome = run_with_quiet_panic_hook(|| {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { start() }))
     });
+    // Drain the pool whether START returned or unwound cleanly. (A hard abort
+    // — a runtime-helper panic that can't unwind the JIT frame — exits the
+    // process before here, and the OS reclaims everything.)
+    newbcpl_runtime::objc::autorelease_pool_pop(pool);
     match outcome {
         Ok(value) => Ok(value),
         Err(payload) => Err(format!("JIT panic: {}", panic_payload_to_string(payload))),

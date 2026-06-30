@@ -83,6 +83,44 @@ unsafe fn cstr<'a>(ptr: *const u8) -> Option<&'a CStr> {
     }
 }
 
+// ─── autorelease pool ───────────────────────────────────────────────
+
+/// `objc_autoreleasePoolPush()` — open a new autorelease pool and return an
+/// opaque token to balance with [`autorelease_pool_pop`]. Returns null if
+/// the runtime symbol can't be resolved (in which case `pop` is a no-op).
+///
+/// While a pool is open, every +0 object — the result of an `autorelease`
+/// or of a convenience constructor (`[NSMutableArray array]`,
+/// `stringWithFormat:`, `numberWith…`) — is registered with it and released
+/// when the pool is popped. That gives such borrowed/transient objects a
+/// DEFINED lifetime (valid for the run, drained at its end) instead of
+/// leaking with no pool in place. +1 owned objects (alloc/new/copy/init,
+/// and BCPL `NEW`) are unaffected — they are released deterministically at
+/// their scope, never via the pool.
+pub fn autorelease_pool_push() -> *mut c_void {
+    let f = sym_or_null("objc_autoreleasePoolPush");
+    if f.is_null() {
+        return std::ptr::null_mut();
+    }
+    let f: extern "C" fn() -> *mut c_void = unsafe { std::mem::transmute(f) };
+    f()
+}
+
+/// `objc_autoreleasePoolPop(token)` — drain and pop the pool opened by the
+/// matching [`autorelease_pool_push`]. A null token (push failed or pool
+/// disabled) is a no-op.
+pub fn autorelease_pool_pop(token: *mut c_void) {
+    if token.is_null() {
+        return;
+    }
+    let f = sym_or_null("objc_autoreleasePoolPop");
+    if f.is_null() {
+        return;
+    }
+    let f: extern "C" fn(*mut c_void) = unsafe { std::mem::transmute(f) };
+    f(token);
+}
+
 // ─── class / selector lookup ────────────────────────────────────────
 
 /// `objc_getClass(name)` — look up an Objective-C class by name.
@@ -1080,6 +1118,27 @@ mod tests {
     fn get_class_finds_nsobject() {
         let cls = unsafe { bcpl_objc_get_class(c"NSObject".as_ptr() as *const u8) };
         assert!(!cls.is_null(), "objc_getClass(NSObject) should resolve");
+    }
+
+    #[test]
+    fn autorelease_pool_push_pop_resolves() {
+        // The runtime symbols must resolve on this platform, and a push must
+        // hand back a token that pop accepts without crashing. Drains a +0
+        // object made while the pool is open.
+        let token = autorelease_pool_push();
+        assert!(
+            !token.is_null(),
+            "objc_autoreleasePoolPush should resolve and return a token"
+        );
+        let arr = unsafe { bcpl_objc_nsstring(c"in pool".as_ptr() as *const u8) };
+        assert!(!arr.is_null());
+        autorelease_pool_pop(token); // must not crash
+    }
+
+    #[test]
+    fn autorelease_pool_pop_null_is_noop() {
+        // A null token (pool disabled / symbol unresolved) is a safe no-op.
+        autorelease_pool_pop(std::ptr::null_mut());
     }
 
     #[test]

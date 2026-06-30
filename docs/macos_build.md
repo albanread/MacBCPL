@@ -62,6 +62,14 @@ newbcpl-driver test-folder  dir/         # JIT every .bcl under dir, emit a repo
 `gui` (the Cocoa editor/runner over the objc bridge) is the in-progress GUI
 phase; the console `run` path is fully working.
 
+**Global option `--no-autorelease-pool`** (valid anywhere on the line). Each
+`run` is wrapped in an Objective-C autorelease pool by default, giving +0 /
+convenience-constructor Cocoa objects a defined lifetime (drained at run end —
+see Chapter 10 of the language manual). This flag turns that off, reverting to
+"no pool in place" so +0 objects leak; useful for isolating allocation
+behavior. +1 owned objects (`alloc`/`init`/`copy` and BCPL `NEW`) are released
+deterministically at their scope and are unaffected either way.
+
 ## JIT specifics that matter on macOS
 
 - **Memory manager:** MCJIT uses the default MM, which registers DWARF

@@ -1632,16 +1632,21 @@ it — which is correct, because releasing a borrowed object would over-release 
 and crash. So `[arr objectAtIndex: 0]`, `[s uppercaseString]`, `[dict allValues]`
 hand you something you may read but must not release.
 
-There is a sharper edge to the +0 case. The JIT runs with **no autorelease
-pool**. In normal Cocoa a +0 "convenience" result — `[NSMutableArray array]`,
-`[NSNumber numberWithDouble:]`, `stringWithFormat:` — is registered with the
-current pool and lives until it drains; with no pool, such an object's lifetime
-is undefined past the statement that made it. The classic Objective-C discipline
-keeps you safe:
+What gives a +0 object its lifetime is the **autorelease pool**. Each top-level
+run is wrapped in one by default, so every +0 object — including the convenience
+constructors `[NSMutableArray array]`, `[NSNumber numberWithDouble:]`,
+`stringWithFormat:` — is valid for the duration of the run and released when the
+pool drains at its end. (A GUI program's `[app run]` loop installs its own pool
+per event, draining each turn's temporaries.) So a +0 result is safe to create
+and use within a run.
 
-> Prefer the **`alloc`/`init`** (+1) form over the convenience constructor: write
-> `[[NSMutableArray alloc] init]`, not `[NSMutableArray array]`. The +1 object is
-> tracked and released; the +0 one is on its own.
+Two qualifications remain. First, a single run-scoped pool does not drain
+*during* a straight-line run, so a console loop that creates a great many +0
+temporaries holds them all until the end; for that, prefer the **`alloc`/`init`**
+(+1) form, whose object is released deterministically at its scope. Second, you
+can turn the pool off with `newbcpl-driver --no-autorelease-pool`, which reverts
+to "no pool in place" — then a +0 object leaks (it stays valid but is never
+reclaimed), which is occasionally useful for isolating allocation behavior.
 
 To dispose a +1 object *early* — before its scope ends — bind it with `USING`
 (which disposes on every exit) or send `[x release]` yourself. To keep one

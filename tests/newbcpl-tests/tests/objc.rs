@@ -280,6 +280,19 @@ fn bracket_alloc_init_owned_released() {
     );
 }
 
+/// A +0 convenience constructor (`[NSMutableArray array]`) returns an
+/// autoreleased object. The autorelease pool wrapping every run (on by
+/// default) gives it a defined lifetime — valid for the run — so it is safe
+/// to build and use without an explicit `alloc`/`init`.
+#[test]
+fn plus_zero_convenience_constructor_under_pool() {
+    expect(
+        "objc_autorelease_pool",
+        "LET START() BE $(\n  LET a = [NSMutableArray array]\n  [a addObject: \"x\"]\n  [a addObject: \"y\"]\n  WRITEN([a count] AS INT)\n  WRITES([a componentsJoinedByString: \",\"])\n$)\n",
+        "2x,y",
+    );
+}
+
 /// A +1 bracket object RETURNED from a function escapes its scope, so the
 /// callee must NOT release it — ownership transfers to the caller. If the
 /// escape analysis released it in the callee, the caller's read would be a
