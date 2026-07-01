@@ -713,6 +713,35 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Release the owned objects created since `watermark` — a `{ … }` reclaim
+    /// scope's slice of `function_owned_objects` — and drop them from the list
+    /// so they are not released again at function exit. Emitted at the scoped
+    /// block's fall-through. A block-local, non-escaping `NEW` / +1 object thus
+    /// dies at the closing brace; an escaper was never added (the same escape
+    /// pass that governs the arena marked it escaping), so ownership still
+    /// transfers out — no over-release.
+    fn emit_block_owned_releases(&mut self, watermark: usize) {
+        if watermark >= self.function_owned_objects.len() {
+            return;
+        }
+        let slots: Vec<ValueId> = self.function_owned_objects[watermark..].to_vec();
+        for slot in slots {
+            let obj = self.b().alloc_value();
+            self.b().emit(Instr::Load {
+                dst: obj,
+                slot,
+                hint: TypeHint::Object,
+            });
+            self.b().emit(Instr::Call {
+                dst: None,
+                callee: Value::Function("bcpl_str_release".to_string()),
+                args: vec![Value::Local(obj)],
+                hint: TypeHint::Word,
+            });
+        }
+        self.function_owned_objects.truncate(watermark);
+    }
+
     /// Enter this function's per-scope arena (Phase 2 stack-scope
     /// allocation): emit `bcpl_arena_enter()` and stash the handle in a
     /// fresh slot. Call at function entry, AFTER params are set up.
@@ -1874,18 +1903,25 @@ impl<'a> Lowerer<'a> {
         // any escape is a store/return/pass/@-address it already flags → heap)
         // keeps a value that outlives the block off the arena, so freeing here
         // is safe. Object and autorelease-pool tiers are not yet block-scoped.
-        let arena_slot = if block.scoped {
-            Some(self.enter_block_arena())
+        let (arena_slot, obj_watermark) = if block.scoped {
+            // Remember where this block's owned objects start, so we can
+            // release just its slice at the brace.
+            (Some(self.enter_block_arena()), Some(self.function_owned_objects.len()))
         } else {
-            None
+            (None, None)
         };
         for s in &block.stmts {
             self.lower_stmt(s);
         }
-        // Free on fall-through only (control still inside the block); non-local
-        // exits are reclaimed transitively by an enclosing/function free.
-        if let Some(slot) = arena_slot {
-            if self.b().current_open() {
+        // On fall-through only (control still inside the block): release this
+        // block's scope-local +1 objects, then free its arena. A non-local exit
+        // (BREAK/LOOP/GOTO/RETURN) leaves both to the enclosing / function free
+        // — bounded, never a double-release or a dangling pointer.
+        if self.b().current_open() {
+            if let Some(wm) = obj_watermark {
+                self.emit_block_owned_releases(wm);
+            }
+            if let Some(slot) = arena_slot {
                 self.emit_block_arena_free(slot);
             }
         }

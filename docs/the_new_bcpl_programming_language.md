@@ -1198,9 +1198,10 @@ you want reclaimed, leave everything else in section brackets:
 
 ```bcpl
 FOR i = 1 TO 1000 DO {
-    LET scratch = VEC 4096       // freed at this }, not at function end
-    process(i, scratch)
-}                                // peak = one iteration's scratch, not 1000
+    LET scratch = VEC 4096       // arena  — freed at this }
+    LET frame   = NEW Frame(i)   // object — released at this }
+    render(frame, scratch)
+}                                // peak = one iteration, not 1000
 ```
 
 versus the same loop in `$( … )`, which would hold all 1000 buffers until the
@@ -1213,13 +1214,23 @@ the brace, so it survives. Only what the compiler proves stays inside the braces
 is reclaimed there. As always, an uncertain case is heaped (a leak at worst,
 never a dangling pointer).
 
-Two limits in this first cut. The reclaim covers the **arena tier** (scratch
-`VEC` / `FVEC` / `TABLE`); scope-local `NEW` objects and `+0` Cocoa temporaries
-are still reclaimed at function end / run end, not at the brace — bracing those
-tiers is the next step. And reclamation fires at the brace on **fall-through**; a
-`BREAK` / `LOOP` / `GOTO` that jumps out of the braces defers the reclaim to the
-enclosing scope's free (bounded, never leaked past function end). Both blocks, as
-in classic BCPL, still open an ordinary lexical scope for names.
+The reclaim covers two tiers. The **arena** — scratch `VEC` / `FVEC` / `TABLE` —
+and scope-local **`+1` objects** — `NEW`, and `alloc`/`init` bracket sends — are
+both freed (arena) / released (objects) at the closing brace when proven
+non-escaping. So a braced loop bounds both its scratch vectors *and* its
+transient objects to one iteration.
+
+What `{ }` deliberately does **not** drain is **`+0` Cocoa temporaries** (the
+results of ordinary, non-`alloc`/`init` bracket sends). Those are *borrowed* —
+the compiler doesn't track their ownership — so releasing them at the brace could
+free one that was stored out of the block, a use-after-free. They stay on the
+run-scoped autorelease pool (§10.7); per-block `+0` draining is safe only under
+explicit programmer control, not as an automatic consequence of the braces.
+
+Reclamation fires at the brace on **fall-through**; a `BREAK` / `LOOP` / `GOTO`
+that jumps out of the braces defers the reclaim to the enclosing scope's free
+(bounded, never leaked past function end). Both block styles, as in classic BCPL,
+still open an ordinary lexical scope for names.
 
 ---
 

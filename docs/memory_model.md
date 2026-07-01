@@ -26,8 +26,13 @@ behind the single allocation choke point (`__newbcpl_alloc_rec` /
   `LET name = VEC/FVEC/TABLE(…)` where `name` is proven non-escaping
   (`is_vector_kind`). Escape is block-aware for `{ }` by lexical confinement +
   the escape pass (which now marks `@(v!i)` interior addresses as escaping).
-  Lists are **never** arena-allocated. (Object and `+0`-Cocoa tiers are not yet
-  `{ }`-scoped — still per-function / per-run.)
+  Lists are **never** arena-allocated. The **`+1` object tier is also
+  `{ }`-scoped**: a block-local non-escaping `NEW` / alloc-init object is released
+  at the brace via a watermark into `function_owned_objects` (release the slice,
+  truncate — so no double-release at function exit). The **`+0`-Cocoa tier is
+  NOT** `{ }`-scoped — those are borrowed/untracked, so auto-draining them per
+  block could free an escaped temporary (use-after-free); they stay on the
+  run-scoped pool.
 - **Tier 2 — program-global manual free-list heap.** First-fit / split /
   coalesce (the reused free-list code from the old `gc.rs`). This backs explicit
   `GETVEC` / `FREEVEC`, **all lists** (cons cells alias via `TL`/`REST`, so they

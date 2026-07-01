@@ -211,3 +211,29 @@ fn brace_valof_resultis_survives() {
         "99",
     );
 }
+
+/// A `{ }` reclaim scope also releases its block-local `NEW` objects at the
+/// brace. A 500-iteration loop that creates one per pass must run clean — if
+/// an object were released twice (at the brace AND at function exit) it would
+/// over-release and abort.
+#[test]
+fn brace_scope_local_objects_released_each_pass() {
+    expect(
+        "brace_object_loop",
+        "CLASS C $(\n  DECL x\n  ROUTINE CREATE(v) BE SELF.x := v\n  FUNCTION get() = SELF.x\n$)\nLET START() BE $(\n  LET total = 0\n  FOR i = 1 TO 500 DO { LET o = NEW C(i)  total := total + o.get() }\n  WRITEN(total)\n$)\n",
+        "125250",
+    );
+}
+
+/// An object that ESCAPES a `{ }` block (stored into an outer binding) must
+/// NOT be released at the brace — ownership transfers out. Calling a method on
+/// it after the block must still work; a premature brace-release would be a
+/// use-after-free.
+#[test]
+fn brace_object_escape_survives_close() {
+    expect(
+        "brace_object_escape",
+        "CLASS C $(\n  DECL x\n  ROUTINE CREATE(v) BE SELF.x := v\n  FUNCTION get() = SELF.x\n$)\nLET START() BE $(\n  LET keep = ?\n  { LET o = NEW C(42)  keep := o }\n  WRITEN(keep.get())\n$)\n",
+        "42",
+    );
+}
