@@ -889,7 +889,17 @@ fn build_report(
 /// the macOS frameworks with clang (which ad-hoc-signs the arm64 binary).
 fn build_executable(src: &Path, exe: &Path) -> Result<(), String> {
     let obj = exe.with_extension("o");
-    newbcpl_llvm::emit_aot_object(src, &obj)?;
+    // Active-modules folder (same resolution as `run`): env override, else
+    // ./modules-active/. Its modules are compiled and linked into the object.
+    let modules_dir = std::env::var_os("NEWBCPL_MODULES_ACTIVE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("modules-active"));
+    let modules_arg = if modules_dir.is_dir() {
+        Some(modules_dir.as_path())
+    } else {
+        None
+    };
+    newbcpl_llvm::emit_aot_object(src, &obj, modules_arg)?;
 
     let runtime = locate_runtime_lib()?;
     let mut cmd = std::process::Command::new("clang");

@@ -10,7 +10,7 @@ fn aot_emits_a_macho64_object() {
     std::fs::write(&src, "LET START() BE $(\n  WRITES(\"hi\")\n$)\n").unwrap();
     let obj = dir.join("newbcpl_aot_probe.o");
 
-    newbcpl_llvm::emit_aot_object(&src, &obj).expect("emit_aot_object should succeed");
+    newbcpl_llvm::emit_aot_object(&src, &obj, None).expect("emit_aot_object should succeed");
 
     let bytes = std::fs::read(&obj).expect("object file readable");
     assert!(bytes.len() > 64, "object should be non-trivial ({} bytes)", bytes.len());
@@ -39,7 +39,7 @@ fn aot_emits_class_program_with_registrar() {
     .unwrap();
     let obj = dir.join("newbcpl_aot_class_probe.o");
 
-    newbcpl_llvm::emit_aot_object(&src, &obj).expect("emit_aot_object should succeed for a class");
+    newbcpl_llvm::emit_aot_object(&src, &obj, None).expect("emit_aot_object should succeed for a class");
 
     let bytes = std::fs::read(&obj).expect("object file readable");
     assert_eq!(&bytes[0..4], &[0xCF, 0xFA, 0xED, 0xFE], "Mach-O 64 object");

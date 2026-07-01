@@ -24,9 +24,8 @@ The compiler runs two ways. `newbcpl-driver run` is a JIT: it lexes, parses,
 checks, lowers to LLVM, and executes the program in-process — the mode used
 throughout this book, so every example here has been run. `newbcpl-driver build`
 is the ahead-of-time path: it emits a standalone, signed Mach-O executable you
-can ship — for console programs, the full memory model, Cocoa, and user
-`CLASS`es with inheritance. (Linking `modules-active/` modules into an AOT
-build is the one remaining gap.)
+can ship — at parity with the JIT: console programs, the full memory model,
+Cocoa, user `CLASS`es with inheritance, and `modules-active/` linking.
 
 This book is a tutorial and a reference. The first chapter teaches the language
 by example; the middle chapters take up types, control flow, functions,

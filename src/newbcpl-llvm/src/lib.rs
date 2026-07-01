@@ -787,16 +787,74 @@ fn build_ir(path: &Path) -> Result<IrModule, String> {
 ///
 /// Increment 1: single-file console programs (no `modules-active` linking, no
 /// Cocoa class registrar). Those follow.
-pub fn emit_aot_object(path: &Path, out_obj: &Path) -> Result<(), String> {
+pub fn emit_aot_object(path: &Path, out_obj: &Path, modules_dir: Option<&Path>) -> Result<(), String> {
     let ir = build_ir(path)?;
     let context = Context::create();
     // Fix a class-name prefix for this build; emit_new bakes the same one into
     // its `bcpl_objc_new` calls, and the generated registrar registers under it.
     emit::begin_run();
     let module = emit::emit(&context, &ir);
-    let registrar = emit_aot_class_registrar(&context, &module, &ir.layouts);
+    // Compile + link every modules-active/ module into the program object, so
+    // cross-module references (`<stem>_<fn>`) resolve statically at link time —
+    // the AOT analogue of the JIT loader.
+    let all_layouts = link_modules_into(&context, &module, ir.layouts.clone(), modules_dir)?;
+    let registrar = emit_aot_class_registrar(&context, &module, &all_layouts);
     emit_aot_main(&context, &module, registrar);
     write_object(&module, out_obj)
+}
+
+/// Emit every `*.bcl` in `modules_dir` (alphabetical), rename its top-level
+/// functions to `<stem>_<name>`, and link them into `module` so the AOT object
+/// carries them as definitions. Returns the class layouts accumulated across the
+/// entry program and every module (for the registrar). Mirrors
+/// `run_program_ir`'s module phase.
+fn link_modules_into<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    mut all_layouts: Vec<newbcpl_sema::ClassLayout>,
+    modules_dir: Option<&Path>,
+) -> Result<Vec<newbcpl_sema::ClassLayout>, String> {
+    let Some(dir) = modules_dir else {
+        return Ok(all_layouts);
+    };
+    if !dir.is_dir() {
+        return Ok(all_layouts);
+    }
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("io: read_dir {}: {e}", dir.display()))?
+        .filter_map(|r| r.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "bcl"))
+        .collect();
+    paths.sort();
+    for mpath in &paths {
+        let stem = mpath
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("module path has no stem: {}", mpath.display()))?;
+        let mod_ir = build_ir(mpath)?;
+        let mod_llvm = emit::emit(context, &mod_ir);
+
+        use inkwell::llvm_sys::core::LLVMSetValueName2;
+        use inkwell::values::AsValueRef;
+        for ir_fn in &mod_ir.functions {
+            if let Some(fv) = mod_llvm.get_function(&ir_fn.name) {
+                let new_name = format!("{stem}_{}", ir_fn.name);
+                unsafe {
+                    LLVMSetValueName2(
+                        fv.as_value_ref(),
+                        new_name.as_ptr() as *const i8,
+                        new_name.len(),
+                    );
+                }
+            }
+        }
+        module
+            .link_in_module(mod_llvm)
+            .map_err(|e| format!("link module {stem}: {}", e.to_string()))?;
+        all_layouts.extend(mod_ir.layouts.iter().cloned());
+    }
+    Ok(all_layouts)
 }
 
 /// Generate `void @__bcpl_register_classes()`: the AOT analogue of the JIT's

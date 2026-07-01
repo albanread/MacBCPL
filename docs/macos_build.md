@@ -87,10 +87,11 @@ Works today for **console programs**, the full **memory model** (arena, `{ }` /
 and user-defined ones), and **user `CLASS`es with inheritance** — the object
 model works because `main` calls a generated `__bcpl_register_classes` (the AOT
 analogue of the JIT's registrar: `objc_allocateClassPair` + per-class ivars +
-`class_addMethod` with the emitted methods as IMPs) before `START`. The
-signal-safe crash handler is active in the built binary. **Remaining gap:**
-linking `modules-active/` modules into an AOT build (they are JIT-linked today);
-a single-file program with classes and Cocoa is fully AOT.
+`class_addMethod` with the emitted methods as IMPs) before `START`. Modules in
+`modules-active/` are compiled and linked into the object too (each renamed
+`<stem>_<fn>`, the AOT analogue of the JIT loader). The signal-safe crash
+handler is active in the built binary. `build` is now at **parity with the JIT**
+— anything `run` executes, `build` compiles to a standalone binary.
 
 **Global option `--no-autorelease-pool`** (valid anywhere on the line). Each
 `run` is wrapped in an Objective-C autorelease pool by default, giving +0 /

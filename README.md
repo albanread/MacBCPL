@@ -3,10 +3,10 @@
 **Modern BCPL on Apple Silicon — a Rust + LLVM compiler for macOS arm64, with
 both a JIT (`run`) and AOT standalone executables (`build`).**
 
-> Under development. `run` JITs and executes any program; `build` emits a
-> standalone signed Mach-O executable — for console programs, the full memory
-> model, Cocoa (system classes and user-defined `CLASS`es), and inheritance.
-> Linking `modules-active/` into an AOT build is the remaining gap.
+> Under development. `run` JITs and executes a program in-process; `build` emits
+> a standalone signed Mach-O executable — at parity with the JIT: console
+> programs, the full memory model, Cocoa (system classes and user-defined
+> `CLASS`es with inheritance), and `modules-active/` linking.
 
 MacBCPL is the macOS / Apple-Silicon (arm64) fork of
 [NewBCPL](https://github.com/albanread/NewBCPL), itself a recreation of the
