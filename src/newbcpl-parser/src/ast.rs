@@ -449,6 +449,12 @@ pub enum Stmt {
 #[derive(Debug, Clone)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
+    /// `true` when the block was written with curly braces `{ … }` — a
+    /// *reclaim scope*: its scope-local heap (the arena tier) is freed at the
+    /// closing brace, not at function exit. `false` for classic section
+    /// brackets `$( … $)`, a plain lexical block whose transients live to
+    /// function end. This is the one place the two block syntaxes differ.
+    pub scoped: bool,
     pub span: Span,
 }
 

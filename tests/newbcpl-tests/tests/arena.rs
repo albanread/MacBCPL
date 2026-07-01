@@ -173,3 +173,41 @@ fn getvec_freevec_roundtrip() {
         "42",
     );
 }
+
+// ─── `{ }` reclaim scope vs `$( )` plain block ─────────────────────
+
+/// A `{ … }` block is a reclaim scope: a proven-non-escaping block-local
+/// vector lives in a nested arena freed at the closing brace. It must still
+/// compute correctly within the block.
+#[test]
+fn brace_scope_local_vector_is_correct() {
+    expect(
+        "brace_scope_local",
+        "LET START() BE $(\n  { LET v = VEC 10  FOR i = 0 TO 10 DO v!i := i * i  WRITEN(v!5) }\n$)\n",
+        "25",
+    );
+}
+
+/// A vector that ESCAPES a `{ }` block by being stored into an outer binding
+/// must be promoted to the manual heap, not the block arena — so it survives
+/// the block's close. If it were block-arena-routed this would read freed
+/// memory (use-after-free).
+#[test]
+fn brace_escape_via_store_survives_close() {
+    expect(
+        "brace_escape_store",
+        "LET START() BE $(\n  LET p = ?\n  { LET v = VEC 4  v!0 := 42  p := v }\n  WRITEN(p!0)\n$)\n",
+        "42",
+    );
+}
+
+/// A vector RESULTIS'd out of a scoped `VALOF { … }` escapes and must survive
+/// on the heap after the block arena is freed.
+#[test]
+fn brace_valof_resultis_survives() {
+    expect(
+        "brace_valof_resultis",
+        "LET mk() = VALOF { LET v = VEC 4  v!0 := 99  RESULTIS v }\nLET START() BE $( LET p = mk()  WRITEN(p!0) $)\n",
+        "99",
+    );
+}

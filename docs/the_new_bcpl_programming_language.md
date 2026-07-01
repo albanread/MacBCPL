@@ -83,8 +83,10 @@ LET START() BE
 ```
 
 The body of `START` here is a single statement. When you need several, group
-them with **section brackets**, `$(` and `$)`. Curly braces `{` and `}` are
-exact synonyms, so use whichever you like:
+them with **section brackets**, `$(` and `$)`. Curly braces `{` and `}` group
+the same way but carry one extra meaning — they are a *reclaim scope* for
+transient heap (Chapter 8, §8.4). Until you get to that, use `$( … $)`; the two
+are interchangeable for everything in these early chapters.
 
 ```bcpl
 LET START() BE $(
@@ -461,8 +463,11 @@ expression-level counterpart of the `TEST` statement.
 ### 3.1 Statements and blocks
 
 A statement is an expression-with-effect (a call, an assignment) or a control
-construct. Several statements enclosed in `$( … $)` (or `{ … }`) form a block,
-which is itself a statement and may declare its own local `LET` variables.
+construct. Several statements enclosed in `$( … $)` — or `{ … }` — form a block,
+which is itself a statement and may declare its own local `LET` variables. Both
+bracket styles open a lexical scope for names; they differ only in heap
+lifetime, which §8.4 takes up: `{ … }` reclaims its block-local transients at the
+closing brace, `$( … $)` lets them live to function end.
 
 ### 3.2 IF, UNLESS, TEST
 
@@ -1175,6 +1180,47 @@ useful pulse on the object tier — not a process-wide census, since raw bracket
 `alloc/init` and the frameworks' own allocations go straight to the Objective-C
 runtime.)
 
+### 8.4 Reclaim scopes — `{ }` versus `$( )`
+
+By default a scope-local transient lives on its function's arena and is freed
+when the *function* returns (§8.1). That is the right granularity almost always,
+but it means a loop that builds scratch every iteration holds all of it until the
+function ends. New BCPL gives you a finer knob without a new keyword, by making
+the two block syntaxes mean different things:
+
+- **`$( … )`** — a plain block. Its block-local transients live to function end
+  (the default).
+- **`{ … }`** — a **reclaim scope**. Its block-local, proven-non-escaping heap
+  is freed at the closing brace.
+
+So you pay for granular reclamation only where you ask for it — brace the region
+you want reclaimed, leave everything else in section brackets:
+
+```bcpl
+FOR i = 1 TO 1000 DO {
+    LET scratch = VEC 4096       // freed at this }, not at function end
+    process(i, scratch)
+}                                // peak = one iteration's scratch, not 1000
+```
+
+versus the same loop in `$( … )`, which would hold all 1000 buffers until the
+function returned.
+
+Safety is by the same rule as everywhere: a value that **escapes** the braces —
+returned by `RESULTIS`, stored into an outer variable, passed to something that
+keeps it, or address-taken — is promoted to the manual heap and is *not* freed at
+the brace, so it survives. Only what the compiler proves stays inside the braces
+is reclaimed there. As always, an uncertain case is heaped (a leak at worst,
+never a dangling pointer).
+
+Two limits in this first cut. The reclaim covers the **arena tier** (scratch
+`VEC` / `FVEC` / `TABLE`); scope-local `NEW` objects and `+0` Cocoa temporaries
+are still reclaimed at function end / run end, not at the brace — bracing those
+tiers is the next step. And reclamation fires at the brace on **fall-through**; a
+`BREAK` / `LOOP` / `GOTO` that jumps out of the braces defers the reclaim to the
+enclosing scope's free (bounded, never leaked past function end). Both blocks, as
+in classic BCPL, still open an ordinary lexical scope for names.
+
 ---
 
 # Part II — Cocoa
@@ -1786,7 +1832,7 @@ PAIR FPAIR QUAD FQUAD OCT FOCT ASM
 | assignment | `:=` |
 | conditional | `->` |
 | lane access | `.\|k\|` |
-| section brackets | `$( $)` and synonyms `{ }`, optionally tagged |
+| section brackets | `$( $)` (plain block) and `{ }` (reclaim scope, §8.4), optionally tagged |
 | grouping / sep. | `( )` `[ ]` `,` `;` |
 | null literal | `?` |
 

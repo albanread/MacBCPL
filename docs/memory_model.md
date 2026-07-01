@@ -13,13 +13,21 @@ behind the single allocation choke point (`__newbcpl_alloc_rec` /
 
 - **Tier 0 — stack / registers / static.** Locals, params, the `VALOF` result
   slot, SIMD packs, string literals. Unchanged.
-- **Tier 1 — per-function arena (default for proven scope-local transients).**
-  Bump allocation; freed *wholesale* at function exit. This is the "stack-scope
-  semantics" tier. v1 granularity is **per function** (one arena per function),
-  which makes `GOTO` and `RESULTIS`-in-`VALOF` safe *by construction* — there are
-  no inner arenas to skip, and the single arena outlives every intra-function
-  jump. Routable sites: a direct `LET name = VEC/FVEC/TABLE(…)` where `name` is
-  proven non-escaping (`is_vector_kind`). Lists are **never** arena-allocated.
+- **Tier 1 — per-scope arena (default for proven scope-local transients).**
+  Bump allocation; freed *wholesale* at scope exit. This is the "stack-scope
+  semantics" tier. The default granularity is **per function** (one arena per
+  function), which makes `GOTO` and `RESULTIS`-in-`VALOF` safe *by construction*.
+  A **`{ … }` reclaim scope** opts into finer granularity: it pushes a nested
+  arena freed at the closing brace (fall-through), so its block-local transients
+  are reclaimed early; `$( … )` stays per-function. The arena STACK's
+  free-to-handle means a non-local exit (`BREAK`/`GOTO`/`RETURN`) that skips a
+  block free is reclaimed by an enclosing scope, so a skipped inner free is
+  bounded, never a dangling pointer. Routable sites: a direct
+  `LET name = VEC/FVEC/TABLE(…)` where `name` is proven non-escaping
+  (`is_vector_kind`). Escape is block-aware for `{ }` by lexical confinement +
+  the escape pass (which now marks `@(v!i)` interior addresses as escaping).
+  Lists are **never** arena-allocated. (Object and `+0`-Cocoa tiers are not yet
+  `{ }`-scoped — still per-function / per-run.)
 - **Tier 2 — program-global manual free-list heap.** First-fit / split /
   coalesce (the reused free-list code from the old `gc.rs`). This backs explicit
   `GETVEC` / `FREEVEC`, **all lists** (cons cells alias via `TL`/`REST`, so they

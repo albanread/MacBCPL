@@ -756,6 +756,46 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Enter a nested arena for a `{ … }` reclaim scope: `bcpl_arena_enter()`
+    /// stashed in a fresh slot. Block-local, proven-non-escaping arena
+    /// allocations land in this innermost arena and are reclaimed at the
+    /// closing brace by `emit_block_arena_free`. Returns the handle slot.
+    fn enter_block_arena(&mut self) -> ValueId {
+        let handle = self.b().alloc_value();
+        self.b().emit(Instr::Call {
+            dst: Some(handle),
+            callee: Value::Function("bcpl_arena_enter".to_string()),
+            args: Vec::new(),
+            hint: TypeHint::Word,
+        });
+        let slot = self.b().alloca("__block_arena", TypeHint::Word);
+        self.b().emit(Instr::Store {
+            slot,
+            value: Value::Local(handle),
+        });
+        slot
+    }
+
+    /// Free a block arena by its handle slot. Emitted at the block's
+    /// fall-through exit only; a non-local exit (BREAK/LOOP/GOTO/RETURN) that
+    /// skips it is reclaimed by an enclosing scope's free, since
+    /// `bcpl_arena_free` frees every arena from the handle up to the stack top
+    /// (so a skipped inner free leaks nothing beyond the next outer free).
+    fn emit_block_arena_free(&mut self, slot: ValueId) {
+        let handle = self.b().alloc_value();
+        self.b().emit(Instr::Load {
+            dst: handle,
+            slot,
+            hint: TypeHint::Word,
+        });
+        self.b().emit(Instr::Call {
+            dst: None,
+            callee: Value::Function("bcpl_arena_free".to_string()),
+            args: vec![Value::Local(handle)],
+            hint: TypeHint::Word,
+        });
+    }
+
     /// The single funnel for leaving a function: free the arena, then
     /// emit the `Return`. Using this everywhere a function returns means
     /// arena cleanup can't be forgotten on an exit path.
@@ -1826,8 +1866,28 @@ impl<'a> Lowerer<'a> {
 
     fn lower_block(&mut self, block: &Block) {
         self.b().push_scope();
+        // A `{ … }` block is a reclaim scope: push a nested arena so its
+        // block-local, proven-non-escaping heap (the arena tier) is freed at the
+        // closing brace rather than at function exit. `$( … $)` is a plain block
+        // — no arena, transients live to function end. Escape analysis
+        // (per-function, but a block-local `LET` is lexically confined here, so
+        // any escape is a store/return/pass/@-address it already flags → heap)
+        // keeps a value that outlives the block off the arena, so freeing here
+        // is safe. Object and autorelease-pool tiers are not yet block-scoped.
+        let arena_slot = if block.scoped {
+            Some(self.enter_block_arena())
+        } else {
+            None
+        };
         for s in &block.stmts {
             self.lower_stmt(s);
+        }
+        // Free on fall-through only (control still inside the block); non-local
+        // exits are reclaimed transitively by an enclosing/function free.
+        if let Some(slot) = arena_slot {
+            if self.b().current_open() {
+                self.emit_block_arena_free(slot);
+            }
         }
         self.b().pop_scope();
     }
@@ -3849,6 +3909,33 @@ fn is_non_capturing_builtin(name: &str) -> bool {
     )
 }
 
+/// `@e` takes the address of `e`'s storage, so a pointer *into* the owning
+/// variable escapes. Unlike a read (`esc_base`), taking an INTERIOR address
+/// (`@(v!i)`, `@(v%i)`, `@(v.f)`, `@(p.|k|)`) must mark the ROOT base as
+/// escaping — otherwise an arena / scope-local `v` could be reclaimed while a
+/// live interior pointer to it survives (use-after-free). Walk through
+/// subscript / member / lane bases to the root; anything else flows as a value.
+fn esc_addr(e: &Expr, esc: &mut HashSet<String>) {
+    match e {
+        Expr::Ident { name, .. } => {
+            esc.insert(name.clone());
+        }
+        Expr::Binary { op, lhs, rhs, .. } if esc_is_through_base(*op) => {
+            esc_addr(lhs, esc);
+            if !matches!(op, BinaryOp::Dot | BinaryOp::Of) {
+                esc_value(rhs, esc);
+            }
+        }
+        // `@(!p)` / `@(%p)`: the address is the value `p` holds — `p` flows out.
+        Expr::Unary {
+            op: UnaryOp::Indirection | UnaryOp::CharIndirection,
+            operand,
+            ..
+        } => esc_value(operand, esc),
+        _ => esc_value(e, esc),
+    }
+}
+
 fn esc_value(e: &Expr, esc: &mut HashSet<String>) {
     match e {
         Expr::Ident { name, .. } => {
@@ -3884,8 +3971,8 @@ fn esc_value(e: &Expr, esc: &mut HashSet<String>) {
             | UnaryOp::Len
             | UnaryOp::FreeVec
             | UnaryOp::FreeList => esc_base(operand, esc),
-            // `@x` takes x's address — x escapes.
-            UnaryOp::AddressOf => esc_value(operand, esc),
+            // `@x` / `@(v!i)` takes an address into x's storage — x escapes.
+            UnaryOp::AddressOf => esc_addr(operand, esc),
             UnaryOp::Neg | UnaryOp::Not | UnaryOp::LogNot => esc_value(operand, esc),
         },
         Expr::Call { callee, args, .. } => {

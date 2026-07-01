@@ -1605,6 +1605,9 @@ impl Parser {
                 let close = self.eat();
                 return Ok(Stmt::Block(Block {
                     stmts,
+                    // Curly braces mark a reclaim scope; section brackets a
+                    // plain block. (Both still open a lexical scope for names.)
+                    scoped: open.lexeme == "{",
                     span: SourceSpan {
                         start: open.span.start,
                         end: close.span.end,
