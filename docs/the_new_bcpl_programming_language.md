@@ -1220,17 +1220,37 @@ both freed (arena) / released (objects) at the closing brace when proven
 non-escaping. So a braced loop bounds both its scratch vectors *and* its
 transient objects to one iteration.
 
-What `{ }` deliberately does **not** drain is **`+0` Cocoa temporaries** (the
+The tier `{ }` cannot drain *automatically* is **`+0` Cocoa temporaries** (the
 results of ordinary, non-`alloc`/`init` bracket sends). Those are *borrowed* —
-the compiler doesn't track their ownership — so releasing them at the brace could
-free one that was stored out of the block, a use-after-free. They stay on the
-run-scoped autorelease pool (§10.7); per-block `+0` draining is safe only under
-explicit programmer control, not as an automatic consequence of the braces.
+the compiler doesn't track their ownership — so silently releasing them at the
+brace could free one that was stored out of the block, a use-after-free. For that
+tier there is an **explicit** opt-in: prefix the block with **`POOL`**.
+
+`POOL { … }` wraps the block in an Objective-C autorelease pool that drains at
+the closing brace, on top of the arena and object reclamation the braces already
+do. So `POOL { … }` reclaims **all three** transient tiers at `}`:
+
+```bcpl
+FOR frame = 1 TO n DO POOL {
+    LET scratch = VEC 4096        // arena  — freed at }
+    LET img     = NEW Image(frame)// object — released at }
+    LET t       = [clock description]   // +0    — drained at }
+    render(img, scratch, t)
+}                                 // all three reclaimed; peak = one frame
+```
+
+Writing `POOL` is you taking the standard Cocoa `@autoreleasepool` contract:
+*do not stash a `+0` object out of the pool and use it later without retaining
+it* — that would be a dangling reference. The compiler can't check this (the
+`+0` objects aren't tracked), which is exactly why draining them is opt-in rather
+than automatic. Without `POOL`, `+0` temporaries stay on the run-scoped pool
+(§10.7), valid but not reclaimed until the run ends.
 
 Reclamation fires at the brace on **fall-through**; a `BREAK` / `LOOP` / `GOTO`
 that jumps out of the braces defers the reclaim to the enclosing scope's free
-(bounded, never leaked past function end). Both block styles, as in classic BCPL,
-still open an ordinary lexical scope for names.
+(bounded — the run pool and outer arenas drain everything above them, never
+leaked past function/run end). Both block styles, as in classic BCPL, still open
+an ordinary lexical scope for names.
 
 ---
 
@@ -1707,8 +1727,10 @@ and use within a run.
 
 Two qualifications remain. First, a single run-scoped pool does not drain
 *during* a straight-line run, so a console loop that creates a great many +0
-temporaries holds them all until the end; for that, prefer the **`alloc`/`init`**
-(+1) form, whose object is released deterministically at its scope. Second, you
+temporaries holds them all until the end; to bound that, wrap the loop body in a
+**`POOL { … }`** block (§8.4), which drains its `+0` temporaries each iteration,
+or prefer the **`alloc`/`init`** (+1) form, whose object is released
+deterministically at its scope. Second, you
 can turn the pool off with `newbcpl-driver --no-autorelease-pool`, which reverts
 to "no pool in place" — then a +0 object leaks (it stays valid but is never
 reclaimed), which is occasionally useful for isolating allocation behavior.
@@ -1822,7 +1844,7 @@ FOR TO BY SWITCHON INTO CASE DEFAULT ENDCASE GOTO RETURN FINISH BREAK LOOP
 TRUE FALSE NOT XOR BAND BOR BXOR BNOT REM EQV NEQV GET
 FLET FSTATIC FVEC FTABLE FVALOF FUNCTION ROUTINE
 CLASS EXTENDS DECL NEW VIRTUAL FINAL MANAGED PUBLIC PRIVATE PROTECTED
-SELF SUPER RETAIN FREEVEC FREELIST USING
+SELF SUPER RETAIN FREEVEC FREELIST USING POOL
 FLOAT TRUNC FIX FSQRT ENTIER FOREACH IN
 LIST MANIFESTLIST HD TL REST LEN TYPEOF TYPE AS POINTER DEFER BRK
 PAIR FPAIR QUAD FQUAD OCT FOCT ASM
@@ -1998,7 +2020,8 @@ member      ::= visibility ":"
 visibility  ::= "PUBLIC" | "PRIVATE" | "PROTECTED"
 modifier    ::= "VIRTUAL" | "FINAL"
 
-stmt        ::= "$(" { stmt } "$)"   |  "{" { stmt } "}"
+stmt        ::= "$(" { stmt } "$)"   |  "{" { stmt } "}"     // block; { } = reclaim scope
+              | "POOL" ( "{" { stmt } "}" | "$(" { stmt } "$)" )  // + autorelease pool
               | lvalue { "," lvalue } ":=" expr { "," expr }
               | "IF" expr "THEN" stmt
               | "UNLESS" expr "THEN" stmt

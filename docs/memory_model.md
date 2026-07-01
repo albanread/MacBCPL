@@ -30,9 +30,14 @@ behind the single allocation choke point (`__newbcpl_alloc_rec` /
   `{ }`-scoped**: a block-local non-escaping `NEW` / alloc-init object is released
   at the brace via a watermark into `function_owned_objects` (release the slice,
   truncate — so no double-release at function exit). The **`+0`-Cocoa tier is
-  NOT** `{ }`-scoped — those are borrowed/untracked, so auto-draining them per
-  block could free an escaped temporary (use-after-free); they stay on the
-  run-scoped pool.
+  NOT** `{ }`-scoped automatically — those are borrowed/untracked, so
+  auto-draining them per block could free an escaped temporary
+  (use-after-free). Instead it is an **explicit** opt-in: `POOL { … }` wraps the
+  block in an autorelease pool (`bcpl_autorelease_pool_push/pop` at the brace) so
+  `+0` temporaries drain there, with the standard `@autoreleasepool` contract on
+  the programmer (don't stash a `+0` out of the pool). `POOL { … }` thus drains
+  all three tiers at the brace; a plain `{ }` drains arena + objects; `$( )`
+  drains none early.
 - **Tier 2 — program-global manual free-list heap.** First-fit / split /
   coalesce (the reused free-list code from the old `gc.rs`). This backs explicit
   `GETVEC` / `FREEVEC`, **all lists** (cons cells alias via `TL`/`REST`, so they

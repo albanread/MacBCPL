@@ -169,6 +169,23 @@ pub fn autorelease_pool_pop(token: *mut c_void) {
     f(token);
 }
 
+/// Codegen entry for a `POOL { … }` block: open an autorelease pool and return
+/// its token (as a Word). Paired with [`bcpl_autorelease_pool_pop`] at the
+/// block's brace. The explicit, programmer-controlled `+0` tier — brace-drains
+/// borrowed/convenience-constructor temporaries the automatic `{ }` scopes
+/// dare not touch.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn bcpl_autorelease_pool_push() -> *mut c_void {
+    autorelease_pool_push()
+}
+
+/// Codegen entry for the end of a `POOL { … }` block: drain and pop the pool.
+/// Null token is a no-op.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn bcpl_autorelease_pool_pop(token: *mut c_void) {
+    autorelease_pool_pop(token);
+}
+
 // ─── class / selector lookup ────────────────────────────────────────
 
 /// `objc_getClass(name)` — look up an Objective-C class by name.
@@ -1400,6 +1417,14 @@ pub fn builtin_addresses() -> Vec<(&'static str, usize)> {
         ("bcpl_objc_alloc_init", bcpl_objc_alloc_init as *const () as usize),
         ("bcpl_objc_release", bcpl_objc_release as *const () as usize),
         ("bcpl_objc_retain", bcpl_objc_retain as *const () as usize),
+        (
+            "bcpl_autorelease_pool_push",
+            bcpl_autorelease_pool_push as *const () as usize,
+        ),
+        (
+            "bcpl_autorelease_pool_pop",
+            bcpl_autorelease_pool_pop as *const () as usize,
+        ),
         (
             "bcpl_objc_allocate_class",
             bcpl_objc_allocate_class as *const () as usize,

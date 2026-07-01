@@ -1482,6 +1482,30 @@ impl Parser {
                 },
             });
         }
+        if self.check_kw("POOL") {
+            // `POOL <block>` — wrap the following block in an Objective-C
+            // autorelease pool drained at its closing brace, so `+0` borrowed /
+            // convenience-constructor Cocoa temporaries are reclaimed there.
+            // Composes with the `{ }` reclaim scope: `POOL { … }` drains the
+            // arena, `+1` objects, and the `+0` pool all at the brace.
+            self.eat();
+            if !(self.check_sym("{") || self.check_sym("$(")) {
+                return Err(ParseError::new(
+                    format!(
+                        "expected `{{` or `$(` block after POOL, got `{}`",
+                        self.peek().lexeme
+                    ),
+                    self.peek().span,
+                ));
+            }
+            let block_stmt = self.parse_block()?;
+            if let Stmt::Block(mut b) = block_stmt {
+                b.pooled = true;
+                return Ok(Stmt::Block(b));
+            }
+            unreachable!("parse_block always returns Stmt::Block");
+        }
+
         if self.check_kw("USING") {
             // `USING name = expr DO stmt`
             // Scope-deterministic resource form. The RELEASE method
@@ -1608,6 +1632,7 @@ impl Parser {
                     // Curly braces mark a reclaim scope; section brackets a
                     // plain block. (Both still open a lexical scope for names.)
                     scoped: open.lexeme == "{",
+                    pooled: false,
                     span: SourceSpan {
                         start: open.span.start,
                         end: close.span.end,

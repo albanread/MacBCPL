@@ -237,3 +237,27 @@ fn brace_object_escape_survives_close() {
         "42",
     );
 }
+
+// ─── POOL { } — the explicit +0 Cocoa tier ─────────────────────────
+
+/// `POOL { … }` wraps the block in an autorelease pool: `+0` convenience
+/// constructors drain at the brace. A 1000-iteration loop must run clean.
+#[test]
+fn pool_block_drains_plus_zero_temporaries() {
+    expect(
+        "pool_plus_zero",
+        "LET START() BE $(\n  FOR i = 1 TO 1000 DO POOL {\n    LET a = [NSMutableArray array]\n    [a addObject: \"x\"]\n  }\n  WRITES(\"ok\")\n$)\n",
+        "ok",
+    );
+}
+
+/// `POOL { … }` composes all three transient tiers — arena scratch, `+1`
+/// objects, and the `+0` pool — each reclaimed at the brace.
+#[test]
+fn pool_composes_all_three_tiers() {
+    expect(
+        "pool_all_tiers",
+        "CLASS C $(\n  DECL x\n  ROUTINE CREATE(v) BE SELF.x := v\n  FUNCTION get() = SELF.x\n$)\nLET START() BE $(\n  LET total = 0\n  FOR i = 1 TO 300 DO POOL {\n    LET scratch = VEC 8\n    LET obj = NEW C(i)\n    LET a = [NSMutableArray array]\n    [a addObject: \"x\"]\n    scratch!0 := obj.get()\n    total := total + scratch!0\n  }\n  WRITEN(total)\n$)\n",
+        "45150",
+    );
+}

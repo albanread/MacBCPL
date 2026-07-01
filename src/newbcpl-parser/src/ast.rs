@@ -455,6 +455,11 @@ pub struct Block {
     /// brackets `$( … $)`, a plain lexical block whose transients live to
     /// function end. This is the one place the two block syntaxes differ.
     pub scoped: bool,
+    /// `true` when the block was prefixed `POOL { … }` — wrap it in an
+    /// Objective-C autorelease pool drained at the closing brace, so `+0`
+    /// borrowed / convenience-constructor Cocoa temporaries are reclaimed here
+    /// (the explicit opt-in the automatic `{ }` tiers can't safely do).
+    pub pooled: bool,
     pub span: Span,
 }
 

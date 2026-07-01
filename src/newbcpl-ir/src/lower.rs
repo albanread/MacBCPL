@@ -805,6 +805,43 @@ impl<'a> Lowerer<'a> {
         slot
     }
 
+    /// Open an autorelease pool for a `POOL { … }` block: the token is stashed
+    /// in a fresh slot, popped at the brace by `emit_block_pool_pop`. Drains the
+    /// block's `+0` Cocoa temporaries. Returns the token slot.
+    fn enter_block_pool(&mut self) -> ValueId {
+        let handle = self.b().alloc_value();
+        self.b().emit(Instr::Call {
+            dst: Some(handle),
+            callee: Value::Function("bcpl_autorelease_pool_push".to_string()),
+            args: Vec::new(),
+            hint: TypeHint::Word,
+        });
+        let slot = self.b().alloca("__block_pool", TypeHint::Word);
+        self.b().emit(Instr::Store {
+            slot,
+            value: Value::Local(handle),
+        });
+        slot
+    }
+
+    /// Pop a block autorelease pool by its token slot (fall-through only; a
+    /// non-local exit is drained by the enclosing / run pool, since
+    /// `objc_autoreleasePoolPop` drains everything above the token).
+    fn emit_block_pool_pop(&mut self, slot: ValueId) {
+        let handle = self.b().alloc_value();
+        self.b().emit(Instr::Load {
+            dst: handle,
+            slot,
+            hint: TypeHint::Word,
+        });
+        self.b().emit(Instr::Call {
+            dst: None,
+            callee: Value::Function("bcpl_autorelease_pool_pop".to_string()),
+            args: vec![Value::Local(handle)],
+            hint: TypeHint::Word,
+        });
+    }
+
     /// Free a block arena by its handle slot. Emitted at the block's
     /// fall-through exit only; a non-local exit (BREAK/LOOP/GOTO/RETURN) that
     /// skips it is reclaimed by an enclosing scope's free, since
@@ -1903,6 +1940,14 @@ impl<'a> Lowerer<'a> {
         // any escape is a store/return/pass/@-address it already flags → heap)
         // keeps a value that outlives the block off the arena, so freeing here
         // is safe. Object and autorelease-pool tiers are not yet block-scoped.
+        // `POOL { … }` opens a +0 autorelease pool (outermost, so it drains
+        // last). `{ … }` opens an arena + tracks owned objects. The flags are
+        // independent: `POOL $( )` is a pool with no arena/object scoping.
+        let pool_slot = if block.pooled {
+            Some(self.enter_block_pool())
+        } else {
+            None
+        };
         let (arena_slot, obj_watermark) = if block.scoped {
             // Remember where this block's owned objects start, so we can
             // release just its slice at the brace.
@@ -1914,15 +1959,19 @@ impl<'a> Lowerer<'a> {
             self.lower_stmt(s);
         }
         // On fall-through only (control still inside the block): release this
-        // block's scope-local +1 objects, then free its arena. A non-local exit
-        // (BREAK/LOOP/GOTO/RETURN) leaves both to the enclosing / function free
-        // — bounded, never a double-release or a dangling pointer.
+        // block's scope-local +1 objects, free its arena, then drain its +0
+        // pool. A non-local exit (BREAK/LOOP/GOTO/RETURN) leaves them to the
+        // enclosing / function / run reclaim — bounded, never a double-release
+        // or a dangling pointer.
         if self.b().current_open() {
             if let Some(wm) = obj_watermark {
                 self.emit_block_owned_releases(wm);
             }
             if let Some(slot) = arena_slot {
                 self.emit_block_arena_free(slot);
+            }
+            if let Some(slot) = pool_slot {
+                self.emit_block_pool_pop(slot);
             }
         }
         self.b().pop_scope();
