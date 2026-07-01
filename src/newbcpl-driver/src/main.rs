@@ -22,6 +22,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("dump-heap", "snapshot the runtime heap (not implemented yet)"),
     ("run <path>", "JIT-compile and run the program's START routine"),
     (
+        "build <path> [--out <exe>]",
+        "AOT-compile to a standalone Mach-O executable (default: <path> stem)",
+    ),
+    (
         "gui <path>",
         "open the iGui frame (bedit + log view); Program ▸ Run / Ctrl+R JITs <path>; console output goes to the log view (Windows only)",
     ),
@@ -159,6 +163,47 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        "build" => {
+            let rest: Vec<String> = args.collect();
+            let mut path: Option<PathBuf> = None;
+            let mut out: Option<PathBuf> = None;
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--out" => match it.next() {
+                        Some(p) => out = Some(PathBuf::from(p)),
+                        None => {
+                            eprintln!("build: --out expects a path");
+                            return ExitCode::from(2);
+                        }
+                    },
+                    _ if path.is_none() => path = Some(PathBuf::from(a)),
+                    _ => {
+                        eprintln!("build: unexpected argument `{a}`");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            let Some(path) = path else {
+                eprintln!("build: missing source path");
+                print_usage();
+                return ExitCode::from(2);
+            };
+            // Default exe name: the source file stem in the cwd.
+            let exe = out.unwrap_or_else(|| {
+                PathBuf::from(path.file_stem().and_then(|s| s.to_str()).unwrap_or("a"))
+            });
+            match build_executable(&path, &exe) {
+                Ok(()) => {
+                    eprintln!("[build] wrote {}", exe.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("build: {e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
         "gui" => match args.next() {
             Some(path_arg) => run_gui(PathBuf::from(path_arg)),
             None => {
@@ -837,6 +882,61 @@ fn build_report(
     }
 
     s
+}
+
+/// AOT-compile `src` to a standalone Mach-O executable at `exe`: emit the
+/// object via newbcpl-llvm, then link it against the BCPL runtime staticlib and
+/// the macOS frameworks with clang (which ad-hoc-signs the arm64 binary).
+fn build_executable(src: &Path, exe: &Path) -> Result<(), String> {
+    let obj = exe.with_extension("o");
+    newbcpl_llvm::emit_aot_object(src, &obj)?;
+
+    let runtime = locate_runtime_lib()?;
+    let mut cmd = std::process::Command::new("clang");
+    cmd.arg("-o").arg(exe).arg(&obj).arg(&runtime);
+    cmd.args(["-lSystem", "-lc", "-lm", "-liconv", "-lc++"]);
+    // Frameworks: CoreFoundation/Security back Rust std; the rest let a BCPL
+    // program reach Cocoa directly. Unused ones bind lazily, so linking them
+    // unconditionally is harmless.
+    for fw in [
+        "CoreFoundation", "Security", "Cocoa", "AppKit", "Foundation",
+        "CoreGraphics", "QuartzCore", "CoreText",
+    ] {
+        cmd.args(["-framework", fw]);
+    }
+    cmd.args(["-arch", "arm64"]);
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("failed to run clang: {e}"))?;
+    let _ = std::fs::remove_file(&obj); // drop the intermediate object
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("clang exited with {}\n{stderr}", output.status));
+    }
+    Ok(())
+}
+
+/// Locate `libnewbcpl_runtime.a` next to the driver executable (cargo places
+/// the staticlib alongside the binary in `target/<profile>/`).
+fn locate_runtime_lib() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let dir = exe.parent().ok_or("driver exe has no parent directory")?;
+    let lib = dir.join("libnewbcpl_runtime.a");
+    if lib.is_file() {
+        return Ok(lib);
+    }
+    // `cargo run` / `cargo test` may place the driver under target/<profile>/deps.
+    if let Some(up) = dir.parent() {
+        let alt = up.join("libnewbcpl_runtime.a");
+        if alt.is_file() {
+            return Ok(alt);
+        }
+    }
+    Err(format!(
+        "libnewbcpl_runtime.a not found next to {} — run `cargo build -p newbcpl-runtime`",
+        dir.display()
+    ))
 }
 
 fn print_usage() {

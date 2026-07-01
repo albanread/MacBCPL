@@ -3,6 +3,13 @@ name = "newbcpl-runtime"
 version = "0.1.0"
 edition = "2024"
 
+# `staticlib` produces `libnewbcpl_runtime.a` — a self-contained archive (the
+# BCPL runtime: builtins, heap/arena, objc bridge, crash handler) that AOT
+# executables link against. `rlib` keeps it usable as a normal dependency for
+# the JIT driver and tests.
+[lib]
+crate-type = ["rlib", "staticlib"]
+
 [dependencies]
 serde_json = "1"
 

@@ -20,9 +20,12 @@ citizen, a class system in which **an object is a real Cocoa object**, and a
 memory model in which heap data follows the stack's scopes so that there is no
 garbage collector to pause your program and no `free` you are required to call.
 
-The compiler is a JIT. You write a program, the driver lexes, parses, checks,
-lowers to LLVM, and runs it — there is no separate executable yet. Everything
-in this book has been run.
+The compiler runs two ways. `newbcpl-driver run` is a JIT: it lexes, parses,
+checks, lowers to LLVM, and executes the program in-process — the mode used
+throughout this book, so every example here has been run. `newbcpl-driver build`
+is the ahead-of-time path: it emits a standalone, signed Mach-O executable you
+can ship (console, memory-feature, and Cocoa-system-class programs today;
+user-defined `CLASS`es via AOT are in progress).
 
 This book is a tutorial and a reference. The first chapter teaches the language
 by example; the middle chapters take up types, control flow, functions,

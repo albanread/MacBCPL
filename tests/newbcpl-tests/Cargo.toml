@@ -11,6 +11,7 @@ path = "src/lib.rs"
 newbcpl-lexer = { path = "../../src/newbcpl-lexer" }
 newbcpl-parser = { path = "../../src/newbcpl-parser" }
 newbcpl-sema = { path = "../../src/newbcpl-sema" }
+newbcpl-llvm = { path = "../../src/newbcpl-llvm" }
 
 [[test]]
 name = "matrix_tier1_negatives"

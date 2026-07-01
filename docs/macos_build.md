@@ -56,11 +56,38 @@ newbcpl-driver dump-ir      prog.bcl     # shows @arena vs @heap alloc tags (see
 newbcpl-driver dump-llvm    prog.bcl
 newbcpl-driver dump-asm     prog.bcl
 newbcpl-driver run          prog.bcl     # JIT + execute (console programs verified)
+newbcpl-driver build        prog.bcl     # AOT: emit a standalone Mach-O exe
+newbcpl-driver build        prog.bcl --out myprog   # ... to a chosen path
 newbcpl-driver test-folder  dir/         # JIT every .bcl under dir, emit a report
 ```
 
 `gui` (the Cocoa editor/runner over the objc bridge) is the in-progress GUI
 phase; the console `run` path is fully working.
+
+## AOT executables (`build`)
+
+`build` compiles ahead of time to a standalone, signed `Mach-O 64-bit
+executable arm64` — no runtime, no JIT, just the program:
+
+```sh
+newbcpl-driver build hello.bcl --out hello
+./hello                                   # runs on its own
+```
+
+Under the hood it emits a relocatable object (the program's code plus a C
+`main` that installs the crash handler, opens an autorelease pool, calls
+`START`, and pops the pool), then links it with `clang` against the runtime
+static library `libnewbcpl_runtime.a` (built alongside the driver by
+`cargo build -p newbcpl-runtime`) and the macOS frameworks
+(Foundation/AppKit/CoreGraphics/…). `clang` ad-hoc-signs the arm64 binary, so it
+runs without a separate `codesign` step.
+
+Works today for **console programs**, the full **memory model** (arena, `{ }` /
+`POOL` reclaim scopes, lists, `GETVEC`), and **Cocoa bracket sends to system
+classes** (`[[NSMutableArray alloc] init]`, `[s uppercaseString]`, …); the
+signal-safe crash handler is active in the built binary. **In progress:**
+AOT for user-defined `CLASS`es (the Obj-C class registrar must run before
+`START`) and `modules-active/` linking.
 
 **Global option `--no-autorelease-pool`** (valid anywhere on the line). Each
 `run` is wrapped in an Objective-C autorelease pool by default, giving +0 /

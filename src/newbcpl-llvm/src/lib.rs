@@ -14,6 +14,7 @@ use std::path::Path;
 
 use inkwell::OptimizationLevel;
 use inkwell::context::Context;
+use inkwell::module::{Linkage, Module};
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
@@ -776,6 +777,87 @@ fn build_ir(path: &Path) -> Result<IrModule, String> {
         .unwrap_or("module");
     let base_dir = path.parent().map(|p| p.to_path_buf());
     build_ir_from_source_with_base(&source, module_name, base_dir.as_deref(), None)
+}
+
+/// Ahead-of-time compile the BCPL source at `path` to a relocatable object at
+/// `out_obj`. The object holds the program's code plus a C `main` that installs
+/// the crash handler, wraps the run in an autorelease pool, and calls `START`.
+/// The driver links it against `libnewbcpl_runtime.a` + system frameworks to
+/// produce a standalone Mach-O executable.
+///
+/// Increment 1: single-file console programs (no `modules-active` linking, no
+/// Cocoa class registrar). Those follow.
+pub fn emit_aot_object(path: &Path, out_obj: &Path) -> Result<(), String> {
+    let ir = build_ir(path)?;
+    let context = Context::create();
+    let module = emit::emit(&context, &ir);
+    emit_aot_main(&context, &module);
+    write_object(&module, out_obj)
+}
+
+/// Synthesize `int main()`: `bcpl_install_crash_handler();` then the run wrapped
+/// in an autorelease pool around `START()`, mirroring the JIT `run_program_ir`
+/// startup. The pool token is a Word (pointer ≡ i64 in a register), like the
+/// arena handle.
+fn emit_aot_main<'ctx>(context: &'ctx Context, module: &Module<'ctx>) {
+    let i32t = context.i32_type();
+    let i64t = context.i64_type();
+    let voidt = context.void_type();
+
+    let mut ext = |name: &str, ty| {
+        module
+            .get_function(name)
+            .unwrap_or_else(|| module.add_function(name, ty, Some(Linkage::External)))
+    };
+    let install = ext("bcpl_install_crash_handler", voidt.fn_type(&[], false));
+    let pool_push = ext("bcpl_autorelease_pool_push", i64t.fn_type(&[], false));
+    let pool_pop = ext("bcpl_autorelease_pool_pop", voidt.fn_type(&[i64t.into()], false));
+    // START is defined by the program's codegen (a BCPL routine returning WORD).
+    let start = ext("START", i64t.fn_type(&[], false));
+
+    let main_fn = module.add_function("main", i32t.fn_type(&[], false), None);
+    let builder = context.create_builder();
+    let bb = context.append_basic_block(main_fn, "entry");
+    builder.position_at_end(bb);
+    builder.build_call(install, &[], "").expect("call crash handler");
+    let tok = match builder
+        .build_call(pool_push, &[], "pool")
+        .expect("call pool push")
+        .try_as_basic_value()
+    {
+        inkwell::values::ValueKind::Basic(v) => v,
+        inkwell::values::ValueKind::Instruction(_) => {
+            unreachable!("bcpl_autorelease_pool_push returns a value")
+        }
+    };
+    builder.build_call(start, &[], "").expect("call START");
+    builder
+        .build_call(pool_pop, &[tok.into()], "")
+        .expect("call pool pop");
+    builder
+        .build_return(Some(&i32t.const_zero()))
+        .expect("return from main");
+}
+
+/// Emit `module` as a native relocatable object at `out_obj` for
+/// aarch64-apple-darwin, PIC (so it links into a PIE executable).
+fn write_object(module: &Module<'_>, out_obj: &Path) -> Result<(), String> {
+    Target::initialize_aarch64(&InitializationConfig::default());
+    let triple = TargetMachine::get_default_triple();
+    module.set_triple(&triple);
+    let target = Target::from_triple(&triple).map_err(|e| format!("from_triple: {}", e.to_string()))?;
+    let tm = target
+        .create_target_machine(
+            &triple,
+            "generic",
+            "",
+            OptimizationLevel::Default,
+            RelocMode::PIC,
+            CodeModel::Default,
+        )
+        .ok_or_else(|| "create_target_machine failed".to_string())?;
+    tm.write_to_file(module, FileType::Object, out_obj)
+        .map_err(|e| format!("write object {}: {}", out_obj.display(), e.to_string()))
 }
 
 fn build_ir_from_source(source: &str, module_name: &str) -> Result<IrModule, String> {
