@@ -790,16 +790,192 @@ fn build_ir(path: &Path) -> Result<IrModule, String> {
 pub fn emit_aot_object(path: &Path, out_obj: &Path) -> Result<(), String> {
     let ir = build_ir(path)?;
     let context = Context::create();
+    // Fix a class-name prefix for this build; emit_new bakes the same one into
+    // its `bcpl_objc_new` calls, and the generated registrar registers under it.
+    emit::begin_run();
     let module = emit::emit(&context, &ir);
-    emit_aot_main(&context, &module);
+    let registrar = emit_aot_class_registrar(&context, &module, &ir.layouts);
+    emit_aot_main(&context, &module, registrar);
     write_object(&module, out_obj)
+}
+
+/// Generate `void @__bcpl_register_classes()`: the AOT analogue of the JIT's
+/// Rust registrar loop (lib.rs). For each BCPL class (base-before-subclass) it
+/// emits the Objective-C registration — `bcpl_objc_allocate_class`, per-class
+/// ivar, `bcpl_objc_add_method` for its own methods (IMP = the emitted
+/// `Owner_method` function, referenced by symbol — no JIT address needed),
+/// root CREATE/RELEASE no-ops, and `bcpl_objc_register_class`. `main` calls it
+/// before `START`. Returns `None` (no function emitted) if the program is
+/// class-free.
+fn emit_aot_class_registrar<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    layouts: &[newbcpl_sema::ClassLayout],
+) -> Option<inkwell::values::FunctionValue<'ctx>> {
+    use inkwell::AddressSpace;
+    use inkwell::values::ValueKind;
+    use std::collections::HashMap;
+
+    if layouts.is_empty() {
+        return None;
+    }
+
+    let ptr = context.ptr_type(AddressSpace::default());
+    let i64t = context.i64_type();
+    let i32t = context.i32_type();
+    let i8t = context.i8_type();
+    let voidt = context.void_type();
+
+    let mut ext = |name: &str, ty| {
+        module
+            .get_function(name)
+            .unwrap_or_else(|| module.add_function(name, ty, Some(Linkage::External)))
+    };
+    let get_class = ext("bcpl_objc_get_class", ptr.fn_type(&[ptr.into()], false));
+    let alloc_class = ext(
+        "bcpl_objc_allocate_class",
+        ptr.fn_type(&[ptr.into(), ptr.into()], false),
+    );
+    let add_ivar = ext(
+        "bcpl_objc_add_ivar",
+        i32t.fn_type(
+            &[ptr.into(), ptr.into(), i64t.into(), i8t.into(), ptr.into()],
+            false,
+        ),
+    );
+    let sel_fn = ext("bcpl_objc_sel", ptr.fn_type(&[ptr.into()], false));
+    let add_method = ext(
+        "bcpl_objc_add_method",
+        i32t.fn_type(&[ptr.into(), ptr.into(), ptr.into(), ptr.into()], false),
+    );
+    let register_class = ext("bcpl_objc_register_class", voidt.fn_type(&[ptr.into()], false));
+    let default_method = ext("__newbcpl_default_method", i64t.fn_type(&[], false));
+
+    let reg = module.add_function("__bcpl_register_classes", voidt.fn_type(&[], false), None);
+    let builder = context.create_builder();
+    let bb = context.append_basic_block(reg, "entry");
+    builder.position_at_end(bb);
+
+    // Base-before-subclass ordering (objc_allocateClassPair needs a registered
+    // super), mirroring the JIT registrar's depth sort.
+    let by_name: HashMap<&str, &newbcpl_sema::ClassLayout> =
+        layouts.iter().map(|l| (l.class_name.as_str(), l)).collect();
+    fn depth(name: &str, by_name: &HashMap<&str, &newbcpl_sema::ClassLayout>, guard: usize) -> usize {
+        if guard > 1024 {
+            return guard;
+        }
+        match by_name.get(name).and_then(|l| l.extends.as_deref()) {
+            Some(parent) if by_name.contains_key(parent) => 1 + depth(parent, by_name, guard + 1),
+            _ => 0,
+        }
+    }
+    let mut order: Vec<&newbcpl_sema::ClassLayout> = layouts.iter().collect();
+    order.sort_by_key(|l| depth(&l.class_name, &by_name, 0));
+
+    let prefix = emit::class_prefix();
+    let gstr = |s: &str| {
+        builder
+            .build_global_string_ptr(s, ".regstr")
+            .expect("global string")
+            .as_pointer_value()
+    };
+    let call_ptr = |f: inkwell::values::FunctionValue<'ctx>,
+                    args: &[inkwell::values::BasicMetadataValueEnum<'ctx>],
+                    name: &str|
+     -> inkwell::values::BasicValueEnum<'ctx> {
+        match builder.build_call(f, args, name).expect("call").try_as_basic_value() {
+            ValueKind::Basic(v) => v,
+            ValueKind::Instruction(_) => unreachable!("expected a returned value"),
+        }
+    };
+
+    for layout in order {
+        let objc_name = format!("{prefix}{}", layout.class_name);
+        // Superclass name resolved statically: a BCPL parent is prefixed and
+        // already registered (base-first); a non-BCPL parent is a real Cocoa
+        // class of that name; no parent → NSObject.
+        let super_name = match &layout.extends {
+            Some(base) if by_name.contains_key(base.as_str()) => format!("{prefix}{base}"),
+            Some(base) => base.clone(),
+            None => "NSObject".to_string(),
+        };
+        let super_ptr = call_ptr(get_class, &[gstr(&super_name).into()], "super");
+        let cls = call_ptr(alloc_class, &[super_ptr.into(), gstr(&objc_name).into()], "cls");
+
+        if layout.own_fields_size > 0 {
+            let ivar_name = format!("__bcpl_{}", layout.class_name);
+            let enc = format!("[{}c]", layout.own_fields_size);
+            builder
+                .build_call(
+                    add_ivar,
+                    &[
+                        cls.into(),
+                        gstr(&ivar_name).into(),
+                        i64t.const_int(layout.own_fields_size as u64, false).into(),
+                        i8t.const_int(3, false).into(),
+                        gstr(&enc).into(),
+                    ],
+                    "",
+                )
+                .expect("add_ivar");
+        }
+
+        for entry in &layout.vtable {
+            let Some(owner) = entry.defining_class.as_deref() else {
+                continue;
+            };
+            if owner != layout.class_name {
+                continue;
+            }
+            let method_symbol = format!("{owner}_{}", entry.method_name);
+            let Some(fv) = module.get_function(&method_symbol) else {
+                continue;
+            };
+            let imp = fv.as_global_value().as_pointer_value();
+            let sel_name = emit::objc_selector(&entry.method_name);
+            let sel = call_ptr(sel_fn, &[gstr(&sel_name).into()], "sel");
+            let enc = objc_method_type_encoding(fv);
+            builder
+                .build_call(add_method, &[cls.into(), sel.into(), imp.into(), gstr(&enc).into()], "")
+                .expect("add_method");
+        }
+
+        // Root classes: bind undefined CREATE/RELEASE to the no-op.
+        if layout.extends.is_none() {
+            let noop = default_method.as_global_value().as_pointer_value();
+            for m in ["CREATE", "RELEASE"] {
+                let undefined = layout
+                    .vtable
+                    .iter()
+                    .find(|v| v.method_name == m)
+                    .map(|v| v.defining_class.is_none())
+                    .unwrap_or(true);
+                if undefined {
+                    let sel_name = emit::objc_selector(m);
+                    let sel = call_ptr(sel_fn, &[gstr(&sel_name).into()], "sel");
+                    builder
+                        .build_call(add_method, &[cls.into(), sel.into(), noop.into(), gstr("q@:").into()], "")
+                        .expect("add_method noop");
+                }
+            }
+        }
+
+        builder.build_call(register_class, &[cls.into()], "").expect("register_class");
+    }
+
+    builder.build_return(None).expect("return from registrar");
+    Some(reg)
 }
 
 /// Synthesize `int main()`: `bcpl_install_crash_handler();` then the run wrapped
 /// in an autorelease pool around `START()`, mirroring the JIT `run_program_ir`
 /// startup. The pool token is a Word (pointer ≡ i64 in a register), like the
 /// arena handle.
-fn emit_aot_main<'ctx>(context: &'ctx Context, module: &Module<'ctx>) {
+fn emit_aot_main<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    registrar: Option<inkwell::values::FunctionValue<'ctx>>,
+) {
     let i32t = context.i32_type();
     let i64t = context.i64_type();
     let voidt = context.void_type();
@@ -820,6 +996,10 @@ fn emit_aot_main<'ctx>(context: &'ctx Context, module: &Module<'ctx>) {
     let bb = context.append_basic_block(main_fn, "entry");
     builder.position_at_end(bb);
     builder.build_call(install, &[], "").expect("call crash handler");
+    // Register BCPL classes with the Obj-C runtime before START (so NEW works).
+    if let Some(reg) = registrar {
+        builder.build_call(reg, &[], "").expect("call class registrar");
+    }
     let tok = match builder
         .build_call(pool_push, &[], "pool")
         .expect("call pool push")

@@ -4,9 +4,9 @@
 both a JIT (`run`) and AOT standalone executables (`build`).**
 
 > Under development. `run` JITs and executes any program; `build` emits a
-> standalone signed Mach-O executable for console, memory-feature, and
-> Cocoa-system-class programs. AOT for user-defined `CLASS`es (the Obj-C class
-> registrar) is in progress.
+> standalone signed Mach-O executable — for console programs, the full memory
+> model, Cocoa (system classes and user-defined `CLASS`es), and inheritance.
+> Linking `modules-active/` into an AOT build is the remaining gap.
 
 MacBCPL is the macOS / Apple-Silicon (arm64) fork of
 [NewBCPL](https://github.com/albanread/NewBCPL), itself a recreation of the

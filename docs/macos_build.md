@@ -83,11 +83,14 @@ static library `libnewbcpl_runtime.a` (built alongside the driver by
 runs without a separate `codesign` step.
 
 Works today for **console programs**, the full **memory model** (arena, `{ }` /
-`POOL` reclaim scopes, lists, `GETVEC`), and **Cocoa bracket sends to system
-classes** (`[[NSMutableArray alloc] init]`, `[s uppercaseString]`, …); the
-signal-safe crash handler is active in the built binary. **In progress:**
-AOT for user-defined `CLASS`es (the Obj-C class registrar must run before
-`START`) and `modules-active/` linking.
+`POOL` reclaim scopes, lists, `GETVEC`), **Cocoa bracket sends** (system classes
+and user-defined ones), and **user `CLASS`es with inheritance** — the object
+model works because `main` calls a generated `__bcpl_register_classes` (the AOT
+analogue of the JIT's registrar: `objc_allocateClassPair` + per-class ivars +
+`class_addMethod` with the emitted methods as IMPs) before `START`. The
+signal-safe crash handler is active in the built binary. **Remaining gap:**
+linking `modules-active/` modules into an AOT build (they are JIT-linked today);
+a single-file program with classes and Cocoa is fully AOT.
 
 **Global option `--no-autorelease-pool`** (valid anywhere on the line). Each
 `run` is wrapped in an Objective-C autorelease pool by default, giving +0 /

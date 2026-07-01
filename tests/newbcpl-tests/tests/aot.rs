@@ -24,3 +24,26 @@ fn aot_emits_a_macho64_object() {
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&obj);
 }
+
+/// A program with a user `CLASS` emits a Mach-O object that also contains the
+/// generated `__bcpl_register_classes` (the Obj-C registrar `main` runs before
+/// `START`). Emission must succeed and produce a valid object.
+#[test]
+fn aot_emits_class_program_with_registrar() {
+    let dir = std::env::temp_dir();
+    let src = dir.join("newbcpl_aot_class_probe.bcl");
+    std::fs::write(
+        &src,
+        "CLASS C $(\n  DECL x\n  ROUTINE CREATE(v) BE SELF.x := v\n  FUNCTION get() = SELF.x\n$)\nLET START() BE $(\n  LET o = NEW C(42)\n  WRITEN(o.get())\n$)\n",
+    )
+    .unwrap();
+    let obj = dir.join("newbcpl_aot_class_probe.o");
+
+    newbcpl_llvm::emit_aot_object(&src, &obj).expect("emit_aot_object should succeed for a class");
+
+    let bytes = std::fs::read(&obj).expect("object file readable");
+    assert_eq!(&bytes[0..4], &[0xCF, 0xFA, 0xED, 0xFE], "Mach-O 64 object");
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&obj);
+}
