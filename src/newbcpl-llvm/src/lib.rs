@@ -787,7 +787,12 @@ fn build_ir(path: &Path) -> Result<IrModule, String> {
 ///
 /// Increment 1: single-file console programs (no `modules-active` linking, no
 /// Cocoa class registrar). Those follow.
-pub fn emit_aot_object(path: &Path, out_obj: &Path, modules_dir: Option<&Path>) -> Result<(), String> {
+pub fn emit_aot_object(
+    path: &Path,
+    out_obj: &Path,
+    modules_dir: Option<&Path>,
+    opt_level: u8,
+) -> Result<(), String> {
     let ir = build_ir(path)?;
     let context = Context::create();
     // Fix a class-name prefix for this build; emit_new bakes the same one into
@@ -800,7 +805,17 @@ pub fn emit_aot_object(path: &Path, out_obj: &Path, modules_dir: Option<&Path>) 
     let all_layouts = link_modules_into(&context, &module, ir.layouts.clone(), modules_dir)?;
     let registrar = emit_aot_class_registrar(&context, &module, &all_layouts);
     emit_aot_main(&context, &module, registrar);
-    write_object(&module, out_obj)
+    write_object(&module, out_obj, opt_level)
+}
+
+/// Map a `-O` digit (0..=3) to the inkwell codegen level.
+fn opt_llvm(opt_level: u8) -> OptimizationLevel {
+    match opt_level {
+        0 => OptimizationLevel::None,
+        1 => OptimizationLevel::Less,
+        2 => OptimizationLevel::Default,
+        _ => OptimizationLevel::Aggressive,
+    }
 }
 
 /// Emit every `*.bcl` in `modules_dir` (alphabetical), rename its top-level
@@ -1078,8 +1093,11 @@ fn emit_aot_main<'ctx>(
 }
 
 /// Emit `module` as a native relocatable object at `out_obj` for
-/// aarch64-apple-darwin, PIC (so it links into a PIE executable).
-fn write_object(module: &Module<'_>, out_obj: &Path) -> Result<(), String> {
+/// aarch64-apple-darwin, PIC (so it links into a PIE executable). At `-O1`+ the
+/// LLVM `default<O_n>` pass pipeline runs over the module first.
+fn write_object(module: &Module<'_>, out_obj: &Path, opt_level: u8) -> Result<(), String> {
+    use inkwell::passes::PassBuilderOptions;
+
     Target::initialize_aarch64(&InitializationConfig::default());
     let triple = TargetMachine::get_default_triple();
     module.set_triple(&triple);
@@ -1089,11 +1107,20 @@ fn write_object(module: &Module<'_>, out_obj: &Path) -> Result<(), String> {
             &triple,
             "generic",
             "",
-            OptimizationLevel::Default,
+            opt_llvm(opt_level),
             RelocMode::PIC,
             CodeModel::Default,
         )
         .ok_or_else(|| "create_target_machine failed".to_string())?;
+
+    // Mid-level IR optimization (inlining, DCE, mem2reg, …). -O0 skips it.
+    if opt_level >= 1 {
+        let n = opt_level.min(3);
+        module
+            .run_passes(&format!("default<O{n}>"), &tm, PassBuilderOptions::create())
+            .map_err(|e| format!("run_passes O{n}: {}", e.to_string()))?;
+    }
+
     tm.write_to_file(module, FileType::Object, out_obj)
         .map_err(|e| format!("write object {}: {}", out_obj.display(), e.to_string()))
 }

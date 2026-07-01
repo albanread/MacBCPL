@@ -10,7 +10,7 @@ fn aot_emits_a_macho64_object() {
     std::fs::write(&src, "LET START() BE $(\n  WRITES(\"hi\")\n$)\n").unwrap();
     let obj = dir.join("newbcpl_aot_probe.o");
 
-    newbcpl_llvm::emit_aot_object(&src, &obj, None).expect("emit_aot_object should succeed");
+    newbcpl_llvm::emit_aot_object(&src, &obj, None, 2).expect("emit_aot_object should succeed");
 
     let bytes = std::fs::read(&obj).expect("object file readable");
     assert!(bytes.len() > 64, "object should be non-trivial ({} bytes)", bytes.len());
@@ -39,11 +39,29 @@ fn aot_emits_class_program_with_registrar() {
     .unwrap();
     let obj = dir.join("newbcpl_aot_class_probe.o");
 
-    newbcpl_llvm::emit_aot_object(&src, &obj, None).expect("emit_aot_object should succeed for a class");
+    newbcpl_llvm::emit_aot_object(&src, &obj, None, 2).expect("emit_aot_object should succeed for a class");
 
     let bytes = std::fs::read(&obj).expect("object file readable");
     assert_eq!(&bytes[0..4], &[0xCF, 0xFA, 0xED, 0xFE], "Mach-O 64 object");
 
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&obj);
+}
+
+/// `emit_aot_object` produces a valid object at every `-O` level (exercising the
+/// `default<O_n>` pass pipeline at 1–3 and skipping it at 0).
+#[test]
+fn aot_emits_at_each_opt_level() {
+    let dir = std::env::temp_dir();
+    let src = dir.join("newbcpl_aot_opt_probe.bcl");
+    std::fs::write(&src, "LET sq(x) = x * x\nLET START() BE $(\n  WRITEN(sq(7))\n$)\n").unwrap();
+    for opt in [0u8, 1, 2, 3] {
+        let obj = dir.join(format!("newbcpl_aot_opt_{opt}.o"));
+        newbcpl_llvm::emit_aot_object(&src, &obj, None, opt)
+            .unwrap_or_else(|e| panic!("emit at -O{opt}: {e}"));
+        let bytes = std::fs::read(&obj).expect("object readable");
+        assert_eq!(&bytes[0..4], &[0xCF, 0xFA, 0xED, 0xFE], "-O{opt} Mach-O object");
+        let _ = std::fs::remove_file(&obj);
+    }
+    let _ = std::fs::remove_file(&src);
 }

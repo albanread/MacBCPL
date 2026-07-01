@@ -22,8 +22,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("dump-heap", "snapshot the runtime heap (not implemented yet)"),
     ("run <path>", "JIT-compile and run the program's START routine"),
     (
-        "build <path> [--out <exe>]",
-        "AOT-compile to a standalone Mach-O executable (default: <path> stem)",
+        "build <path> [--out <p>] [-O0..3] [--strip] [--app]",
+        "AOT-compile to a standalone Mach-O executable (or a .app bundle)",
     ),
     (
         "gui <path>",
@@ -167,6 +167,9 @@ fn main() -> ExitCode {
             let rest: Vec<String> = args.collect();
             let mut path: Option<PathBuf> = None;
             let mut out: Option<PathBuf> = None;
+            let mut opt: u8 = 2; // default -O2, matching the JIT codegen level
+            let mut strip = false;
+            let mut app = false;
             let mut it = rest.iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
@@ -177,6 +180,12 @@ fn main() -> ExitCode {
                             return ExitCode::from(2);
                         }
                     },
+                    "-O0" => opt = 0,
+                    "-O1" => opt = 1,
+                    "-O2" => opt = 2,
+                    "-O3" => opt = 3,
+                    "--strip" => strip = true,
+                    "--app" => app = true,
                     _ if path.is_none() => path = Some(PathBuf::from(a)),
                     _ => {
                         eprintln!("build: unexpected argument `{a}`");
@@ -189,13 +198,10 @@ fn main() -> ExitCode {
                 print_usage();
                 return ExitCode::from(2);
             };
-            // Default exe name: the source file stem in the cwd.
-            let exe = out.unwrap_or_else(|| {
-                PathBuf::from(path.file_stem().and_then(|s| s.to_str()).unwrap_or("a"))
-            });
-            match build_executable(&path, &exe) {
-                Ok(()) => {
-                    eprintln!("[build] wrote {}", exe.display());
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("a").to_string();
+            match build_target(&path, out.as_deref(), &stem, opt, strip, app) {
+                Ok(produced) => {
+                    eprintln!("[build] wrote {}", produced.display());
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -884,10 +890,55 @@ fn build_report(
     s
 }
 
-/// AOT-compile `src` to a standalone Mach-O executable at `exe`: emit the
-/// object via newbcpl-llvm, then link it against the BCPL runtime staticlib and
-/// the macOS frameworks with clang (which ad-hoc-signs the arm64 binary).
-fn build_executable(src: &Path, exe: &Path) -> Result<(), String> {
+/// Orchestrate an AOT build: pick the output path (a bare executable, or the
+/// binary inside a `.app` bundle), emit + link it, optionally `strip`, and
+/// optionally wrap it in a bundle. Returns the path actually produced.
+fn build_target(
+    src: &Path,
+    out: Option<&Path>,
+    stem: &str,
+    opt: u8,
+    strip: bool,
+    app: bool,
+) -> Result<PathBuf, String> {
+    if app {
+        // A `.app` bundle: <name>.app/Contents/{MacOS/<name>, Info.plist}.
+        let app_dir = out
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(format!("{stem}.app")));
+        let bin_name = app_dir
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(stem)
+            .to_string();
+        let macos = app_dir.join("Contents/MacOS");
+        std::fs::create_dir_all(&macos).map_err(|e| format!("create bundle dirs: {e}"))?;
+        let exe = macos.join(&bin_name);
+        build_executable(src, &exe, opt)?;
+        if strip {
+            strip_and_sign(&exe)?;
+        }
+        std::fs::write(app_dir.join("Contents/Info.plist"), info_plist(&bin_name))
+            .map_err(|e| format!("write Info.plist: {e}"))?;
+        codesign(&app_dir)?; // sign the whole bundle
+        Ok(app_dir)
+    } else {
+        let exe = out
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(stem));
+        build_executable(src, &exe, opt)?;
+        if strip {
+            strip_and_sign(&exe)?;
+        }
+        Ok(exe)
+    }
+}
+
+/// AOT-compile `src` to a standalone Mach-O executable at `exe`: emit the object
+/// via newbcpl-llvm (at `-O opt`), then link it against the BCPL runtime
+/// staticlib and the macOS frameworks with clang (`-dead_strip` drops the
+/// unreferenced runtime; clang ad-hoc-signs the arm64 binary).
+fn build_executable(src: &Path, exe: &Path, opt: u8) -> Result<(), String> {
     let obj = exe.with_extension("o");
     // Active-modules folder (same resolution as `run`): env override, else
     // ./modules-active/. Its modules are compiled and linked into the object.
@@ -899,7 +950,7 @@ fn build_executable(src: &Path, exe: &Path) -> Result<(), String> {
     } else {
         None
     };
-    newbcpl_llvm::emit_aot_object(src, &obj, modules_arg)?;
+    newbcpl_llvm::emit_aot_object(src, &obj, modules_arg, opt)?;
 
     let runtime = locate_runtime_lib()?;
     let mut cmd = std::process::Command::new("clang");
@@ -914,7 +965,9 @@ fn build_executable(src: &Path, exe: &Path) -> Result<(), String> {
     ] {
         cmd.args(["-framework", fw]);
     }
-    cmd.args(["-arch", "arm64"]);
+    // Dead-strip unreferenced code — the runtime staticlib is large but only a
+    // fraction is used, so this trims the binary considerably.
+    cmd.args(["-arch", "arm64", "-Wl,-dead_strip"]);
 
     let output = cmd
         .output()
@@ -925,6 +978,52 @@ fn build_executable(src: &Path, exe: &Path) -> Result<(), String> {
         return Err(format!("clang exited with {}\n{stderr}", output.status));
     }
     Ok(())
+}
+
+/// `strip` the executable, then re-sign it ad-hoc — stripping rewrites the
+/// binary and invalidates clang's link-time signature.
+fn strip_and_sign(exe: &Path) -> Result<(), String> {
+    let status = std::process::Command::new("strip")
+        .arg(exe)
+        .status()
+        .map_err(|e| format!("failed to run strip: {e}"))?;
+    if !status.success() {
+        return Err(format!("strip exited with {status}"));
+    }
+    codesign(exe)
+}
+
+/// Ad-hoc code-sign `target` (an executable or a `.app` bundle).
+fn codesign(target: &Path) -> Result<(), String> {
+    let status = std::process::Command::new("codesign")
+        .args(["-s", "-", "--force"])
+        .arg(target)
+        .status()
+        .map_err(|e| format!("failed to run codesign: {e}"))?;
+    if !status.success() {
+        return Err(format!("codesign exited with {status}"));
+    }
+    Ok(())
+}
+
+/// A minimal `Info.plist` for a `.app` bundle wrapping `bin_name`.
+fn info_plist(bin_name: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key><string>{bin_name}</string>
+  <key>CFBundleIdentifier</key><string>org.macbcpl.{bin_name}</string>
+  <key>CFBundleName</key><string>{bin_name}</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+"#
+    )
 }
 
 /// Locate `libnewbcpl_runtime.a` next to the driver executable (cargo places

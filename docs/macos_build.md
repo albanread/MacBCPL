@@ -74,13 +74,32 @@ newbcpl-driver build hello.bcl --out hello
 ./hello                                   # runs on its own
 ```
 
+Options:
+
+```sh
+newbcpl-driver build prog.bcl -O2            # -O0..-O3 optimization (default -O2)
+newbcpl-driver build prog.bcl --strip        # strip symbols (smaller), then re-sign
+newbcpl-driver build gui.bcl  --app          # produce gui.app (a bundle)
+newbcpl-driver build gui.bcl  --app --strip --out MyApp.app
+```
+
+- **`-O0`…`-O3`** — codegen level, plus the LLVM `default<O_n>` mid-level pass
+  pipeline at `-O1`+ (`-O0` skips it). Default `-O2`, matching the JIT.
+- **`--strip`** — run `strip`, then re-sign (stripping invalidates the link-time
+  signature). Combined with the always-on linker `-dead_strip` (which drops the
+  unreferenced runtime), it trims the binary noticeably.
+- **`--app`** — wrap the executable in a `<name>.app` bundle
+  (`Contents/MacOS/<name>` + a minimal `Info.plist`) and sign the bundle — the
+  form a Cocoa GUI program (`[app run]`) needs to behave as a real app. The
+  BCPL IDE (`examples/bcpl-ide.bcl`) builds this way into a double-clickable app.
+
 Under the hood it emits a relocatable object (the program's code plus a C
 `main` that installs the crash handler, opens an autorelease pool, calls
 `START`, and pops the pool), then links it with `clang` against the runtime
 static library `libnewbcpl_runtime.a` (built alongside the driver by
 `cargo build -p newbcpl-runtime`) and the macOS frameworks
-(Foundation/AppKit/CoreGraphics/…). `clang` ad-hoc-signs the arm64 binary, so it
-runs without a separate `codesign` step.
+(Foundation/AppKit/CoreGraphics/…). `clang` ad-hoc-signs the arm64 binary, so a
+plain `build` runs without a separate `codesign` step.
 
 Works today for **console programs**, the full **memory model** (arena, `{ }` /
 `POOL` reclaim scopes, lists, `GETVEC`), **Cocoa bracket sends** (system classes
