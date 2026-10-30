@@ -258,9 +258,11 @@ fn compile_and_run(name: &str, flags: u32) -> i32 {
         Ok(Err(p)) => match p.downcast::<rosbox::Finish>() {
             Ok(f) => match f.why {
                 None => f.code as i32,
+                // Escape: the module reports it, as the command's error
+                Some(why) if f.code == 17 && why == "Escape" => -6,
                 Some(why) => {
                     out(&format!("{why}\n"));
-                    if f.code == 17 && why == "Escape" { -6 } else { -5 }
+                    -5
                 }
             },
             Err(p) => {

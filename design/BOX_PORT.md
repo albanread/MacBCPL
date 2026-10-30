@@ -209,8 +209,8 @@ object runtime in Rust behind the same `bcpl_objc_*` entry points (a
 class table, methods by selector, reference counts, instances in the
 arena) and a `msgSend` trampoline in assembly for AArch64 and x86-64,
 which looks up the method and jumps to it with the arguments untouched.
-Until then a program with a `CLASS` compiles and stops at its first `NEW`
-with "classes are not in the box yet" (section 12 says which).
+Not done (section 13): a program with a `CLASS` compiles and stops at
+its first `NEW` with "classes and Objective-C are not in the box".
 
 Gone, and left out of the build: Cocoa, Objective-C bracket sends
 (`[obj sel: x]`: a compile error in the box), the autorelease pool and
@@ -272,3 +272,141 @@ written down when that step is done.
    deskdrive. Benchmarks: fib(30) and the sieve beside the others.
 4. !Code.
 5. Intel: build, host checks, the Mac Pro run written down.
+
+## 13. As built (30 Oct 2026)
+
+Branches: this repository's `cli/bcpl-box`; A7232ToolChain's `bcpl` (from
+`langs`, `origin/langs` merged in again on the way; worktree
+`src/A7232ToolChain-bcpl`).
+
+**Build.** `sh box/build.sh aarch64|x86_64` (cargo for
+`<arch>-unknown-linux-musl`, zig 0.15 as the C compiler) makes
+`BOX/caches/bcpl/out-<arch>/`: `libbcpl-box.a` (26.9 MB Arm, 26.0 MB Intel,
+no LLVM inside: the build stops if an LLVM object is in the Rust archive),
+`llvm-stamp.txt` (the NCL set's `.stamp`, checked by /init's link with
+FasterBASIC's and Modula-2's), `bcpl_box.h`, and `lib/`, the ROM's
+`/usr/lib/bcpl` (libhdr, maths, geom, riscos, declaritive). There is no
+LLVM-inside build: the library has no dlopen or dlsym of its own.
+(`BOX/caches/bcpl` is a link to `/Volumes/xb/BOX-overflow/bcpl`: the
+`/Volumes/xc` disc ran out of space during this work.)
+
+**Size.** /init's text, Arm: 78.6 MB on `langs`, 80.2 MB with BCPL
+(+1.6 MB); Intel 85.6 to 87.3 MB (+1.7 MB). initramfs.cpio, Arm 216.9 to
+219.0 MB; Intel 228.6 to 230.7 MB. The LLVM is the same one copy.
+
+**What differed from the plan.**
+- MacBCPL already ran programs with MCJIT, so boxjit.rs is the Mac's run
+  path with Modula-2's memory manager and the box's checks; the Objective-C
+  class registrar is not in it.
+- `STATIC` is parsed but not lowered (a static is taken for an external
+  routine): the library modules keep their state in `GLOBAL`s.
+- Classes: not done. `NEW` of a class ends the program with "classes and
+  Objective-C are not in the box"; a raw bracket send does the same.
+- Program arguments: the C API takes them, but MacBCPL has no way for a
+  program to read them, so they are dropped.
+
+**Found and fixed on the way** (all for the Mac too, its tests unchanged:
+`cargo test --workspace` passes but for `host_recovery`, a Windows-era
+test of a panic through a JIT frame, which aborts on macOS as the README
+says, before and after these changes):
+- `VEC n` and `GETVEC(n)` gave n words, not n+1 as the language guide says:
+  `v!n` was the next heap block's header (a SWI's r!9 read garbage).
+- `FREEVEC` freed nothing: it looked for the heap header one word too high,
+  so a GETVEC in a loop grew without end (the sieve ran out of memory).
+- Every function polled a GC safepoint, at entry and at every loop
+  back-edge, though there is no collector; and every function pushed and
+  popped an arena whether or not it made anything in one. Both gone (the
+  arena only where a VEC is routed to it): fib(30) 18.5 to 1.4 ms, the
+  sieve 11.1 to 4.0 ms.
+- An arena's first chunk was 64 KB, made, zeroed and freed on every call
+  of a routine with a VEC: now 1 KB (dict 227 to 39 ms).
+
+**Proved in the Arm box under QEMU** (slot A):
+- `box/boxtest.sh` with `box/tests/go`: output through the VDU, WRITEF,
+  JOIN, a library module; SYS and SYSN by number and name, registers out,
+  XSYS's error block with V set, ERRNUM, ERRTEXT, a GETVEC buffer to a SWI,
+  SYS's error ending the program; files written and read back as streams;
+  STOP's code in Sys$ReturnCode; a compile error as `FILE:LINE: error:`;
+  a fault ending the run and the next run normal; `-t`, `-O0`.
+- `tools/build-arm-mac.sh --check`: 4 of 2050 checks failed, the known four
+  (three share checks, one MimeMap); the 13 BCPL checks
+  (boot/selftest_bcpl.c) and every FasterBASIC, Modula-2 and F66 check
+  pass.
+- The desktop, driven with deskdrive (box/deskbox.sh): `!BCPL` in the Filer
+  with its icon, its !Run opening Examples with the &A78 icons; Hello
+  double-clicked running in a TaskWindow and reading a name; Escape ending
+  an endless printing loop; Greeter double-clicked running as its own task:
+  the Declaritive window, its tick ("27 seconds"), change events ("Hello,
+  Box!"), Quit.
+- !Code: Hello dropped on it, highlighted, Language BCPL; F1 on WRITEF
+  giving its signature and description; Build file (`*BCPL -c`) putting a
+  compile error in the problems and F8 going to its line; Run file.
+
+**Benchmarks** (`box/tests/bench.bcl`, the box's language comparison,
+A7232ToolChain rosgd/tests/bench/languages, best of three, Arm box under
+QEMU, -O2):
+
+| test | BCPL | Modula-2 | FasterBASIC LLVM | C |
+|---|---|---|---|---|
+| fib(30) | 1.40 ms | 1.67 ms | 1.37 ms | 1.4 ms |
+| sieve, primes below 2,000,000 | 4.03 ms | 4.24 ms | 7.0 ms | 4.2 / 4.3 ms |
+| dict, 200,000 string keys | 40.8 ms | | | 24 ms |
+
+A program compiles in a few milliseconds (Mandelbrot 5 ms): MacBCPL has no
+large library to compile with every program.
+
+**The Intel box.** Built on the Studio: `box/build.sh x86_64` and
+`make ARCH=x86_64` in A7232ToolChain `bcpl`: `build/init` links the module,
+the library and the one LLVM (an x86-64 static PIE; 87.3 MB of text).
+Host-side, `sh box/hostcheck.sh` compiles box/tests/*.bcl (hello, swi,
+files, finish, fault, bench) with the box's front end and code generator
+for x86_64-unknown-linux-musl, as the JIT does (the large code model), with
+the library modules each names, and checks: ELF x86-64; no 32-bit
+PC-relative reference out of an object; every name an object needs is a
+runtime builtin or in /init's dlsym table. All pass. Nothing has run on
+x86-64: MCJIT's placement of code above 4 GB on x86-64, the unwinding of
+FINISH and Escape through x86-64 JIT frames, and the fault escape there are
+unproved.
+
+**What must be run on the Mac Pro** (`ssh macpro`, BOX root
+/Users/Shared/BOX; one session at a time):
+
+1. A7232ToolChain branch `bcpl` and this repository's branch
+   `cli/bcpl-box` side by side in `BOX/src` (as `A7232ToolChain-bcpl` and
+   `MacBCPL-cli-bcpl-box`), with zfb2026 `cli/fbllvm-box` and MacModula2
+   `cli/m2-llvmshare` as `langs` needs; `rosgd/tools/box-root.sh` in the
+   first.
+2. The libraries and the x86-64 NCL set, copied from the Studio together
+   (`caches/intel-mac/llvm-libs-box-x86_64-ncl`, `caches/bcpl/out-x86_64`,
+   and FasterBASIC's and Modula-2's): each library's `llvm-stamp.txt` must
+   be the set's `.stamp`, or the link stops.
+3. In `rosgd`: `tools/build-intel-mac.sh --check`. Pass: no more than the 4
+   known failures, and the 13 checks from "the BCPL module is in the ROM"
+   to "the run after a fault is as good as the first" reading `ok`, with
+   every FasterBASIC and Modula-2 check.
+4. The bench: `box/tests/bench.bcl` on a share as `bench,a78`, then
+   `*BCPL HostFS::Host.$.bench` in a box under HVF; or langbench.seq's
+   `bcpl` step.
+5. The desktop (`run/run-x86_64.sh` with `make ARCH=x86_64 usershare`):
+   `!BCPL`, a double-click on Examples.Hello and Examples.Greeter, Escape
+   in a loop, and !Code with a BCPL file (Build, F8, F1, Run).
+
+**Left.**
+- Everything Intel beyond building and the host check: the run above.
+- Classes (CLASS, NEW, methods): a small object runtime behind the
+  `bcpl_objc_*` entry points and a msgSend trampoline for each
+  architecture (section 8).
+- `STATIC` in the compiler (lowered as GLOBAL is).
+- Escape is seen when a program prints, reads or calls a SWI: a loop that
+  does none of these cannot be stopped (as the other languages).
+- Locals are on /init's stack: `@` of a local is not a RISC OS address
+  (ADDR says so); VEC, GETVEC, strings and globals are.
+- A VEC in a loop body that is not a `{ }` block takes new arena space each
+  turn until the function returns (MacBCPL's per-function arena).
+- Strings that CSTR, ERRTEXT and declaritive_poll make are kept until the
+  run ends.
+- `|` and `&` are bitwise and do not short-circuit (MacBCPL's dialect):
+  examples use nested tests.
+- A fault inside the runtime while it holds a lock would leave it held.
+- !Code: no completion, rename or formatter for BCPL (MacBCPL has no
+  formatter or language server); no "New BCPL project".
