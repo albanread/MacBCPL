@@ -1,0 +1,30 @@
+// swi.bcl -- SWIs by number and name, registers in and out, the X form's
+// error, strings and vectors as buffers
+LET START() BE $(
+    LET r = VEC 9
+    LET buf = GETVEC(16)
+    LET e = 0
+    r!0 := "OS_Write0 from BCPL*N"
+    SYS(#X02, r)
+    r!0 := "OS_Write0 by name*N"
+    SYSN("OS_Write0", r)
+    SYSN("OS_ReadMonotonicTime", r)
+    WRITEF("time is positive: %d*N", r!0 > 0)
+    WRITEF("SWINUMBER(*"OS_WriteC*") = %d*N", SWINUMBER("OS_WriteC"))
+    // XOS_ReadVarVal into a GETVEC buffer
+    r!0 := "Sys$ReturnCode"; r!1 := buf; r!2 := 100; r!3 := 0; r!4 := 3
+    e := XSYSN("OS_ReadVarVal", r)
+    WRITEF("ReadVarVal error %d length %d*N", e, r!2)
+    // an error from the X form, with V set
+    r!0 := "NoSuchCommandAnywhere"
+    e := XSYS(#X05, r)
+    WRITEF("XOS_CLI error number &%x flags %d*N", ERRNUM(e), SYSFLAGS())
+    WRITES("text: "); WRITES(ERRTEXT(e)); NEWLINE()
+    WRITES("riscos_getenv: "); WRITES(riscos_getenv("Sys$ReturnCode")); NEWLINE()
+    WRITEF("buf is a RISC OS address: %d*N", ADDR(buf) = buf)
+    FREEVEC(buf)
+    // the non-X form ends the program with the error
+    r!0 := "NoSuchCommandAnywhere"
+    SYS(#X05, r)
+    WRITES("not reached*N")
+$)

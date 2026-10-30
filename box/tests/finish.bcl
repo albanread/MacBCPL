@@ -1,0 +1,6 @@
+// finish.bcl -- FINISH ends the program from inside a routine; STOP's code
+LET deep(n) BE $(
+    IF n = 0 DO $( WRITES("finishing*N"); STOP(3) $)
+    deep(n - 1)
+$)
+LET START() BE $( deep(10); WRITES("not reached*N") $)

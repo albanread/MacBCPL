@@ -10,6 +10,10 @@
 pub mod emit;
 mod jit_mm;
 
+// The BOX (design/BOX_PORT.md): MCJIT over /init's LLVM, data in the arena.
+#[cfg(feature = "rosbox")]
+pub mod boxjit;
+
 use std::path::Path;
 
 use inkwell::OptimizationLevel;
@@ -53,7 +57,7 @@ pub fn dump_asm(path: &Path) -> String {
             // Initialise the AArch64 target backend — the MacBCPL port
             // targets aarch64-apple-darwin. `get_default_triple()` below
             // resolves to the host arm64 triple.
-            Target::initialize_aarch64(&InitializationConfig::default());
+            let _ = Target::initialize_native(&InitializationConfig::default());
 
             let triple = TargetMachine::get_default_triple();
             module.set_triple(&triple);
@@ -292,7 +296,7 @@ fn run_program_ir(ir: &IrModule, modules_dir: Option<&Path>) -> Result<i64, Stri
                         unsafe {
                             LLVMSetValueName2(
                                 fv.as_value_ref(),
-                                new_name.as_ptr() as *const i8,
+                                new_name.as_ptr() as *const std::ffi::c_char,
                                 new_name.len(),
                             );
                         }
@@ -858,7 +862,7 @@ fn link_modules_into<'ctx>(
                 unsafe {
                     LLVMSetValueName2(
                         fv.as_value_ref(),
-                        new_name.as_ptr() as *const i8,
+                        new_name.as_ptr() as *const std::ffi::c_char,
                         new_name.len(),
                     );
                 }
@@ -1098,7 +1102,8 @@ fn emit_aot_main<'ctx>(
 fn write_object(module: &Module<'_>, out_obj: &Path, opt_level: u8) -> Result<(), String> {
     use inkwell::passes::PassBuilderOptions;
 
-    Target::initialize_aarch64(&InitializationConfig::default());
+    Target::initialize_native(&InitializationConfig::default())
+        .map_err(|e| format!("initialize_native: {e}"))?;
     let triple = TargetMachine::get_default_triple();
     module.set_triple(&triple);
     let target = Target::from_triple(&triple).map_err(|e| format!("from_triple: {}", e.to_string()))?;
@@ -1496,22 +1501,14 @@ mod tests {
     }
 
     #[test]
-    fn every_function_polls_safepoint() {
-        // Cooperative-GC plumbing: the IR-emit pass inserts a
-        // `__newbcpl_safepoint()` call at the top of every JIT'd
-        // function so the collector can pause threads that
-        // never allocate. Confirm the call shows up in both the
-        // top-level routine and a class method body — START and
-        // Foo_CREATE both need to be parkable.
+    fn no_function_polls_safepoint() {
+        // The no-GC model has no collector, so no function polls a
+        // safepoint (they cost a call per function and per loop turn).
         let text = emit_text(
             "CLASS Foo $(\n  DECL x\n  ROUTINE CREATE(ix) BE $( SELF.x := ix $)\n$)\nLET S() BE { LET f = NEW Foo(42) }",
         );
         let safepoint_calls = text.matches("call void @__newbcpl_safepoint()").count();
-        assert!(
-            safepoint_calls >= 2,
-            "expected at least one safepoint call per function (START and Foo_CREATE), got {safepoint_calls}\n{text}"
-        );
-        assert!(text.contains("declare void @__newbcpl_safepoint()"));
+        assert_eq!(safepoint_calls, 0, "expected no safepoint calls\n{text}");
     }
 
     #[test]

@@ -1,0 +1,11 @@
+// hello.bcl -- output through the VDU, a library module, a list and JOIN
+LET START() BE $(
+    LET s = "Hello from BCPL in the BOX"
+    WRITES(s); NEWLINE()
+    WRITEF("answer=%d hex=%x len=%d char=%d*N", 42, 255, LEN(s), s % 0)
+    WRITEF("maths_sq(12) = %d*N", maths_sq(12))
+    WRITES(JOIN(LIST("one", "two", "three"), "-")); NEWLINE()
+    FOR i = 1 TO 5 DO $( WRITEN(i * i); WRCH(' ') $)
+    NEWLINE()
+    WRITEF("float %f*N", 3.25)
+$)

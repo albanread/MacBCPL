@@ -1,0 +1,49 @@
+// bench.bcl -- the BOX language comparison (docs/cli-tasks/bench-fasterbasic.bas)
+// in BCPL: fib(30) and a sieve of the primes below 2,000,000.
+// OS_ReadMonotonicTime counts centiseconds, so each test repeats until half a
+// second has gone; the best of three, in milliseconds.
+MANIFEST $( N = 2000000 $)
+
+LET fib(n) = n < 2 -> n, fib(n - 1) + fib(n - 2)
+
+LET sieve(sv) = VALOF $(
+    LET c = 0
+    FOR i = 2 TO N DO sv%i := 0
+    FOR i = 2 TO N DO
+        IF sv%i = 0 DO $(
+            c := c + 1
+            IF i <= 1414 DO $(
+                LET j = i * i
+                WHILE j <= N DO $( sv%j := 1; j := j + i $)
+            $)
+        $)
+    RESULTIS c
+$)
+
+LET now() = VALOF $( LET r = VEC 9
+    SYS(#X42, r)
+    RESULTIS r!0
+$)
+
+LET work(w, sv) = w = 1 -> fib(30), sieve(sv)
+
+LET best(name, w, sv) BE $(
+    LET b, r, c, e = 1000000000, 0, 0, 0
+    FOR k = 1 TO 3 DO $(
+        LET t = now()
+        LET ms100 = 0
+        c := 0
+        $( r := work(w, sv); c := c + 1; e := now() - t $) REPEATUNTIL e >= 50
+        ms100 := e * 1000 / c
+        IF ms100 < b DO b := ms100
+    $)
+    WRITEF("bcpl %s %d.", name, b / 100)
+    IF b - (b / 100) * 100 < 10 DO WRCH('0')
+    WRITEF("%d ms  %d  (last: %d runs in %d cs)*N", b - (b / 100) * 100, r, c, e)
+$)
+
+LET START() BE $(
+    LET sv = GETVEC(N / 8 + 2)
+    best("fib", 1, sv)
+    best("sieve", 2, sv)
+$)

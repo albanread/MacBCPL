@@ -1,0 +1,21 @@
+| box/tests/go -- the BCPL box test: each program run by *BCPL; *X keeps going past an error
+Echo == hello
+X BCPL HostFS::Host.$.hello
+Echo == swi
+X BCPL HostFS::Host.$.swi
+Echo == files
+X BCPL HostFS::Host.$.files
+Echo == finish
+X BCPL HostFS::Host.$.finish
+Echo rc <Sys$ReturnCode>
+Echo == bad
+X BCPL -c HostFS::Host.$.bad
+Echo == fault
+X BCPL HostFS::Host.$.fault
+Echo == after fault
+X BCPL HostFS::Host.$.hello
+Echo == opt
+X BCPL -t -O0 HostFS::Host.$.finish
+Echo == bench
+X BCPL HostFS::Host.$.bench
+Echo == done

@@ -1,0 +1,5 @@
+// bad.bcl -- a compile error, reported as FILE:LINE: error: TEXT
+LET START() BE $(
+    WRITES("one*N")
+    LET x = (1 +
+$)

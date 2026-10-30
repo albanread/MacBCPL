@@ -1,0 +1,28 @@
+[package]
+name = "newbcpl-box"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "BCPL for the BOX (64-bit RISC OS over Linux): the compiler and runtime as a static library for /init. See design/BOX_PORT.md."
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+path = "src/lib.rs"
+
+[features]
+# box/hostcheck.sh: x86-64 objects from an Arm Mac
+x86-check = ["newbcpl-llvm/x86-check"]
+# box/build.sh's default: LLVM left out of libbcpl-box.a, for /init to link once
+llvm-outside = ["newbcpl-llvm/no-llvm-linking"]
+
+[[bin]]
+name = "bcpl-hostcheck"
+path = "src/hostcheck.rs"
+required-features = ["x86-check"]
+
+[dependencies]
+newbcpl-ir = { path = "../src/newbcpl-ir" }
+newbcpl-llvm = { path = "../src/newbcpl-llvm", features = ["rosbox"] }
+newbcpl-parser = { path = "../src/newbcpl-parser" }
+newbcpl-runtime = { path = "../src/newbcpl-runtime", features = ["rosbox"] }
+newbcpl-sema = { path = "../src/newbcpl-sema" }

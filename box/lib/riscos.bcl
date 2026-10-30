@@ -1,0 +1,80 @@
+// riscos.bcl -- common RISC OS calls, for BCPL in the BOX.
+//
+// A library module: a program calls riscos_write0("Hi*N"), riscos_time()
+// and so on, and the module is linked in because the program names it.
+// Each is a SWI through the runtime's SYS (design/BOX_PORT.md, section 7):
+// a vector of ten words is the registers, in and out.
+
+// OS_Write0: a string to the VDU
+LET write0(s) BE $( LET r = VEC 9
+    r!0 := s
+    SYS(#X02, r)
+$)
+
+// OS_WriteC: one character (a VDU code)
+LET vdu(c) BE $( LET r = VEC 9
+    r!0 := c
+    SYS(#X00, r)
+$)
+
+// OS_NewLine
+LET newline() BE $( LET r = VEC 9
+    SYS(#X03, r)
+$)
+
+// OS_ReadMonotonicTime: centiseconds since the box started
+LET time() = VALOF $( LET r = VEC 9
+    SYS(#X42, r)
+    RESULTIS r!0
+$)
+
+// OS_CLI: a * command; XOS_CLI's error block (0: none)
+LET cli(s) = VALOF $( LET r = VEC 9
+    r!0 := s
+    RESULTIS XSYS(#X05, r)
+$)
+
+// OS_Byte 129: a key within t centiseconds (-1 none); a negative t scans a key
+LET inkey(t) = VALOF $( LET r = VEC 9
+    r!0 := 129
+    r!1 := t & 255
+    r!2 := (t >> 8) & 255
+    SYS(#X06, r)
+    TEST t < 0 THEN RESULTIS r!1 = 255 -> TRUE, FALSE
+    ELSE RESULTIS r!2 = 0 -> r!1, -1
+$)
+
+// VDU 22, m: a screen mode
+LET mode(m) BE $( vdu(22); vdu(m) $)
+
+// VDU 12: the text window cleared
+LET cls() BE vdu(12)
+
+// VDU 31, x, y: the text cursor moved
+LET tab(x, y) BE $( vdu(31); vdu(x); vdu(y) $)
+
+// VDU 17, c: the text colour
+LET colour(c) BE $( vdu(17); vdu(c) $)
+
+// OS_Plot k, x, y (OS units)
+LET plot(k, x, y) BE $( LET r = VEC 9
+    r!0 := k
+    r!1 := x
+    r!2 := y
+    SYS(#X45, r)
+$)
+
+// A system variable's value as a string ("" if it is not set)
+LET getenv(name) = VALOF $( LET r = VEC 9
+    LET buf = GETVEC(32)
+    LET s = 0
+    r!0 := name
+    r!1 := buf
+    r!2 := 255
+    r!3 := 0
+    r!4 := 3
+    TEST XSYS(#X23, r) = 0 THEN buf%(r!2) := 0 ELSE buf%0 := 0
+    s := CSTR(buf)
+    FREEVEC(buf)
+    RESULTIS s
+$)

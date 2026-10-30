@@ -50,8 +50,18 @@ pub mod igui_mac;
 /// `CLASS` objects *be* Cocoa objects (objc_getClass / sel_registerName
 /// / objc_msgSend / objc_allocateClassPair / class_addMethod / …),
 /// ported from MacModula2. Also the foundation for the Cocoa GUI.
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(feature = "rosbox")))]
 pub mod objc;
+
+/// The BOX (design/BOX_PORT.md): strings without Cocoa, behind objc.rs's
+/// entry points; the hooks out to RISC OS; SWIs and streams.
+#[cfg(feature = "rosbox")]
+#[path = "objc_box.rs"]
+pub mod objc;
+#[cfg(feature = "rosbox")]
+pub mod rosbox;
+#[cfg(feature = "rosbox")]
+pub mod riscos;
 
 /// BCPL `Sound_*` / `Music_*` runtime — game-focused SFX synth and
 /// ABC → MIDI playback, backed by NewAudio. Slot bookkeeping and

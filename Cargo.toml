@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "box",
     "new-asm",
     "src/newbcpl-driver",
     "src/newbcpl-ir",

@@ -98,6 +98,10 @@ pub use jit_syms::resolve as resolve_jit_symbol;
 // ── Async-signal-safe output ──────────────────────────────────────────
 
 fn write_all(bytes: &[u8]) {
+    // The box: BRK's report goes to the VDU (no signal handler there)
+    #[cfg(feature = "rosbox")]
+    return crate::rosbox::write_bytes(bytes);
+    #[allow(unreachable_code)]
     let mut off = 0usize;
     while off < bytes.len() {
         let r = unsafe {
@@ -167,6 +171,15 @@ impl Line {
 /// signal handler and the `BRK` statement. `skip` drops the first N
 /// frames (the dumper's own frames). Signal-safe.
 pub(crate) fn write_backtrace(skip: usize) {
+    // The box: musl has no backtrace(); BRK reports without one
+    #[cfg(feature = "rosbox")]
+    let _ = skip;
+    #[cfg(not(feature = "rosbox"))]
+    write_backtrace_os(skip);
+}
+
+#[cfg(not(feature = "rosbox"))]
+fn write_backtrace_os(skip: usize) {
     let mut frames: [*mut c_void; 64] = [core::ptr::null_mut(); 64];
     let n = unsafe { libc::backtrace(frames.as_mut_ptr(), frames.len() as i32) } as usize;
     let mut shown = 0usize;
@@ -245,7 +258,11 @@ unsafe extern "C" fn handler(sig: i32, info: *mut libc::siginfo_t, _ctx: *mut c_
     let fault = if info.is_null() {
         0usize
     } else {
-        unsafe { (*info).si_addr as usize }
+        #[cfg(target_os = "macos")]
+        let a = unsafe { (*info).si_addr as usize };
+        #[cfg(not(target_os = "macos"))]
+        let a = unsafe { (*info).si_addr() as usize };
+        a
     };
 
     let mut l = Line::new();
@@ -277,6 +294,10 @@ static INSTALL: std::sync::Once = std::sync::Once::new();
 /// startup, before running JIT'd code.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn bcpl_install_crash_handler() {
+    // The box: faults are /init's (the module's fault escape)
+    #[cfg(feature = "rosbox")]
+    return;
+    #[allow(unreachable_code)]
     INSTALL.call_once(|| unsafe {
         let mut sa: libc::sigaction = core::mem::zeroed();
         sa.sa_sigaction = handler as libc::sighandler_t;

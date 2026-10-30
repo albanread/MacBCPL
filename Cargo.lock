@@ -25,6 +25,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfg-if"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
+
+[[package]]
+name = "dlmalloc"
+version = "0.2.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad5208a115eaba24916f7456929832e310a81518c641f93fee4f89aa93aa3675"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -97,6 +114,17 @@ name = "new-asm"
 version = "0.1.0"
 
 [[package]]
+name = "newbcpl-box"
+version = "0.0.0"
+dependencies = [
+ "newbcpl-ir",
+ "newbcpl-llvm",
+ "newbcpl-parser",
+ "newbcpl-runtime",
+ "newbcpl-sema",
+]
+
+[[package]]
 name = "newbcpl-driver"
 version = "0.1.0"
 dependencies = [
@@ -127,6 +155,7 @@ name = "newbcpl-llvm"
 version = "0.1.0"
 dependencies = [
  "inkwell",
+ "llvm-sys",
  "new-asm",
  "newbcpl-ir",
  "newbcpl-parser",
@@ -154,6 +183,7 @@ dependencies = [
 name = "newbcpl-runtime"
 version = "0.1.0"
 dependencies = [
+ "dlmalloc",
  "libc",
  "serde_json",
 ]
@@ -293,6 +323,21 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "windows-link"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-sys"
+version = "0.61.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
+dependencies = [
+ "windows-link",
+]
 
 [[package]]
 name = "zmij"

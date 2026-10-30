@@ -81,6 +81,13 @@ pub unsafe extern "C-unwind" fn WRITEN(n: i64) -> i64 {
 /// low byte.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn WRITEC(c: i64) -> i64 {
+    // The box: a character is a Latin-1 byte (RISC OS's alphabet)
+    #[cfg(feature = "rosbox")]
+    {
+        write_bytes(&[if (0..256).contains(&c) { c as u8 } else { b'?' }]);
+        return 0;
+    }
+    #[allow(unreachable_code)]
     match char::from_u32(c as u32) {
         Some(ch) => {
             let mut buf = [0u8; 4];
@@ -110,6 +117,9 @@ pub unsafe extern "C-unwind" fn FWRITE(f: f64) -> i64 {
 /// `RDCH()` — read one byte from stdin; -1 on EOF.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn RDCH() -> i64 {
+    #[cfg(feature = "rosbox")]
+    return crate::rosbox::rdch();
+    #[allow(unreachable_code)]
     let mut buf = [0u8; 1];
     match std::io::stdin().read(&mut buf) {
         Ok(0) | Err(_) => -1,
@@ -124,6 +134,10 @@ pub unsafe extern "C-unwind" fn RDCH() -> i64 {
 /// own subprocess so this is harmless.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn FINISH() -> i64 {
+    // The box: the program ends, not /init
+    #[cfg(feature = "rosbox")]
+    crate::rosbox::finish(0, None);
+    #[allow(unreachable_code)]
     let _ = std::io::stdout().flush();
     std::process::exit(0);
 }
@@ -207,7 +221,7 @@ pub unsafe extern "C-unwind" fn TIMER_END(start: i64) -> i64 {
 /// stdout, using fractional seconds with millisecond precision.
 pub unsafe extern "C-unwind" fn TIMER_DISPLAY(elapsed: i64) -> i64 {
     let seconds = (elapsed as f64) / 1_000_000_000.0;
-    println!("{:.3}s", seconds);
+    write_bytes(format!("{:.3}s\n", seconds).as_bytes());
     0
 }
 
@@ -335,7 +349,11 @@ pub unsafe extern "C-unwind" fn JOIN(list: i64, separator: *const u8) -> *const 
         }
         cur = unsafe { (*cur).tl } as *const ConsCell;
     }
+    // The box: the bytes are already the string's (Latin-1)
+    #[cfg(feature = "rosbox")]
+    return crate::objc::box_string(&out) as *const u8;
     // NUL-terminate for initWithUTF8String: and return an owned +1 id.
+    #[allow(unreachable_code)]
     out.push(0);
     unsafe { crate::objc::bcpl_objc_nsstring_immortal(out.as_ptr()) as *const u8 }
 }
@@ -423,7 +441,11 @@ pub unsafe extern "C-unwind" fn HEAP_INFO() -> i64 {
     let modules = c.module_root_count.load(Ordering::Acquire);
     let threads = c.registered_threads.load(Ordering::Acquire);
 
+    #[cfg(feature = "rosbox")]
+    let mut h = BoxOut(Vec::new());
+    #[cfg(not(feature = "rosbox"))]
     let stdout = std::io::stdout();
+    #[cfg(not(feature = "rosbox"))]
     let mut h = stdout.lock();
     let _ = writeln!(h, "=== newbcpl GC heap info ===");
     let _ = writeln!(
@@ -765,6 +787,9 @@ pub extern "C-unwind" fn __newbcpl_cons_alloc() -> *mut ConsCell {
             // Grow: one slab of cells, threaded onto the free-list. The
             // slab leaks for the process lifetime (single-mutator JIT).
             let layout = std::alloc::Layout::array::<ConsCell>(CONS_SLAB_CELLS).unwrap();
+            #[cfg(feature = "rosbox")]
+            let base = crate::rosbox::sys_alloc_zeroed(layout.size(), 16) as *mut ConsCell;
+            #[cfg(not(feature = "rosbox"))]
             let base = unsafe { std::alloc::alloc(layout) } as *mut ConsCell;
             if base.is_null() {
                 std::alloc::handle_alloc_error(layout);
@@ -1175,6 +1200,10 @@ pub unsafe extern "C-unwind" fn SPLIT(_s: *const u8, _delim: *const u8) -> *mut 
 // ─── helpers ─────────────────────────────────────────────────────
 
 fn write_bytes(bytes: &[u8]) {
+    // The box: the selected stream or the VDU, through the module's hooks
+    #[cfg(feature = "rosbox")]
+    return crate::rosbox::write_bytes(bytes);
+    #[allow(unreachable_code)]
     // GUI mode installs a callback that routes bytes to a console
     // window; in that case we skip the host stdout entirely so test
     // captures don't see double output. Without a callback (the
@@ -1191,6 +1220,36 @@ fn write_bytes(bytes: &[u8]) {
     let mut handle = stdout.lock();
     let _ = handle.write_all(bytes);
     let _ = handle.flush();
+}
+
+/// The box: text gathered and written to the VDU (or the selected stream)
+/// when dropped.
+#[cfg(feature = "rosbox")]
+struct BoxOut(Vec<u8>);
+
+#[cfg(feature = "rosbox")]
+impl std::io::Write for BoxOut {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "rosbox")]
+impl Drop for BoxOut {
+    fn drop(&mut self) {
+        crate::rosbox::write_bytes(&std::mem::take(&mut self.0));
+    }
+}
+
+/// The box: the list cells' free list forgotten (its slabs were in the
+/// run's dynamic area).
+#[cfg(feature = "rosbox")]
+pub fn reset_run_state() {
+    CONS_POOL.with(|p| p.borrow_mut().free = std::ptr::null_mut());
 }
 
 // ─── builtin-address table ───────────────────────────────────────
@@ -1507,6 +1566,9 @@ pub fn builtin_addresses() -> &'static [Builtin] {
                 v.push(Builtin { name, address });
             }
         }
+        // The box: SWIs and streams
+        #[cfg(feature = "rosbox")]
+        v.extend(crate::riscos::builtin_addresses());
         // No-GC memory model: per-scope arena + promote entry points
         // (the manual heap's alloc/free are reached via __newbcpl_alloc_rec
         // / FREEVEC which are already registered above).

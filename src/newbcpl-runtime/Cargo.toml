@@ -18,6 +18,11 @@ serde_json = "1"
 # signal-safe crash handler (crash.rs, ported from MacModula2), the
 # objc bridge's dlopen/dlsym, and BRK's backtrace.
 libc = "0.2"
+dlmalloc = { version = "0.2", optional = true }
+
+[features]
+# The BOX (design/BOX_PORT.md): RISC OS hooks, data in a dynamic area
+rosbox = ["dep:dlmalloc"]
 
 # Dropped vs upstream NewBCPL: `newaudio-core`/`newaudio-abc` (external,
 # not part of the port — audio.rs is a no-op stub) and `bcpl-wingui` +

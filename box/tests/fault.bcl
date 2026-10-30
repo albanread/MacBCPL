@@ -1,0 +1,7 @@
+// fault.bcl -- a write through a bad pointer ends the run, not the box
+LET START() BE $(
+    LET p = 8
+    WRITES("about to fault*N")
+    !p := 1
+    WRITES("not reached*N")
+$)

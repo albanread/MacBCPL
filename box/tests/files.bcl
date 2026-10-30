@@ -1,0 +1,21 @@
+// files.bcl -- streams through RISC OS: write a file, read it back
+GET "libhdr"
+
+LET START() BE $(
+    LET out = FINDOUTPUT("HostFS::Host.$.bcplfile")
+    LET inp, c, n = 0, 0, 0
+    IF out = 0 DO $( WRITES("cannot open for output*N"); RETURN $)
+    SELECTOUTPUT(out)
+    WRITES("line one*N")
+    WRITEF("line %d*N", 2)
+    ENDWRITE()
+    WRITES("written*N")
+    inp := FINDINPUT("HostFS::Host.$.bcplfile")
+    IF inp = 0 DO $( WRITES("cannot open for input*N"); RETURN $)
+    SELECTINPUT(inp)
+    c := RDCH()
+    UNTIL c = ENDSTREAMCH DO $( WRCH(c); n := n + 1; c := RDCH() $)
+    ENDREAD()
+    WRITEF("%d bytes read back*N", n)
+    WRITEF("missing file gives %d*N", FINDINPUT("HostFS::Host.$.nosuchfile"))
+$)

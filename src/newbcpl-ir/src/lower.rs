@@ -673,7 +673,8 @@ impl<'a> Lowerer<'a> {
     }
 
     fn finish_function(&mut self) {
-        if let Some(b) = self.current.take() {
+        if let Some(mut b) = self.current.take() {
+            strip_unused_arenas(&mut b.function);
             self.functions.push(b.function);
         }
         // Reset per-function arena state for the next function.
@@ -2907,14 +2908,11 @@ impl<'a> Lowerer<'a> {
     /// no allocations and no callees still parks for a concurrent
     /// collector. Pairs with the function-entry poll emitted by
     /// `newbcpl-llvm`'s `emit_safepoint_poll`.
-    fn emit_safepoint(&mut self) {
-        self.b().emit(Instr::Call {
-            dst: None,
-            callee: Value::Function("__newbcpl_safepoint".to_string()),
-            args: Vec::new(),
-            hint: TypeHint::Word,
-        });
-    }
+    ///
+    /// No longer emitted: the no-GC model has no collector to park for,
+    /// and a call at every back-edge cost tight loops (the sieve) twice
+    /// their time. Kept as the one place to put it back.
+    fn emit_safepoint(&mut self) {}
 
     /// Load the implicit `SELF` parameter as a Value. Only callable
     /// while lowering a class method; unwraps because the entry
@@ -4268,3 +4266,50 @@ fn unop_to_ir(op: UnaryOp, operand: TypeHint) -> Option<IrUnOp> {
     })
 }
 
+
+/// A function that makes nothing in an arena (no `TypedConstruct` routed to
+/// `AllocTarget::Arena`) needs no arena of its own: its `bcpl_arena_enter`
+/// and `bcpl_arena_free` calls, and the stores of their handles, go. Nothing
+/// else allocates from the innermost arena, so a callee that skips its own
+/// never draws from its caller's. Recursion-heavy code (fib) paid two
+/// runtime calls a call for arenas it never used.
+fn strip_unused_arenas(f: &mut Function) {
+    let uses_arena = f.blocks.iter().flat_map(|b| &b.instrs).any(|i| {
+        matches!(i, Instr::TypedConstruct { alloc_target: AllocTarget::Arena, .. })
+    });
+    if uses_arena {
+        return;
+    }
+    let mut handles = std::collections::HashSet::new();
+    for b in &mut f.blocks {
+        b.instrs.retain(|i| match i {
+            Instr::Call { dst, callee: Value::Function(n), .. } if n == "bcpl_arena_enter" => {
+                if let Some(d) = dst {
+                    handles.insert(*d);
+                }
+                false
+            }
+            Instr::Call { callee: Value::Function(n), .. } if n == "bcpl_arena_free" => false,
+            _ => true,
+        });
+    }
+    // The handles' slots: their stores, their allocas and the loads that
+    // fed the frees go too
+    let mut slots = std::collections::HashSet::new();
+    for b in &mut f.blocks {
+        b.instrs.retain(|i| match i {
+            Instr::Store { slot, value: Value::Local(v) } if handles.contains(v) => {
+                slots.insert(*slot);
+                false
+            }
+            _ => true,
+        });
+    }
+    for b in &mut f.blocks {
+        b.instrs.retain(|i| match i {
+            Instr::Alloca { dst, .. } => !slots.contains(dst),
+            Instr::Load { slot, .. } => !slots.contains(slot),
+            _ => true,
+        });
+    }
+}

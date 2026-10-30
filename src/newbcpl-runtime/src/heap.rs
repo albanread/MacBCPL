@@ -15,7 +15,25 @@
 //! controls alloc/free explicitly (no collector). A bump/free-list
 //! upgrade can replace the backing later without changing the ABI.
 
-use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
+use std::alloc::{Layout, handle_alloc_error};
+#[cfg(not(feature = "rosbox"))]
+use std::alloc::{alloc_zeroed, dealloc};
+
+/// The system memory under the heap and the arenas: the process's, or in
+/// the box the run's dynamic area (RISC OS addresses a SWI can be given).
+unsafe fn sys_alloc_zeroed(layout: Layout) -> *mut u8 {
+    #[cfg(feature = "rosbox")]
+    return crate::rosbox::sys_alloc_zeroed(layout.size(), layout.align());
+    #[cfg(not(feature = "rosbox"))]
+    unsafe { alloc_zeroed(layout) }
+}
+
+unsafe fn sys_dealloc(p: *mut u8, layout: Layout) {
+    #[cfg(feature = "rosbox")]
+    return crate::rosbox::sys_free(p, layout.size(), layout.align());
+    #[cfg(not(feature = "rosbox"))]
+    unsafe { dealloc(p, layout) }
+}
 use std::sync::atomic::Ordering;
 
 use crate::gc::HEAP_COUNTERS;
@@ -89,7 +107,7 @@ pub unsafe fn bcpl_heap_alloc(payload: usize) -> *mut u8 {
     let total = HEADER_SIZE + payload;
     let layout = Layout::from_size_align(total, BLOCK_ALIGN)
         .expect("bcpl_heap_alloc: invalid layout");
-    let block = unsafe { alloc_zeroed(layout) };
+    let block = unsafe { sys_alloc_zeroed(layout) };
     if block.is_null() {
         handle_alloc_error(layout);
     }
@@ -132,7 +150,7 @@ pub unsafe fn bcpl_heap_free(payload: *mut u8) {
     }
     let layout = Layout::from_size_align(total, BLOCK_ALIGN)
         .expect("bcpl_heap_free: invalid layout");
-    unsafe { dealloc(block, layout) };
+    unsafe { sys_dealloc(block, layout) };
     bump_counters_free(total);
 }
 
@@ -162,7 +180,7 @@ impl Drop for Chunk {
     fn drop(&mut self) {
         if !self.base.is_null() {
             let layout = Layout::from_size_align(self.cap, BLOCK_ALIGN).unwrap();
-            unsafe { dealloc(self.base, layout) };
+            unsafe { sys_dealloc(self.base, layout) };
             let live = HEAP_COUNTERS.live_bytes.load(Ordering::Relaxed);
             HEAP_COUNTERS
                 .live_bytes
@@ -194,7 +212,7 @@ impl Arena {
         let cap = total.max(DEFAULT_CHUNK);
         let layout = Layout::from_size_align(cap, BLOCK_ALIGN)
             .expect("arena chunk layout");
-        let base = unsafe { alloc_zeroed(layout) };
+        let base = unsafe { sys_alloc_zeroed(layout) };
         if base.is_null() {
             handle_alloc_error(layout);
         }
@@ -399,4 +417,17 @@ mod tests {
             bcpl_heap_free(p as *mut u8);
         }
     }
+}
+
+/// The box: the arena stack forgotten at the end of a run (its chunks were
+/// in the run's dynamic area, which starts again).
+#[cfg(feature = "rosbox")]
+pub fn reset_run_state() {
+    ARENA_STACK.with(|a| {
+        if let Ok(mut v) = a.try_borrow_mut() {
+            for arena in v.drain(..) {
+                std::mem::forget(arena);
+            }
+        }
+    });
 }
