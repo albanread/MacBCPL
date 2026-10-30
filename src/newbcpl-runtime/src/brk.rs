@@ -85,10 +85,19 @@ pub unsafe extern "C-unwind" fn __newbcpl_brk(routine_name: *const u8, line: i64
         // our return address, x30 (lr) on entry — captured as the link
         // register before it's clobbered.
         let lr: usize;
+        #[cfg(target_arch = "aarch64")]
         unsafe {
             core::arch::asm!("mov {}, sp", out(reg) sp);
             core::arch::asm!("mov {}, x29", out(reg) fp);
             core::arch::asm!("mov {}, x30", out(reg) lr);
+        }
+        // x86-64 (the BOX's Intel box): rbp's frame record is [saved rbp,
+        // return address], as x29's is
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!("mov {}, rsp", out(reg) sp);
+            core::arch::asm!("mov {}, rbp", out(reg) fp);
+            lr = *((fp + 8) as *const usize);
         }
         let mut c = crash::Line::new();
         c.push_str("context: pc=0x");
@@ -117,8 +126,13 @@ pub unsafe extern "C-unwind" fn __newbcpl_brk(routine_name: *const u8, line: i64
         hdr.flush();
 
         let mut fp: usize;
+        #[cfg(target_arch = "aarch64")]
         unsafe {
             core::arch::asm!("mov {}, x29", out(reg) fp);
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!("mov {}, rbp", out(reg) fp);
         }
         let mut shown = 0usize;
         let mut guard = 0usize;

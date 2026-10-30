@@ -236,7 +236,9 @@ pub fn compile_box(prog: &IrModule, mods: &[(String, IrModule)], opt: u32) -> Re
 /// The host check (box/hostcheck.sh): the box's code for `triple` (as the
 /// JIT makes it: the large code model) written as an object file.
 pub fn emit_object_box(prog: &IrModule, mods: &[(String, IrModule)], triple: &str, out: &Path) -> Result<(), String> {
-    Target::initialize_all(&InitializationConfig::default());
+    let _ = Target::initialize_native(&InitializationConfig::default());
+    #[cfg(feature = "x86-check")]
+    Target::initialize_x86(&InitializationConfig::default());
     let ctx = Context::create();
     let t = inkwell::targets::TargetTriple::create(triple);
     let tm = machine(&t, 2, RelocMode::Default)?;
