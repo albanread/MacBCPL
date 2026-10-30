@@ -26,7 +26,12 @@ MANIFEST $(
     dk_specmax = 65535
 $)
 
-STATIC $( dk_spec = 0; dk_len = 0; dk_block = 0; dk_mask = 0; dk_pollword = 0; dk_next = 0 $)
+GLOBAL dk_spec = 0
+GLOBAL dk_len = 0
+GLOBAL dk_block = 0
+GLOBAL dk_mask = 0
+GLOBAL dk_pollword = 0
+GLOBAL dk_next = 0
 
 LET init(name) BE $( LET r = VEC 9
     dk_spec := GETVEC(dk_specmax / 8 + 1)
