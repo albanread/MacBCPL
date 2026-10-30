@@ -1,0 +1,15 @@
+// Hello -- BCPL in the BOX: output, a loop, WRITEF, a string's characters
+LET START() BE $(
+    LET s = "Hello from BCPL"
+    WRITES(s); NEWLINE()
+    FOR i = 1 TO 10 DO WRITEF("%d squared is %d*N", i, i * i)
+    WRITES("Backwards: ")
+    FOR i = LEN(s) - 1 TO 0 BY -1 DO WRCH(s % i)
+    NEWLINE()
+    WRITES("What is your name? ")
+    $( LET c = RDCH()
+       WRITES("Hello, ")
+       UNTIL c = '*N' | c < 0 DO $( WRCH(c); c := RDCH() $)
+       WRITES("!*N")
+    $)
+$)

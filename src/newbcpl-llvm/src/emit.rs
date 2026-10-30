@@ -1802,7 +1802,10 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         };
 
         let count: u64 = single_const_size.unwrap_or_else(|| args.len() as u64);
-        let total_bytes = count.saturating_add(1).saturating_mul(8);
+        // `VEC n` is n+1 words, v!0 .. v!n (the language guide, 1.3), after
+        // the length word; an init list is its own words.
+        let words = if single_const_size.is_some() { count.saturating_add(1) } else { count };
+        let total_bytes = words.saturating_add(1).saturating_mul(8);
 
         // Allocate via the size-keyed allocator — arena (stack-scope
         // lifetime) or manual heap, per the escape pre-pass's decision.

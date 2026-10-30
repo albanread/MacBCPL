@@ -120,6 +120,18 @@ pub unsafe fn bcpl_heap_alloc(payload: usize) -> *mut u8 {
     unsafe { block.add(HEADER_SIZE) }
 }
 
+/// Whether `payload` is a live manual-heap block's payload.
+///
+/// # Safety
+/// `payload` must be readable 16 bytes below (any pointer the runtime
+/// handed out is).
+pub unsafe fn is_heap_block(payload: *mut u8) -> bool {
+    if (payload as usize) < HEADER_SIZE || (payload as usize) & (BLOCK_ALIGN - 1) != 0 {
+        return false;
+    }
+    unsafe { (*(payload.sub(HEADER_SIZE) as *const Hdr)).tag == HEAP_MAGIC }
+}
+
 /// Free a block previously returned by [`bcpl_heap_alloc`]. Null and
 /// already-zeroed-header pointers are ignored (best-effort guard against
 /// double / foreign frees — pointers into an arena or a string literal
@@ -169,6 +181,7 @@ pub unsafe fn bcpl_heap_free(payload: *mut u8) {
 use std::cell::RefCell;
 
 const DEFAULT_CHUNK: usize = 64 * 1024;
+const FIRST_CHUNK: usize = 1024;
 
 struct Chunk {
     base: *mut u8,
@@ -209,7 +222,11 @@ impl Arena {
                 return p;
             }
         }
-        let cap = total.max(DEFAULT_CHUNK);
+        // A function's arena often holds one small VEC: its first chunk is
+        // small (a 64 KB chunk made, zeroed and freed on every call cost a
+        // VEC-using routine called in a loop far more than its work)
+        let chunk = if self.chunks.is_empty() { FIRST_CHUNK } else { DEFAULT_CHUNK };
+        let cap = total.max(chunk);
         let layout = Layout::from_size_align(cap, BLOCK_ALIGN)
             .expect("arena chunk layout");
         let base = unsafe { sys_alloc_zeroed(layout) };

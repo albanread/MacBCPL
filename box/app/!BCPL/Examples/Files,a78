@@ -1,0 +1,23 @@
+// Files -- classic BCPL streams through RISC OS: a file written, read back
+GET "libhdr"
+
+LET START() BE $(
+    LET name = "<Wimp$ScrapDir>.BCPLDemo"
+    LET out = FINDOUTPUT(name)
+    LET inp, c, lines = 0, 0, 0
+    IF out = 0 DO $( WRITES("Cannot write "); WRITES(name); NEWLINE(); RETURN $)
+    SELECTOUTPUT(out)
+    FOR i = 1 TO 5 DO WRITEF("Line %d of the file*N", i)
+    ENDWRITE()
+    WRITES("Written: "); WRITES(name); NEWLINE()
+    inp := FINDINPUT(name)
+    SELECTINPUT(inp)
+    c := RDCH()
+    UNTIL c = ENDSTREAMCH DO $(
+        IF c = '*N' DO lines := lines + 1
+        WRCH(c)
+        c := RDCH()
+    $)
+    ENDREAD()
+    WRITEF("%d lines read back*N", lines)
+$)

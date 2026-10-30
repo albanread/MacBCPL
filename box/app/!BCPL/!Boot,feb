@@ -1,0 +1,7 @@
+| !Boot for !BCPL: the file type and its sprites
+Set BCPL$Dir <Obey$Dir>
+IconSprites <BCPL$Dir>.!Sprites
+Set File$Type_A78 BCPL
+| Double-click: *BCPL -run runs a program that makes a Declaritive window
+| as a task of its own, any other in a TaskWindow, where its output is read
+Set Alias$@RunType_A78 BCPL -run %%*0

@@ -1,0 +1,148 @@
+// declaritive.bcl -- desktop windows described in JSON, for BCPL in the BOX.
+//
+// A library module over the Declaritive module's SWIs (chunk &C0380), as
+// declaritive/bindings/c does it.  A program calls:
+//
+//   declaritive_init("Name")          becomes a Wimp task
+//   declaritive_add("{'type': ...")   adds text to the spec (as many times
+//                                     as it takes)
+//   w := declaritive_create()         makes the window from the spec
+//   declaritive_poll(ev)              the next event: its kind (0 none),
+//                                     with ev (a VEC 7) filled in:
+//                                     ev!0 kind, ev!1 window, ev!2 name,
+//                                     ev!3 id, ev!4 value (strings),
+//                                     ev!5 number, ev!6 x, ev!7 y
+//   declaritive_set(w, id, prop, value)   a property changed
+//   declaritive_get(w, id, prop)      a property's value, a string
+//   declaritive_is(a, b)              two strings the same
+//   declaritive_closedown()
+//
+// Event kinds: 1 click, 2 change, 3 submit, 4 menu, 5 close, 6 iconbar,
+// 7 quit, 8 drop, 9 tick, 10 key, 11 canvas, 12 pointer, 13 resize,
+// 14 save, 15 paste.  Strings are RISC OS addresses in the box, so they go
+// to the SWIs as they are; the spec is built in a byte vector.
+
+MANIFEST $(
+    dk_specmax = 65535
+$)
+
+STATIC $( dk_spec = 0; dk_len = 0; dk_block = 0; dk_mask = 0; dk_pollword = 0; dk_next = 0 $)
+
+LET init(name) BE $( LET r = VEC 9
+    dk_spec := GETVEC(dk_specmax / 8 + 1)
+    dk_block := GETVEC(63)
+    dk_len := 0
+    r!0 := 1
+    r!1 := name
+    SYS(#XC0380, r)
+    dk_mask := r!1
+    dk_pollword := r!2
+    dk_next := 0
+$)
+
+LET add(text) BE $(
+    LET n = LEN(text)
+    FOR i = 0 TO n - 1 DO
+        IF dk_len < dk_specmax DO $( dk_spec%dk_len := text%i; dk_len := dk_len + 1 $)
+    dk_spec%dk_len := 0
+$)
+
+// The spec so far, 0-terminated, and a fresh start for the next
+LET taken() = VALOF $(
+    dk_spec%dk_len := 0
+    dk_len := 0
+    RESULTIS dk_spec
+$)
+
+LET create() = VALOF $( LET r = VEC 9
+    r!0 := 0
+    r!1 := taken()
+    SYS(#XC0382, r)
+    RESULTIS r!0
+$)
+
+LET open(w) BE $( LET r = VEC 9
+    r!0 := w
+    r!1 := 1
+    SYS(#XC0384, r)
+$)
+
+LET close(w) BE $( LET r = VEC 9
+    r!0 := w
+    SYS(#XC0385, r)
+$)
+
+LET set(w, id, prop, value) BE $( LET r = VEC 9
+    r!0 := w
+    r!1 := id
+    r!2 := prop
+    r!3 := value
+    SYS(#XC0387, r)
+$)
+
+LET get(w, id, prop) = VALOF $( LET r = VEC 9
+    r!0 := w
+    r!1 := id
+    r!2 := prop
+    SYS(#XC0388, r)
+    RESULTIS CSTR(r!0)
+$)
+
+// The spec so far applied to window w as a patch or an update
+LET patch(w) BE $( LET r = VEC 9
+    r!0 := w
+    r!1 := taken()
+    SYS(#XC038A, r)
+$)
+
+LET update(w) BE $( LET r = VEC 9
+    r!0 := w
+    r!1 := taken()
+    SYS(#XC0389, r)
+$)
+
+// A 32-bit word as a signed number
+LET signed(x) = (x & #X80000000) = 0 -> x, x - #X100000000
+
+LET poll(ev) = VALOF $( LET r = VEC 9
+    LET e, kind = 0, 0
+    r!0 := dk_mask
+    r!1 := dk_block
+    r!3 := dk_pollword
+    TEST dk_next ~= 0 THEN $( r!2 := dk_next; SYS(#X400E1, r) $)
+    ELSE $( r!2 := 0; SYS(#X400C7, r) $)
+    r!1 := dk_block
+    SYS(#XC0386, r)
+    kind := signed(r!0)
+    e := r!1
+    // the event block: 32-bit words at e
+    dk_mask := word(e, 8)
+    dk_next := word(e, 9)
+    IF kind <= 0 RESULTIS 0
+    ev!0 := kind
+    ev!1 := word(e, 1)
+    ev!2 := CSTR(word(e, 2))
+    ev!3 := CSTR(word(e, 3))
+    ev!4 := CSTR(word(e, 4))
+    ev!5 := signed(word(e, 5))
+    ev!6 := signed(word(e, 6))
+    ev!7 := signed(word(e, 7))
+    RESULTIS kind
+$)
+
+// Word i (32 bits) of the block at RISC OS address a
+LET word(a, i) = VALOF $(
+    LET p = a + 4 * i
+    RESULTIS %p | (%(p + 1) << 8) | (%(p + 2) << 16) | (%(p + 3) << 24)
+$)
+
+LET is(a, b) = VALOF $(
+    LET n = LEN(a)
+    IF n ~= LEN(b) RESULTIS FALSE
+    FOR i = 0 TO n - 1 DO IF a%i ~= b%i RESULTIS FALSE
+    RESULTIS TRUE
+$)
+
+LET closedown() BE $( LET r = VEC 9
+    SYS(#XC0381, r)
+$)

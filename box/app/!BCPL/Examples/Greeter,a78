@@ -1,0 +1,37 @@
+// Greeter -- a desktop window from BCPL, by the Declaritive module.  The
+// window is described in JSON; its events come back from declaritive_poll.
+LET START() BE $(
+    LET ev = VEC 7
+    LET w, start, done = 0, riscos_time(), FALSE
+    declaritive_init("Greeter")
+    declaritive_add("{'type':'window','id':'greeter','title':'BCPL + Declaritive','tick':100,")
+    declaritive_add("'body':{'type':'form','children':[")
+    declaritive_add("{'type':'input','id':'name','label':'Your name','live':true},")
+    declaritive_add("{'type':'text','id':'greeting','label':'Greeting','text':'Type your name'},")
+    declaritive_add("{'type':'text','id':'clock','label':'Running for','text':''},")
+    declaritive_add("{'type':'row','span':true,'children':[{'type':'spacer'},")
+    declaritive_add("{'type':'button','id':'quit','text':'Quit'}]}]}}")
+    w := declaritive_create()
+    UNTIL done DO
+        SWITCHON declaritive_poll(ev) INTO $(
+            CASE 1: done := declaritive_is(ev!3, "quit"); ENDCASE      // click
+            CASE 2: IF declaritive_is(ev!3, "name") DO                // change
+                        declaritive_set(w, "greeting", "text", JOIN(LIST("Hello, ", ev!4, "!"), ""))
+                    ENDCASE
+            CASE 9: declaritive_set(w, "clock", "text",                // tick
+                        JOIN(LIST(seconds((riscos_time() - start) / 100), " seconds"), ""))
+                    ENDCASE
+            CASE 5: CASE 7: done := TRUE; ENDCASE                      // close, quit
+            DEFAULT: ENDCASE
+        $)
+    declaritive_closedown()
+$)
+
+// n as a string of digits
+LET seconds(n) = VALOF $(
+    LET buf = VEC 4
+    LET i = 20
+    buf%i := 0
+    $( i := i - 1; buf%i := '0' + n - (n / 10) * 10; n := n / 10 $) REPEATUNTIL n = 0
+    RESULTIS CSTR(buf + i)
+$)

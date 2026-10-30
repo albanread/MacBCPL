@@ -966,8 +966,9 @@ pub unsafe extern "C-unwind" fn TAIL(head: i64) -> i64 {
 /// TypeDesc-interning that keeps `BlockHeader.tag` pointers
 /// stable across JIT engine drops.
 fn alloc_vec_words(n_words: i64) -> *mut i64 {
+    // GETVEC(n) is n+1 words, v!0 .. v!n, as VEC n, after the length word
     let n = n_words.max(0) as usize;
-    let total_bytes = (n + 1) * std::mem::size_of::<i64>();
+    let total_bytes = (n + 2) * std::mem::size_of::<i64>();
     let raw = unsafe { __newbcpl_alloc_rec(total_bytes as i64) } as *mut i64;
     // The GC zero-initialises the block; we just stamp the length.
     unsafe {
@@ -1089,6 +1090,11 @@ pub unsafe extern "C-unwind" fn __newbcpl_len(p: *const i64) -> i64 {
     // `p[-1]` on its non-canonical bits would fault. So detect the tagged
     // bit and route those to the UTF-8 byte length — turning a crash into
     // the correct answer for the common short-string case.
+    // The box: a string has its own header (objc_box.rs)
+    #[cfg(feature = "rosbox")]
+    if let Some(n) = crate::objc::box_string_len(p as *mut core::ffi::c_void) {
+        return n;
+    }
     #[cfg(not(windows))]
     {
         if (p as usize) & (1usize << 63) != 0 {
@@ -1100,6 +1106,16 @@ pub unsafe extern "C-unwind" fn __newbcpl_len(p: *const i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn __newbcpl_freevec(p: *mut i64) -> i64 {
+    // A vector (GETVEC, or a VEC on the heap) is handed out one word past
+    // its length word, which is the heap block's payload: free that. (Freeing
+    // `p` itself found no block header and freed nothing.)
+    if !p.is_null() {
+        let base = unsafe { (p as *mut u8).sub(8) };
+        if unsafe { crate::heap::is_heap_block(base) } {
+            unsafe { crate::heap::bcpl_heap_free(base) };
+            return 0;
+        }
+    }
     unsafe { crate::heap::bcpl_heap_free(p as *mut u8) };
     0
 }

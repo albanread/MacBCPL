@@ -1,0 +1,51 @@
+!BCPL -- BCPL on the BOX
+
+New BCPL (MacBCPL's dialect: floats, lists, VALOF, SWITCHON, MANIFEST,
+STATIC, GET, modules) compiled to machine code in memory by LLVM and run
+at once, inside the box.  The compiler is MacBCPL's.
+
+Files
+  &A78 BCPL   a BCPL program or module (.bcl)
+  Double-click a program to run it: its output appears in a TaskWindow;
+  a program that makes a Declaritive window runs as a task of its own.
+  GET "name" looks beside the program (name, name/bcl), then in the
+  library.
+
+The command
+  *BCPL [-c] [-t] [-O0..3] <file>
+    -c       compile only and report errors as  file:line: error: text
+    -t       give the compile time
+    -O0..-O3 LLVM's optimisation (default -O2)
+  Escape stops a program.  A fault ends the run, not the box.
+
+The box's builtins
+  SWIs     SYS(n, r) and SYSN(name, r) call a SWI with the registers
+           r!0..r!9 (r a VEC 9), in and out; an error ends the program.
+           XSYS and XSYSN return the error block (0 if none), SYSFLAGS()
+           gives N Z C V.  SWINUMBER(name), ERRNUM(e), ERRTEXT(e),
+           CSTR(a) (a string from a RISC OS address), ADDR(p) (checked).
+           Strings, vectors (VEC, GETVEC) and statics are in a dynamic
+           area ("BCPL"): their addresses can be given to SWIs as they are.
+  Files    FINDINPUT(name), FINDOUTPUT(name), FINDAPPEND(name),
+           SELECTINPUT(s), SELECTOUTPUT(s), INPUT(), OUTPUT(), RDCH(),
+           WRCH(c), ENDREAD(), ENDWRITE(), ENDSTREAM(s); RDCH gives
+           ENDSTREAMCH (GET "libhdr") at the end.  With a stream
+           selected, WRITES, WRITEF and the rest write to it.
+  STOP(n)  ends the program with return code n (FINISH: 0).
+
+The library (in the ROM, /usr/lib/bcpl; a module is linked when a
+program calls one of its routines, module_routine)
+  riscos       riscos_write0, riscos_vdu, riscos_time, riscos_cli,
+               riscos_inkey, riscos_mode, riscos_cls, riscos_tab,
+               riscos_colour, riscos_plot, riscos_getenv
+  declaritive  desktop windows described in JSON (the Declaritive
+               module): init, add, create, poll, set, get, is, closedown
+  maths, geom  small examples of modules; libhdr (ENDSTREAMCH)
+
+Not on the box
+  Cocoa, Objective-C and CLASS objects, inline x86 assembler, iGui,
+  sound, and building executables (programs are always compiled and run).
+
+Examples
+  Hello, SWIs, Files, Greeter (a Declaritive window), Bench (fib(30) and
+  a sieve), Mandelbrot.

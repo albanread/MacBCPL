@@ -1,0 +1,3 @@
+| !Run for !BCPL: the file type, then the examples
+/<Obey$Dir>.!Boot
+Filer_OpenDir <BCPL$Dir>.Examples

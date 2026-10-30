@@ -1,0 +1,21 @@
+// Mandelbrot -- the set drawn in characters, in floating point
+LET START() BE $(
+    LET chars = " .:-=+*#%@"
+    FOR row = 0 TO 23 DO $(
+        FLET ci = FLOAT(row) /. 12.0 -. 1.0
+        FOR col = 0 TO 71 DO $(
+            FLET cr = FLOAT(col) /. 28.0 -. 2.0
+            FLET zr = 0.0
+            FLET zi = 0.0
+            LET n = 0
+            WHILE n < 90 & zr *. zr +. zi *. zi <. 4.0 DO $(
+                FLET t = zr *. zr -. zi *. zi +. cr
+                zi := 2.0 *. zr *. zi +. ci
+                zr := t
+                n := n + 1
+            $)
+            WRCH(chars % (n = 90 -> 9, n / 10))
+        $)
+        NEWLINE()
+    $)
+$)

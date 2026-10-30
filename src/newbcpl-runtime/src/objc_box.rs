@@ -59,6 +59,11 @@ fn hdr(p: *mut c_void) -> Option<*mut StrHdr> {
     (unsafe { (*h).magic } == MAGIC).then_some(h)
 }
 
+/// The length of `p` if it is one of our strings.
+pub fn box_string_len(p: *mut c_void) -> Option<i64> {
+    hdr(p).map(|h| unsafe { (*h).len } as i64)
+}
+
 /// A new string of these Latin-1 bytes (reference count 1).
 pub fn box_string(bytes: &[u8]) -> *mut c_void {
     let cap = HDR + bytes.len() + 1;
